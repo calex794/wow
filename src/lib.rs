@@ -96,25 +96,7 @@ impl<'a> Decoder<'a> {
 }
 pub fn decode(input: &[u8]) -> Result<Envelope, WireError> {
     if input.len() > MAX_MESSAGE_BYTES { return Err(WireError::TooLarge); }
-    let mut d = Decoder { bytes: input, offset: 0 };
-    if d.head(5)? != 6 { return Err(WireError::InvalidEncoding); }
-    for expected in 0..6 {
-        if d.head(0)? != expected { return Err(WireError::InvalidEncoding); }
-        match expected {
-            0 => if d.head(0)? != 0 { return Err(WireError::UnsupportedVersion); },
-            1 | 2 | 3 | 4 | 5 => (),
-            _ => unreachable!()
-        }
-        // Read field payload below for fields 1..5; field 0 was consumed above.
-        if expected == 0 { continue; }
-        match expected {
-            1 => { /* values parsed in the second pass below; see decode_inner */
-                return decode_inner(input);
-            }
-            _ => unreachable!()
-        }
-    }
-    Err(WireError::InvalidEncoding)
+    decode_inner(input)
 }
 fn decode_inner(input: &[u8]) -> Result<Envelope, WireError> {
     let mut d = Decoder { bytes: input, offset: 0 };
