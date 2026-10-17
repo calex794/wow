@@ -1,0 +1,10 @@
+[package]
+name = "akula-wire-lab"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+name = "akula_wire_lab"
+path = "src/lib.rs"
