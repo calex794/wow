@@ -71,7 +71,9 @@ impl Server {
             loop {
                 let Some(incoming)=ep.accept().await else {return};
                 let Ok(conn)=incoming.await else {continue};
-                let _=serve_one_anchor_connection(&conn,&ledger).await;
+                if let Err(error)=serve_one_anchor_connection(&conn,&ledger).await {
+                    eprintln!("W6 LAB anchor responder failure: {error:?}");
+                }
             }
         });
         Self{endpoint,task}
