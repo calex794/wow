@@ -332,25 +332,68 @@ impl PeerEnrollmentDb {
         Ok(())
     }
 
-    /// Authorize a proven QUIC/TLS endpoint for exactly the operator-pinned
-    /// route. Returns only a W3 DeviceId/epoch; still require TrustRegistry.
+    /// Snapshot check only, suitable for rejecting untrusted peers BEFORE
+    /// reading any QUIC application stream. This method alone MUST NOT be
+    /// used to authorize a later Mailbox write across process boundaries.
     pub fn authorize(
         &self, remote: &EndpointId, relay: &[u8;16],
         namespace: &[u8;16], token: &[u8;16], issuer: &[u8;16],
     ) -> Result<([u8;16],u64), EnrollmentError> {
-        let old = stored_at(&self.db, remote)?
-            .ok_or(EnrollmentError::UnknownEndpoint)?;
-        if !old.valid() { return Err(EnrollmentError::CorruptStorage); }
-        if old.revoked == 1 { return Err(EnrollmentError::Revoked); }
-        if old.relay.as_slice() != relay
-            || old.namespace.as_slice() != namespace
-            || old.token.as_slice() != token
-            || old.issuer.as_slice() != issuer
-        {
-            return Err(EnrollmentError::WrongScope);
-        }
-        let device: [u8;16] = old.device.try_into()
-            .map_err(|_| EnrollmentError::CorruptStorage)?;
-        Ok((device,old.epoch as u64))
+        authorize_from(&self.db, remote, relay, namespace, token, issuer)
     }
+
+    /// The mandatory final authorization boundary for shared-SQLite writers.
+    ///
+    /// BEGIN IMMEDIATE obtains an actual SQLite RESERVED write lock on the
+    /// operator policy database, not just an in-process Mutex. Every signed
+    /// operator Allow/Revoke uses the SAME IMMEDIATE transaction in
+    /// apply_signed(), so even an independent OS process cannot commit a
+    /// policy change BETWEEN this check and the callback's durable Mailbox
+    /// write. The callback must complete the Mailbox COMMIT before returning.
+    /// An error rolls back this read-only policy transaction on drop.
+    ///
+    /// No network I/O/await under this lock. A busy/locked policy DB fails
+    /// closed; lock starvation is an availability threat and not resolved here.
+    /// This does NOT fix physical DB-snapshot rollback or replicate policies
+    /// across *different* policy SQLite files/hosts.
+    pub fn with_authorized_write<T, E, F>(
+        &mut self, remote: &EndpointId, relay: &[u8;16],
+        namespace: &[u8;16], token: &[u8;16], issuer: &[u8;16],
+        commit_mailbox: F,
+    ) -> Result<T, E>
+    where
+        E: From<EnrollmentError>,
+        F: FnOnce(([u8;16], u64)) -> Result<T, E>,
+    {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(EnrollmentError::from).map_err(E::from)?;
+        let identity = authorize_from(
+            &tx, remote, relay, namespace, token, issuer,
+        ).map_err(E::from)?;
+        let result = commit_mailbox(identity)?;
+        tx.commit().map_err(EnrollmentError::from).map_err(E::from)?;
+        Ok(result)
+    }
+}
+
+/// Internal shared verifier: the caller chooses either a snapshot Connection
+/// or an exclusive-writer SQLite Transaction. Never infer identity from peer
+/// message bytes, even if its transport-level TLS signature is genuine.
+fn authorize_from(
+    db: &Connection, remote: &EndpointId, relay: &[u8;16],
+    namespace: &[u8;16], token: &[u8;16], issuer: &[u8;16],
+) -> Result<([u8;16],u64), EnrollmentError> {
+    let old = stored_at(db, remote)?.ok_or(EnrollmentError::UnknownEndpoint)?;
+    if !old.valid() { return Err(EnrollmentError::CorruptStorage); }
+    if old.revoked == 1 { return Err(EnrollmentError::Revoked); }
+    if old.relay.as_slice() != relay
+        || old.namespace.as_slice() != namespace
+        || old.token.as_slice() != token
+        || old.issuer.as_slice() != issuer
+    {
+        return Err(EnrollmentError::WrongScope);
+    }
+    let device: [u8;16] = old.device.try_into()
+        .map_err(|_| EnrollmentError::CorruptStorage)?;
+    Ok((device,old.epoch as u64))
 }
