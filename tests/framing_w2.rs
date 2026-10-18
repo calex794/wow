@@ -37,8 +37,8 @@ fn frame(id:u32,i:u16,count:u16,payload:&[u8])->Vec<u8>{
 #[test] fn fragments_out_of_order_peers_and_duplicates() {
  let source=bytes();let f=fragment(&source,123,35).unwrap();
  let mut p=FragmentPool::new(FragmentLimits::default()).unwrap();
- for i in (0..f.len()).rev() {
-  let result=p.accept(peer(1),i as u64,&f[i]).unwrap();
+ for (clock,i) in (0..f.len()).rev().enumerate() {
+  let result=p.accept(peer(1),clock as u64,&f[i]).unwrap();
   if i>0 {assert!(result.is_none());}
   else {assert_eq!(result,Some(source.clone()));}
  }
