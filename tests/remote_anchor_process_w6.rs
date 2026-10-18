@@ -9,7 +9,7 @@
 #![cfg(feature="iroh-transport")]
 
 use akula_wire_lab::peer_enrollment_w6::{
-    sign_operator_change, AnchorError, EnrollmentError, EnrollmentLookup,
+    sign_operator_change, AnchorError, AuthorityDomainId, EnrollmentError, EnrollmentLookup,
     EndpointRouteBinding, OperatorChange, PeerEnrollmentDb, PolicyCheckpoint,
     PolicyOperation, TrustedPolicyAnchor, sign_anchor_transition,
 };
@@ -37,11 +37,13 @@ const STOP_FILE: &str = "anchor-stop";
 
 fn key(v:u8)->SecretKey {SecretKey::from_bytes(&[v;32])}
 fn id(v:u8)->[u8;16] {[v;16]}
+fn authority()->AuthorityDomainId {AuthorityDomainId::new([90;32]).unwrap()}
 fn policy()->AnchorServicePolicy {
     AnchorServicePolicy {
         reader:key(41).public(),
         administrator:key(42).public(),
         operator:root().verifying_key(),
+        authority:authority(),
     }
 }
 fn cp(revision:u64,byte:u8)->PolicyCheckpoint {
@@ -202,13 +204,13 @@ impl Drop for ChildAuthority {
     }
 }
 fn client(v:u8,addr:EndpointAddr)->RemoteAnchorClient {
-    RemoteAnchorClient::start(key(v),addr).unwrap()
+    RemoteAnchorClient::start(key(v),addr,authority()).unwrap()
 }
 fn authorized_cas(
     client:&RemoteAnchorClient,old:PolicyCheckpoint,next:PolicyCheckpoint,
 )->Result<(),AnchorError> {
     let command=signed(next.revision,PolicyOperation::Revoke);
-    let proof=sign_anchor_transition(&root(),&command,old,next).unwrap();
+    let proof=sign_anchor_transition(&root(),authority(),&command,old,next).unwrap();
     client.advance_signed(old,next,&command,&proof)
 }
 
@@ -267,11 +269,13 @@ fn separate_os_process_rejects_restored_local_policy_after_signed_revoke() {
     let reader=client(41,server.address());
     let admin=client(42,server.address());
     let binding=binding();
-    let mut active=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    let mut active=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),authority(),
+    ).unwrap();
     assert_eq!(active.authorize_anchored(&reader,lookup(&binding)).unwrap(),(id(7),3));
     let change=signed(2,PolicyOperation::Revoke);
     let (old,next)=active.preview_signed_update(&change).unwrap();
-    let proof=sign_anchor_transition(&root(),&change,old,next).unwrap();
+    let proof=sign_anchor_transition(&root(),authority(),&change,old,next).unwrap();
     active.apply_signed_anchored_with_proof(&change,&proof,&admin).unwrap();
     assert_eq!(reader.current().unwrap(),active.checkpoint().unwrap());
     drop(active);
@@ -281,7 +285,9 @@ fn separate_os_process_rejects_restored_local_policy_after_signed_revoke() {
     // Roll back ONLY local enrollment; independent child OS process ledger
     // retains revoke checkpoint, even across the child process SIGKILL.
     fs::copy(&copy,&local_path).unwrap();
-    let mut restored=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    let mut restored=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),authority(),
+    ).unwrap();
     assert_eq!(restored.last_revision().unwrap(),1);
     let server=ChildAuthority::start(dir.path());
     let fresh_reader=client(41,server.address());
@@ -306,7 +312,12 @@ fn separate_os_process_unavailable_anchor_fails_closed_without_cached_trust() {
     let local=dir.path().join("policy.sqlite");
     let mut enrollment=PeerEnrollmentDb::open(&local,root().verifying_key()).unwrap();
     enrollment.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
-    provision(&remote,enrollment.checkpoint().unwrap());
+    let initial=enrollment.checkpoint().unwrap();
+    drop(enrollment);
+    let mut enrollment=PeerEnrollmentDb::open_for_authority(
+        &local,root().verifying_key(),authority(),
+    ).unwrap();
+    provision(&remote,initial);
     let server=ChildAuthority::start(dir.path());
     let reader=client(41,server.address());
     let trusted_binding=binding();
@@ -335,6 +346,9 @@ fn separate_os_process_unavailable_anchor_fails_closed_without_cached_trust() {
 /// a real Roha/noq connection into an independent OS child and SQLite WAL.
 struct LostCasReply<'a>(&'a RemoteAnchorClient);
 impl TrustedPolicyAnchor for LostCasReply<'_> {
+    fn authority_domain(&self)->Option<AuthorityDomainId> {
+        self.0.authority_domain()
+    }
     fn current(&self) -> Result<PolicyCheckpoint,AnchorError> {
         self.0.current()
     }
@@ -360,6 +374,10 @@ fn real_quic_signed_cas_lost_reply_recovers_after_authority_restart_and_policy_r
     let mut local=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
     local.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
     let expected=local.checkpoint().unwrap();
+    drop(local);
+    let mut local=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),authority(),
+    ).unwrap();
     provision(&remote_path,expected);
     let server=ChildAuthority::start(dir.path());
     let admin=client(42,server.address());
@@ -367,7 +385,7 @@ fn real_quic_signed_cas_lost_reply_recovers_after_authority_restart_and_policy_r
     let change=signed(2,PolicyOperation::Revoke);
     let (old,next)=local.preview_signed_update(&change).unwrap();
     assert_eq!(old,expected);
-    let proof=sign_anchor_transition(&root(),&change,old,next).unwrap();
+    let proof=sign_anchor_transition(&root(),authority(),&change,old,next).unwrap();
     let lost=LostCasReply(&admin);
     assert!(matches!(
         local.apply_signed_anchored_with_proof(&change,&proof,&lost),
@@ -394,7 +412,9 @@ fn real_quic_signed_cas_lost_reply_recovers_after_authority_restart_and_policy_r
     let restarted=ChildAuthority::start(dir.path());
     let fresh_reader=client(41,restarted.address());
     assert_eq!(fresh_reader.current().unwrap(),next);
-    let mut local=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    let mut local=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),authority(),
+    ).unwrap();
     assert_eq!(
         local.recover_pending_signed_update(&fresh_reader).unwrap(),
         akula_wire_lab::peer_enrollment_w6::SignedRecoveryOutcome::AppliedAfterCas
