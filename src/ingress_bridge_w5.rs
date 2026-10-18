@@ -1,6 +1,8 @@
 //! W4/W5 lab stream bridge. Not a public TCP listener or production network
-//! service: the caller must supply authenticated peer/route authorization,
-//! deadlines, connection limits, and a trusted clock BEFORE invoking it.
+//! service: the caller must supply trusted route-owner configuration,
+//! deadlines, connection limits, and a local clock. A signed relay grant
+//! is verified on EACH message before mailbox storage. The TCP peer itself
+//! remains unauthenticated here; the signed grant is a narrow bearer permit.
 //!
 //! The same bounded W2 stream frame carries opaque W3 ciphertext. A relay
 //! has no recipient signing key and can NEVER emit an end-recipient receipt.
@@ -12,6 +14,7 @@ use crate::crypto_identity_w3::TrustedRecipient;
 use crate::journal_w4::{Delivery, Insert, Journal, JournalError};
 use crate::mailbox_w5::{MailError, Mailbox, PutStatus};
 use crate::receipt_w4::{self, ReceiptError};
+use crate::route_grant_w5::{self, GrantError, RelayPolicy};
 use crate::trust_w3::TrustRegistry;
 use crate::{stream_frame, WireError, MAX_MESSAGE_BYTES};
 use ed25519_dalek::SigningKey;
@@ -25,6 +28,7 @@ pub enum BridgeError {
     Mailbox(MailError),
     Recipient(JournalError),
     Receipt(ReceiptError),
+    Grant(GrantError),
 }
 impl From<io::Error> for BridgeError {
     fn from(value: io::Error) -> Self { Self::Io(value) }
@@ -41,24 +45,21 @@ impl From<JournalError> for BridgeError {
 impl From<ReceiptError> for BridgeError {
     fn from(value: ReceiptError) -> Self { Self::Receipt(value) }
 }
-
-/// Prevalidated by the caller, NOT authenticated by this transport laboratory.
-/// A real ingress MUST bind token, MessageId, expiry, namespace and membership
-/// to an independently validated routing grant; do not forward untrusted
-/// socket parameters here. A Mailbox has no signer and never issues ACK bytes.
-#[derive(Clone, Copy)]
-pub struct LabRelayGrant {
-    pub route_token: [u8;16],
-    pub message_id: [u8;16],
-    pub now: i64,
-    pub expires_at: i64,
+impl From<GrantError> for BridgeError {
+    fn from(value: GrantError) -> Self { Self::Grant(value) }
 }
 
 pub enum IngressRoute<'a> {
-    /// Intermediate encrypted-byte storage. No recipient signer is available.
+    /// Intermediate encrypted-byte storage. The relay's pinned issuer,
+    /// namespace, route token and identity come from trusted configuration.
+    /// Grant bytes can be untrusted; verification happens after bounded read
+    /// but BEFORE any call to Mailbox::put. No recipient signer is available.
     Mailbox {
         store: &'a mut Mailbox,
-        grant: LabRelayGrant,
+        signed_grant: &'a [u8],
+        policy: &'a RelayPolicy,
+        trust: &'a TrustRegistry,
+        now: i64,
     },
     /// End-recipient acceptance. The authenticated W3 envelope identifies
     /// sender, receiver, key epoch and message; W4 performs atomic persistence.
@@ -109,12 +110,15 @@ pub fn receive_and_route<R: Read, W: Write>(
 ) -> Result<IngressOutcome, BridgeError> {
     let encrypted_packet = read_one_frame(input)?;
     match route {
-        IngressRoute::Mailbox {store, grant} => {
+        IngressRoute::Mailbox {store, signed_grant, policy, trust, now} => {
+            let verified = route_grant_w5::verify_for_mailbox(
+                signed_grant, policy, trust, now, &encrypted_packet,
+            )?;
             let status = store.put(
-                grant.route_token,
-                grant.message_id,
-                grant.now,
-                grant.expires_at,
+                verified.route_token(),
+                verified.message_id(),
+                now,
+                verified.expires_at(),
                 &encrypted_packet,
             )?;
             Ok(IngressOutcome::MailboxStored(status))
