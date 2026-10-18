@@ -25,7 +25,7 @@ pub enum WireError {
     TooLarge, Truncated, InvalidEncoding, UnsupportedVersion,
     InvalidPriority, LengthMismatch, FragmentMismatch, FragmentCount,
     ConflictingDuplicate, Incomplete, UnsupportedCriticalExtension,
-    TooManyExtensions, ResourceLimit, NonMonotonicTime,
+    TooManyExtensions, ResourceLimit, NonMonotonicTime, ReplaySuppressed,
 }
 
 /// Minimal deterministic CBOR encoding subset: unsigned integers,
