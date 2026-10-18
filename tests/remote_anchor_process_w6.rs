@@ -312,7 +312,12 @@ fn separate_os_process_unavailable_anchor_fails_closed_without_cached_trust() {
     let local=dir.path().join("policy.sqlite");
     let mut enrollment=PeerEnrollmentDb::open(&local,root().verifying_key()).unwrap();
     enrollment.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
-    provision(&remote,enrollment.checkpoint().unwrap());
+    let initial=enrollment.checkpoint().unwrap();
+    drop(enrollment);
+    let mut enrollment=PeerEnrollmentDb::open_for_authority(
+        &local,root().verifying_key(),authority(),
+    ).unwrap();
+    provision(&remote,initial);
     let server=ChildAuthority::start(dir.path());
     let reader=client(41,server.address());
     let trusted_binding=binding();
