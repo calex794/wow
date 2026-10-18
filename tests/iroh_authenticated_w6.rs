@@ -114,6 +114,7 @@ impl Lab {
         // offline operator enrollment. Never bootstrap from untrusted DB
         // automatically in a real network service.
         let anchor = MemoryAnchor::new(enrollment.checkpoint().unwrap());
+        assert_eq!(anchor.observed().revision,1);
         Self {
             _dir:dir,server,trusted,stranger,
             enrollment:Mutex::new(enrollment),anchor,operator,trusted_binding,
