@@ -4,7 +4,7 @@
 #![cfg(feature="iroh-transport")]
 
 use akula_wire_lab::peer_enrollment_w6::{
-    AnchorError, EnrollmentError, EndpointRouteBinding, EnrollmentLookup,
+    AnchorError, AuthorityDomainId, EnrollmentError, EndpointRouteBinding, EnrollmentLookup,
     OperatorChange, PeerEnrollmentDb, PolicyCheckpoint, PolicyOperation,
     TrustedPolicyAnchor, sign_operator_change, sign_anchor_transition,
 };
@@ -24,6 +24,8 @@ use tempfile::tempdir;
 fn sec(n:u8)->SecretKey{SecretKey::from_bytes(&[n;32])}
 fn id(n:u8)->[u8;16]{[n;16]}
 fn root()->SigningKey{SigningKey::from_bytes(&[220;32])}
+fn authority(n:u8)->AuthorityDomainId{AuthorityDomainId::new([n;32]).unwrap()}
+fn current_domain()->AuthorityDomainId{authority(90)}
 fn binding()->EndpointRouteBinding{
     let client=SigningKey::from_bytes(&[5;32]);
     EndpointRouteBinding{
@@ -50,6 +52,7 @@ fn policy_config()->AnchorServicePolicy{
         reader:sec(41).public(),
         administrator:sec(42).public(),
         operator:root().verifying_key(),
+        authority:current_domain(),
     }
 }
 fn checkpoint_flush(path:&Path){
@@ -63,7 +66,10 @@ struct Server {
 }
 impl Server {
     async fn start(path:&Path)->Self{
-        let ledger=RemoteAnchorLedger::open(path,policy_config()).unwrap();
+        Self::start_with_policy(path,policy_config()).await
+    }
+    async fn start_with_policy(path:&Path,policy:AnchorServicePolicy)->Self{
+        let ledger=RemoteAnchorLedger::open(path,policy).unwrap();
         let ledger=Arc::new(Mutex::new(ledger));
         let endpoint=Endpoint::builder(presets::Minimal)
             .clear_ip_transports().bind_addr("127.0.0.1:0").unwrap()
@@ -103,7 +109,12 @@ impl Server {
     }
 }
 fn client(key:u8,addr:EndpointAddr)->RemoteAnchorClient{
-    RemoteAnchorClient::start(sec(key),addr).unwrap()
+    client_with_domain(key,addr,current_domain())
+}
+fn client_with_domain(
+    key:u8,addr:EndpointAddr,domain:AuthorityDomainId,
+)->RemoteAnchorClient{
+    RemoteAnchorClient::start(sec(key),addr,domain).unwrap()
 }
 fn cp(revision:u64,value:u8)->PolicyCheckpoint{
     PolicyCheckpoint {revision,digest:[value;32]}
@@ -113,7 +124,7 @@ fn authorized_cas(
     admin:&RemoteAnchorClient,old:PolicyCheckpoint,new:PolicyCheckpoint,
 )->Result<(),AnchorError>{
     let change=signed(new.revision,PolicyOperation::Revoke);
-    let proof=sign_anchor_transition(&root(),&change,old,new).unwrap();
+    let proof=sign_anchor_transition(&root(),current_domain(),&change,old,new).unwrap();
     admin.advance_signed(old,new,&change,&proof)
 }
 fn provision(path:&Path,initial:PolicyCheckpoint){
@@ -196,7 +207,9 @@ async fn old_local_sqlite_snapshot_denied_by_durable_remote_quic_anchor(){
     let server=Server::start(&remote_path).await;
     let reader=client(41,server.addr());
     let admin=client(42,server.addr());
-    let mut local=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    let mut local=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),current_domain(),
+    ).unwrap();
     let b=binding();
     assert_eq!(local.authorize_anchored(&reader,lookup(&b)).unwrap(),(id(7),3));
 
@@ -204,7 +217,7 @@ async fn old_local_sqlite_snapshot_denied_by_durable_remote_quic_anchor(){
     // the independent local SQLite commit, per W6's fail-closed contract.
     let change=signed(2,PolicyOperation::Revoke);
     let (old,next)=local.preview_signed_update(&change).unwrap();
-    let proof=sign_anchor_transition(&root(),&change,old,next).unwrap();
+    let proof=sign_anchor_transition(&root(),current_domain(),&change,old,next).unwrap();
     local.apply_signed_anchored_with_proof(&change,&proof,&admin).unwrap();
     assert_eq!(reader.current().unwrap(),local.checkpoint().unwrap());
     drop(local);
@@ -214,8 +227,8 @@ async fn old_local_sqlite_snapshot_denied_by_durable_remote_quic_anchor(){
     // Attacker replaces ONLY the local policy database snapshot. Remote
     // authority holds revision 2 in its independent SQLite file.
     std::fs::copy(&saved,&local_path).unwrap();
-    let mut rolled_back=PeerEnrollmentDb::open(
-        &local_path,root().verifying_key()
+    let mut rolled_back=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),current_domain()
     ).unwrap();
     assert_eq!(rolled_back.last_revision().unwrap(),1);
 
@@ -250,6 +263,7 @@ async fn provisioning_is_explicit_and_endpoint_keys_cannot_be_replaced_by_db(){
     let wrong=AnchorServicePolicy{
         reader:sec(45).public(),administrator:sec(46).public(),
         operator:root().verifying_key(),
+        authority:current_domain(),
     };
     assert!(matches!(
         RemoteAnchorLedger::open(&path,wrong),
@@ -285,7 +299,7 @@ async fn stolen_administrator_tls_key_cannot_forge_operator_signed_transition() 
     let admin=client(42,server.addr());
     let reader=client(41,server.addr());
     let valid_change=signed(8,PolicyOperation::Revoke);
-    let valid_proof=sign_anchor_transition(&root(),&valid_change,old,new).unwrap();
+    let valid_proof=sign_anchor_transition(&root(),current_domain(),&valid_change,old,new).unwrap();
 
     // Compromised TLS-admin credential alone is now insufficient.
     assert_anchor_error(admin.advance(old,new),AnchorError::InvalidAttestation);
@@ -295,7 +309,7 @@ async fn stolen_administrator_tls_key_cannot_forge_operator_signed_transition() 
         operation:PolicyOperation::Revoke,revision:8,binding:binding(),
     }).unwrap();
     let forged_proof=sign_anchor_transition(
-        &forged_signer,&forged_change,old,new,
+        &forged_signer,current_domain(),&forged_change,old,new,
     ).unwrap();
     assert_anchor_error(
         admin.advance_signed(old,new,&forged_change,&forged_proof),
@@ -346,6 +360,7 @@ async fn pinned_offline_operator_key_cannot_be_replaced_at_anchor_reopen() {
     let wrong=AnchorServicePolicy {
         reader:sec(41).public(),administrator:sec(42).public(),
         operator:SigningKey::from_bytes(&[221;32]).verifying_key(),
+        authority:current_domain(),
     };
     assert!(matches!(
         RemoteAnchorLedger::open(&db,wrong),
@@ -373,13 +388,60 @@ fn offline_preview_signature_binds_real_w6_policy_mutation_before_publication() 
     assert_ne!(old.digest,new.digest);
     assert_eq!(policy.last_revision().unwrap(),1);
     assert_eq!(policy.checkpoint().unwrap(),prior);
-    let proof=sign_anchor_transition(&root(),&change,old,new).unwrap();
+    let proof=sign_anchor_transition(&root(),current_domain(),&change,old,new).unwrap();
     let verified=akula_wire_lab::peer_enrollment_w6::verify_signed_anchor_transition(
-        &root().verifying_key(),&change,old,new,&proof,
+        &root().verifying_key(),current_domain(),&change,old,new,&proof,
     ).unwrap();
     assert_eq!(verified.operation,PolicyOperation::Revoke);
     assert_eq!(verified.binding,binding());
     assert!(akula_wire_lab::peer_enrollment_w6::verify_signed_anchor_transition(
-        &root().verifying_key(),&change,old,cp(2,200),&proof,
+        &root().verifying_key(),current_domain(),&change,old,cp(2,200),&proof,
     ).is_err());
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn cross_authority_replay_rejected_over_real_quic_even_with_same_tls_key() {
+    let dir=tempdir().unwrap();
+    let first=dir.path().join("first.sqlite");
+    let second=dir.path().join("second.sqlite");
+    let old=cp(1,15);
+    let new=cp(2,16);
+    let other=authority(91);
+    provision(&first,old);
+    drop(RemoteAnchorLedger::provision(
+        &second,
+        AnchorServicePolicy {authority:other,..policy_config()},
+        old,
+    ).unwrap());
+    let change=signed(2,PolicyOperation::Revoke);
+    let proof_a=sign_anchor_transition(
+        &root(),current_domain(),&change,old,new,
+    ).unwrap();
+    let first_service=Server::start(&first).await;
+    let second_service=Server::start_with_policy(
+        &second,AnchorServicePolicy {authority:other,..policy_config()}
+    ).await;
+    // Both servers intentionally use the same TLS server key to prove that
+    // pinned TLS EndpointId alone cannot disambiguate logical authorities.
+    assert_eq!(first_service.addr().id,second_service.addr().id);
+    let admin_b=client_with_domain(42,second_service.addr(),other);
+    assert_eq!(admin_b.current().unwrap(),old);
+    assert_anchor_error(
+        admin_b.advance_signed(old,new,&change,&proof_a),
+        AnchorError::InvalidAttestation,
+    );
+    assert_eq!(admin_b.current().unwrap(),old);
+    // A misconfigured reader with the CORRECT server TLS key but the wrong
+    // independently pinned domain MUST refuse even an innocent GET.
+    let wrong_scope=client_with_domain(41,second_service.addr(),current_domain());
+    assert_anchor_error(wrong_scope.current(),AnchorError::InvalidAttestation);
+    let admin_a=client(42,first_service.addr());
+    admin_a.advance_signed(old,new,&change,&proof_a).unwrap();
+    assert_eq!(admin_a.current().unwrap(),new);
+    assert_eq!(admin_b.current().unwrap(),old);
+    let proof_b=sign_anchor_transition(&root(),other,&change,old,new).unwrap();
+    admin_b.advance_signed(old,new,&change,&proof_b).unwrap();
+    assert_eq!(admin_b.current().unwrap(),new);
+    first_service.stop().await;
+    second_service.stop().await;
 }
