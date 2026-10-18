@@ -220,7 +220,7 @@ pub async fn serve_one_anchor_connection(
 )->Result<(),RemoteAnchorError>{
     if conn.alpn()!=ANCHOR_ALPN {return Err(RemoteAnchorError::Protocol);}
     let remote=conn.remote_id();
-    let (_send,mut recv)=tokio::time::timeout(IO_BUDGET,conn.accept_bi())
+    let (mut response_send,mut recv)=tokio::time::timeout(IO_BUDGET,conn.accept_bi())
         .await.map_err(|_|RemoteAnchorError::Deadline)?
         .map_err(|e|RemoteAnchorError::Transport(e.to_string()))?;
     let wire=tokio::time::timeout(IO_BUDGET,recv.read_to_end(CAS_BYTES))
@@ -242,14 +242,12 @@ pub async fn serve_one_anchor_connection(
             vec![STATUS_MALFORMED]
         }
     };
-    let (mut send,_) = conn.open_bi().await
-        .map_err(|e|RemoteAnchorError::Transport(e.to_string()))?;
-    // The RESPONSE travels on its own bounded stream within the SAME
-    // authenticated connection. Request has already been fully consumed.
+    // One request and one reply share the SAME authenticated bidirectional
+    // QUIC stream. No second stream negotiation or response misbinding.
     tokio::time::timeout(IO_BUDGET,async {
-        send.write_all(&response).await
+        response_send.write_all(&response).await
             .map_err(|e|RemoteAnchorError::Transport(e.to_string()))?;
-        send.finish().map_err(|e|RemoteAnchorError::Transport(e.to_string()))
+        response_send.finish().map_err(|e|RemoteAnchorError::Transport(e.to_string()))
     }).await.map_err(|_|RemoteAnchorError::Deadline)??;
     Ok(())
 }
@@ -330,7 +328,7 @@ impl RemoteAnchorClient {
                     AnchorError::Unavailable
                 })?;
             if conn.alpn()!=ANCHOR_ALPN {return Err(AnchorError::InvalidAttestation);}
-            let (mut send,_recv)=conn.open_bi().await
+            let (mut send,mut response)=conn.open_bi().await
                 .map_err(|e| {
                     eprintln!("W6 LAB anchor stream open failed: {e:?}");
                     AnchorError::Unavailable
@@ -340,11 +338,6 @@ impl RemoteAnchorClient {
                 AnchorError::Unavailable
             })?;
             send.finish().map_err(|_|AnchorError::Unavailable)?;
-            let (_reply_send,mut response)=conn.accept_bi().await
-                .map_err(|e|{
-                    eprintln!("W6 LAB anchor reply stream failed: {e:?}");
-                    AnchorError::Unavailable
-                })?;
             response.read_to_end(RESPONSE_BYTES).await
                 .map_err(|e|{
                     eprintln!("W6 LAB anchor reply read failed: {e:?}");
