@@ -325,17 +325,35 @@ impl RemoteAnchorClient {
         }
         let response=tokio::time::timeout(IO_BUDGET,async {
             let conn=local.connect(remote,ANCHOR_ALPN).await
-                .map_err(|_|AnchorError::Unavailable)?;
+                .map_err(|e| {
+                    eprintln!("W6 LAB anchor TLS connect failed: {e:?}");
+                    AnchorError::Unavailable
+                })?;
             if conn.alpn()!=ANCHOR_ALPN {return Err(AnchorError::InvalidAttestation);}
             let (mut send,_recv)=conn.open_bi().await
-                .map_err(|_|AnchorError::Unavailable)?;
-            send.write_all(&request).await.map_err(|_|AnchorError::Unavailable)?;
+                .map_err(|e| {
+                    eprintln!("W6 LAB anchor stream open failed: {e:?}");
+                    AnchorError::Unavailable
+                })?;
+            send.write_all(&request).await.map_err(|e|{
+                eprintln!("W6 LAB anchor stream write failed: {e:?}");
+                AnchorError::Unavailable
+            })?;
             send.finish().map_err(|_|AnchorError::Unavailable)?;
             let (_reply_send,mut response)=conn.accept_bi().await
-                .map_err(|_|AnchorError::Unavailable)?;
+                .map_err(|e|{
+                    eprintln!("W6 LAB anchor reply stream failed: {e:?}");
+                    AnchorError::Unavailable
+                })?;
             response.read_to_end(RESPONSE_BYTES).await
-                .map_err(|_|AnchorError::Unavailable)
-        }).await.map_err(|_|AnchorError::Unavailable)??;
+                .map_err(|e|{
+                    eprintln!("W6 LAB anchor reply read failed: {e:?}");
+                    AnchorError::Unavailable
+                })
+        }).await.map_err(|e| {
+            eprintln!("W6 LAB anchor RPC timeout: {e:?}");
+            AnchorError::Unavailable
+        })??;
         match response.as_slice() {
             [STATUS_OK,rest @ ..] if rest.len()==CHECKPOINT_BYTES=>
                 decode_checkpoint(rest).map_err(|_|AnchorError::InvalidAttestation),
