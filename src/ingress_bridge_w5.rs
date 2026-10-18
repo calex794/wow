@@ -111,15 +111,8 @@ pub fn receive_and_route<R: Read, W: Write>(
     let encrypted_packet = read_one_frame(input)?;
     match route {
         IngressRoute::Mailbox {store, signed_grant, policy, trust, now} => {
-            let verified = route_grant_w5::verify_for_mailbox(
-                signed_grant, policy, trust, now, &encrypted_packet,
-            )?;
-            let status = store.put(
-                verified.route_token(),
-                verified.message_id(),
-                now,
-                verified.expires_at(),
-                &encrypted_packet,
+            let status = store_authorized_mailbox_packet(
+                store, signed_grant, policy, trust, now, &encrypted_packet,
             )?;
             Ok(IngressOutcome::MailboxStored(status))
         }
@@ -138,6 +131,29 @@ pub fn receive_and_route<R: Read, W: Write>(
             Ok(IngressOutcome::RecipientAccepted(insert))
         }
     }
+}
+
+/// Single authorization boundary shared by the original local test bridge
+/// and the bounded pre-auth TCP handler. A successful write is only
+/// MailboxStored, NEVER a signed end-recipient acknowledgement.
+pub(crate) fn store_authorized_mailbox_packet(
+    store: &mut Mailbox,
+    signed_grant: &[u8],
+    policy: &RelayPolicy,
+    trust: &TrustRegistry,
+    now: i64,
+    encrypted_packet: &[u8],
+) -> Result<PutStatus, BridgeError> {
+    let verified = route_grant_w5::verify_for_mailbox(
+        signed_grant, policy, trust, now, encrypted_packet,
+    )?;
+    Ok(store.put(
+        verified.route_token(),
+        verified.message_id(),
+        now,
+        verified.expires_at(),
+        encrypted_packet,
+    )?)
 }
 
 /// The TCP specialization is intentionally one request/connection. The test
