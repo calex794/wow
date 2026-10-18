@@ -145,3 +145,51 @@ fn deterministic_trace_and_duplicate_and_delayed_frames(){
  let a=run(); assert_eq!(a,run());
  assert!(a.contains("duplicate"));assert!(a.contains("delayed"));
 }
+
+#[test]
+fn revoked_sender_epoch_blocks_forwarded_ciphertext_even_after_delivery(){
+ let f=fixture();
+ let mut sim=Simulation::new(81); links(&mut sim,true);
+ sim.submit_data(id(1),200,&f.packet).unwrap();
+ sim.run(4).unwrap();
+ let mut revoked=TrustRegistry::new();
+ revoked.enroll(id(3),7,f.sender.verifying_key()).unwrap();
+ revoked.revoke(id(3)).unwrap();
+ let incoming=sim.packet(Node::G,Flow::Data,id(1)).unwrap();
+ assert!(open(incoming,TrustedRecipient{
+   secret:&f.secret,recipient_id:id(6),now:sim.tick(),registry:&revoked
+ }).is_err());
+ revoked.enroll(id(3),8,SigningKey::from_bytes(&[9;32]).verifying_key()).unwrap();
+ assert!(open(incoming,TrustedRecipient{
+   secret:&f.secret,recipient_id:id(6),now:sim.tick(),registry:&revoked
+ }).is_err());
+}
+#[test]
+fn malicious_relay_claim_cannot_authenticate_recipient_receipt(){
+ let f=fixture();let temp=tempdir().unwrap();
+ let mut journal=Journal::open(&temp.path().join("outbox.sqlite")).unwrap();
+ journal.enqueue(id(6),id(1),200,&f.packet).unwrap();
+ let attacker=SigningKey::from_bytes(&[99;32]);
+ let forged=sign(&attacker,id(6),id(1),*blake3::hash(&f.packet).as_bytes(),8);
+ let mut sim=Simulation::new(44);links(&mut sim,false);
+ sim.submit_receipt(id(1),200,&forged).unwrap();
+ sim.run(4).unwrap();
+ let delivered=sim.packet(Node::A,Flow::Receipt,id(1)).unwrap();
+ assert!(verify(delivered,&f.trust).is_err());
+ assert_eq!(journal.state(id(6),id(1)).unwrap(),Delivery::Queued);
+}
+#[test]
+fn intermediate_receipt_and_offline_recipient_never_mean_delivered(){
+ let f=fixture();let temp=tempdir().unwrap();
+ let mut journal=Journal::open(&temp.path().join("outbox.sqlite")).unwrap();
+ journal.enqueue(id(6),id(1),200,&f.packet).unwrap();
+ let mut sim=Simulation::new(92);links(&mut sim,false);
+ sim.set_alive(Node::G,false);
+ sim.submit_data(id(1),200,&f.packet).unwrap();
+ sim.run(12).unwrap();
+ assert_eq!(sim.packet(Node::Mailbox,Flow::Data,id(1)),Some(f.packet.as_slice()));
+ assert!(sim.packet(Node::G,Flow::Data,id(1)).is_none());
+ // Mailbox may have stored the opaque bytes, but only the recipient can sign.
+ assert_eq!(journal.state(id(6),id(1)).unwrap(),Delivery::Queued);
+ assert_eq!(journal.retry_bytes(id(6),id(1),sim.tick() as i64).unwrap(),Some(f.packet));
+}
