@@ -60,10 +60,10 @@ fn adversarial_fault_queue_and_event_history_are_bounded() {
  assert_eq!(accepted,64);
  assert_eq!(sim.fault_queue_len(),64);
  // Repeated existing-data copies fill the trace ring without a hard stop.
- for _ in 0..4500 {
-  assert!(sim.offer_untrusted_mailbox_frame(id(1),950,&packet).is_ok()
-    || sim.offer_untrusted_mailbox_frame(id(1),950,&packet)==Err(SimError::ResourceLimit));
-  // The second call above is harmless and may be rate limited.
+ for _ in 0..700 {
+  for _ in 0..8 {
+   assert!(sim.offer_untrusted_mailbox_frame(id(1),950,&packet).is_ok());
+  }
   sim.step().unwrap();
  }
  assert_eq!(sim.events().len(),4096);
