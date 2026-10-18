@@ -78,7 +78,7 @@ fn lookup<'a>(b:&'a EndpointRouteBinding)->EnrollmentLookup<'a>{
 fn setup(behavior:CasBehavior)->(tempfile::TempDir,PeerEnrollmentDb,Anchor) {
     let dir=tempdir().unwrap();
     let path=dir.path().join("policy.sqlite");
-    let mut db=PeerEnrollmentDb::open_for_authority(&path,signer().verifying_key(),authority()).unwrap();
+    let mut db=PeerEnrollmentDb::open(&path,signer().verifying_key()).unwrap();
     db.apply_signed(&change(1,PolicyOperation::Allow)).unwrap();
     let cp=db.checkpoint().unwrap();
     drop(db);
