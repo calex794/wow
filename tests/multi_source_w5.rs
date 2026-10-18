@@ -15,7 +15,7 @@ fn three_hostile_edges_share_global_budget_and_cannot_replace_clean_mailbox_copy
  let mut permitted=0;let mut denied=0;
  for from in [Node::V,Node::W,Node::Mailbox] {
   for i in 1..=8 {
-   let mut corrupt=vec![i;512];corrupt[0]=(i+1) as u8;
+   let mut corrupt=vec![i;512];corrupt[0]=i+1;
    for _ in 0..3 {
     match sim.offer_untrusted_from(from,id(i),900,&corrupt) {
       Ok(())=>permitted+=1,
