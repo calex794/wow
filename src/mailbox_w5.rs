@@ -58,6 +58,7 @@ pub enum MailError {
     InvalidDiskLimit,
     Io(std::io::Error),
     WalCheckpointBusy,
+    AdmissionPaused,
     InvalidTime,
     ClockRollback,
     ReusedMessageId,
@@ -77,6 +78,11 @@ impl From<std::io::Error> for MailError {
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PutStatus { Stored, Duplicate }
+
+/// Process-local fail-closed intake switch. It is deliberately NOT a durable
+/// storage-quota or a replacement for OS/filesystem-enforced disk isolation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MailboxAdmission { Open, PausedStorageFault }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct OpaqueMessage {
@@ -114,6 +120,7 @@ pub struct Mailbox {
     db: Connection,
     limits: MailboxLimits,
     path: PathBuf,
+    admission: MailboxAdmission,
 }
 impl Mailbox {
     pub fn open(path: &Path, limits: MailboxLimits) -> Result<Self, MailError> {
@@ -153,7 +160,9 @@ impl Mailbox {
              CREATE INDEX IF NOT EXISTS mailbox_tombstone_gc
                ON mailbox_tombstones(retained_until);",
         )?;
-        Ok(Self {db, limits, path: path.to_path_buf()})
+        Ok(Self {
+            db, limits, path: path.to_path_buf(), admission: MailboxAdmission::Open,
+        })
     }
 
     /// Explicit opt-in: apply a connection-scoped SQLite main-database page
@@ -222,6 +231,28 @@ impl Mailbox {
         Ok(WalCheckpointResult { log_frames, checkpointed_frames })
     }
 
+    /// A disk-full or SQLite I/O failure makes subsequent intake fail closed
+    /// in this instance until an explicit maintenance/recovery attempt.
+    /// On process restart this volatile flag is lost: the outer service must
+    /// enforce any persistent admission / health policy.
+    pub fn admission(&self) -> MailboxAdmission { self.admission }
+
+    /// Trusted maintenance only. Attempt a genuine SQLite write transaction
+    /// after freeing disk space; clear the intake pause only on COMMIT success.
+    /// This tests a *small* write, not guaranteed capacity for the next packet:
+    /// a later FULL/IOERR immediately pauses intake again. Never call directly
+    /// from an untrusted network request or treat as an end-recipient ACK.
+    pub fn try_resume_after_maintenance(&mut self) -> Result<(), MailError> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE mailbox_maintenance SET last_gc_at=last_gc_at WHERE singleton=1",
+            [],
+        )?;
+        tx.commit()?;
+        self.admission = MailboxAdmission::Open;
+        Ok(())
+    }
+
     /// Enqueue an opaque ciphertext under a recipient-issued routing token.
     ///
     /// Duplicate ID + identical ciphertext AND expiry are idempotent;
@@ -232,6 +263,24 @@ impl Mailbox {
     /// messages. Expired rows retain their quota until explicit maintenance.
     /// Deleted IDs remain reserved while a bounded tombstone is retained.
     pub fn put(
+        &mut self,
+        route_token: [u8; 16],
+        message_id: [u8; 16],
+        now: i64,
+        expires_at: i64,
+        sealed: &[u8],
+    ) -> Result<PutStatus, MailError> {
+        if self.admission == MailboxAdmission::PausedStorageFault {
+            return Err(MailError::AdmissionPaused);
+        }
+        let result = self.put_inner(route_token, message_id, now, expires_at, sealed);
+        if result.as_ref().err().is_some_and(is_storage_fault) {
+            self.admission = MailboxAdmission::PausedStorageFault;
+        }
+        result
+    }
+
+    fn put_inner(
         &mut self,
         route_token: [u8; 16],
         message_id: [u8; 16],
@@ -449,5 +498,16 @@ fn file_len_or_zero(path: &Path) -> Result<u64, MailError> {
         Ok(metadata) => Ok(metadata.len()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(err) => Err(MailError::Io(err)),
+    }
+}
+
+fn is_storage_fault(err: &MailError) -> bool {
+    match err {
+        MailError::Db(rusqlite::Error::SqliteFailure(sql, _)) => matches!(
+            sql.code,
+            rusqlite::ErrorCode::DiskFull | rusqlite::ErrorCode::SystemIoFailure
+        ),
+        MailError::Io(io) => io.raw_os_error() == Some(28), // Unix ENOSPC
+        _ => false,
     }
 }
