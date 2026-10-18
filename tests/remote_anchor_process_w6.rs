@@ -353,7 +353,7 @@ impl TrustedPolicyAnchor for LostCasReply<'_> {
 }
 
 #[test]
-fn real_quic_signed_cas_lost_reply_recovers_after_both_processes_restart() {
+fn real_quic_signed_cas_lost_reply_recovers_after_authority_restart_and_policy_reopen() {
     let dir=tempdir().unwrap();
     let local_path=dir.path().join("policy.sqlite");
     let remote_path=dir.path().join("anchor.sqlite");
@@ -383,7 +383,6 @@ fn real_quic_signed_cas_lost_reply_recovers_after_both_processes_restart() {
     );
     assert!(matches!(blocked,Err(EnrollmentError::PendingRecovery)));
     assert!(!invoked);
-    drop(lost);
     drop(admin);
     drop(reader);
     drop(local);
