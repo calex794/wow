@@ -8,7 +8,7 @@ use akula_wire_lab::ingress_bridge_w5::{
     IngressRoute, LabRelayGrant,
 };
 use akula_wire_lab::journal_w4::{Delivery, Insert, Journal, JournalError};
-use akula_wire_lab::mailbox_w5::{Mailbox, MailError, MailboxLimits, PutStatus};
+use akula_wire_lab::mailbox_w5::{Mailbox, MailboxLimits, PutStatus};
 use akula_wire_lab::trust_w3::TrustRegistry;
 use akula_wire_lab::{stream_frame, WireError, MAX_MESSAGE_BYTES};
 use ed25519_dalek::SigningKey;
