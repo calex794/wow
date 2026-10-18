@@ -272,3 +272,114 @@ async fn pinned_server_tls_key_prevents_writing_to_an_impostor_address(){
     assert_eq!(client(41,genuine.addr()).current().unwrap(),cp(0,7));
     genuine.stop().await;
 }
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn stolen_administrator_tls_key_cannot_forge_operator_signed_transition() {
+    let dir=tempdir().unwrap();
+    let path=dir.path().join("remote.sqlite");
+    let old=cp(7,11);
+    let new=cp(8,12);
+    provision(&path,old);
+    let server=Server::start(&path).await;
+    let admin=client(42,server.addr());
+    let reader=client(41,server.addr());
+    let valid_change=signed(8,PolicyOperation::Revoke);
+    let valid_proof=sign_anchor_transition(&root(),&valid_change,old,new).unwrap();
+
+    // Compromised TLS-admin credential alone is now insufficient.
+    assert_anchor_error(admin.advance(old,new),AnchorError::InvalidAttestation);
+
+    let forged_signer=SigningKey::from_bytes(&[222;32]);
+    let forged_change=sign_operator_change(&forged_signer,&OperatorChange {
+        operation:PolicyOperation::Revoke,revision:8,binding:binding(),
+    }).unwrap();
+    let forged_proof=sign_anchor_transition(
+        &forged_signer,&forged_change,old,new,
+    ).unwrap();
+    assert_anchor_error(
+        admin.advance_signed(old,new,&forged_change,&forged_proof),
+        AnchorError::InvalidAttestation,
+    );
+
+    // Even a VALID offline operator change cannot authorize a different
+    // digest without a separate signature binding that exact digest.
+    assert_anchor_error(
+        admin.advance_signed(old,cp(8,99),&valid_change,&valid_proof),
+        AnchorError::InvalidAttestation,
+    );
+    let mut corrupt=valid_proof;
+    corrupt[0]^=0x80;
+    assert_anchor_error(
+        admin.advance_signed(old,new,&valid_change,&corrupt),
+        AnchorError::InvalidAttestation,
+    );
+    let other_valid_change=signed(8,PolicyOperation::Allow);
+    assert_anchor_error(
+        admin.advance_signed(old,new,&other_valid_change,&valid_proof),
+        AnchorError::InvalidAttestation,
+    );
+
+    // Two correct offline signatures still do not allow a relay reader to
+    // act as the privileged admin TLS identity.
+    assert_anchor_error(
+        reader.advance_signed(old,new,&valid_change,&valid_proof),
+        AnchorError::InvalidAttestation,
+    );
+    assert_eq!(reader.current().unwrap(),old);
+
+    // One EXACT signed intent may commit only once; replay is CAS conflict.
+    admin.advance_signed(old,new,&valid_change,&valid_proof).unwrap();
+    assert_eq!(reader.current().unwrap(),new);
+    assert_anchor_error(
+        admin.advance_signed(old,new,&valid_change,&valid_proof),
+        AnchorError::Conflict,
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn pinned_offline_operator_key_cannot_be_replaced_at_anchor_reopen() {
+    let dir=tempdir().unwrap();
+    let db=dir.path().join("remote.sqlite");
+    provision(&db,cp(1,2));
+    let wrong=AnchorServicePolicy {
+        reader:sec(41).public(),administrator:sec(42).public(),
+        operator:SigningKey::from_bytes(&[221;32]).verifying_key(),
+    };
+    assert!(matches!(
+        RemoteAnchorLedger::open(&db,wrong),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
+    assert_eq!(
+        RemoteAnchorLedger::open(&db,policy_config()).unwrap()
+            .current_for(sec(41).public()).unwrap(),
+        cp(1,2)
+    );
+}
+
+#[test]
+fn offline_preview_signature_binds_real_w6_policy_mutation_before_publication() {
+    let dir=tempdir().unwrap();
+    let path=dir.path().join("policy.sqlite");
+    let mut policy=PeerEnrollmentDb::open(&path,root().verifying_key()).unwrap();
+    policy.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
+    let change=signed(2,PolicyOperation::Revoke);
+    let prior=policy.checkpoint().unwrap();
+    let (old,new)=policy.preview_signed_update(&change).unwrap();
+    assert_eq!(old,prior);
+    assert_eq!(old.revision,1);
+    assert_eq!(new.revision,2);
+    assert_ne!(old.digest,new.digest);
+    assert_eq!(policy.last_revision().unwrap(),1);
+    assert_eq!(policy.checkpoint().unwrap(),prior);
+    let proof=sign_anchor_transition(&root(),&change,old,new).unwrap();
+    let verified=akula_wire_lab::peer_enrollment_w6::verify_signed_anchor_transition(
+        &root().verifying_key(),&change,old,new,&proof,
+    ).unwrap();
+    assert_eq!(verified.operation,PolicyOperation::Revoke);
+    assert_eq!(verified.binding,binding());
+    assert!(akula_wire_lab::peer_enrollment_w6::verify_signed_anchor_transition(
+        &root().verifying_key(),&change,old,cp(2,200),&proof,
+    ).is_err());
+}
