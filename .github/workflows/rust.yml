@@ -10,3 +10,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
+
+  enospc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Mount isolated size-limited filesystem
+        run: |
+          ROOT="$RUNNER_TEMP/staya-enospc"
+          mkdir -p "$ROOT"
+          sudo mount -t tmpfs -o size=16m,mode=0777,nosuid,nodev tmpfs "$ROOT"
+          mountpoint -q "$ROOT"
+          test "$(stat -c %d "$ROOT")" != "$(stat -c %d "$RUNNER_TEMP")"
+      - name: Require real Linux ENOSPC and safe mailbox recovery
+        env:
+          STAYA_ENOSPC_MOUNT: ${{ runner.temp }}/staya-enospc
+        run: cargo test --test mailbox_real_enospc_w5 -- --ignored --nocapture
+      - name: Unmount isolated filesystem
+        if: always()
+        run: |
+          ROOT="$RUNNER_TEMP/staya-enospc"
+          if mountpoint -q "$ROOT"; then sudo umount "$ROOT"; fi
