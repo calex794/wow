@@ -40,6 +40,16 @@ impl TrustRegistry {
         Ok(())
     }
 
+    /// Return the registry-owned key for an exact nonrevoked epoch.
+    pub fn key_for(&self, device: [u8;16], epoch: u64)
+        -> Result<&VerifyingKey, TrustError>
+    {
+        let entry=self.devices.get(&device).ok_or(TrustError::Untrusted)?;
+        if entry.revoked { return Err(TrustError::Revoked); }
+        if entry.epoch != epoch { return Err(TrustError::WrongEpoch); }
+        Ok(&entry.key)
+    }
+
     pub fn verify(&self, device: [u8;16], epoch: u64, key: &VerifyingKey)
         -> Result<(), TrustError>
     {
