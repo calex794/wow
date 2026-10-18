@@ -18,6 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve and prove exact Roha/noq Git fork chain
+        run: |
+          cargo metadata --features iroh-transport --format-version 1 > metadata.json
+          python3 scripts/check_dependency_chain.py metadata.json Cargo.lock
+          cargo tree --features iroh-transport -i noq
+          cargo tree --features iroh-transport -i noq-proto
+          cargo tree --features iroh-transport -i noq-udp
       - name: Run authenticated iroh QUIC loopback integration tests
         run: cargo test --features iroh-transport --all-targets
       - name: Strict Clippy including real iroh adapter
