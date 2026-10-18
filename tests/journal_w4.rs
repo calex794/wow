@@ -40,6 +40,6 @@ fn a(n:u8)->[u8;16]{[n;16]}
 #[test] fn missing_message_cannot_be_marked_as_delivered(){
  let d=tempdir().unwrap();let p=d.path().join("missing.sqlite");
  let mut j=Journal::open(&p).unwrap();
- assert!(matches!(j.record_verified_receipt(a(1),a(2),Delivery::Recipient),Err(JournalError::NotFound)));
+ assert!(matches!(j.record_verified_receipt(a(1),a(2),Delivery::Recipient),Err(JournalError::InvalidState)));
  assert!(matches!(j.retry_bytes(a(1),a(2),1),Err(JournalError::NotFound)));
 }
