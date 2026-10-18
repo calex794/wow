@@ -5,10 +5,13 @@ use akula_wire_lab::crypto_identity_w3::{seal, SignedHeader, TrustedRecipient};
 use akula_wire_lab::crypto_w3::new_recipient;
 use akula_wire_lab::ingress_bridge_w5::{
     receive_verified_recipient_ack, serve_one_tcp, BridgeError, IngressOutcome,
-    IngressRoute, LabRelayGrant,
+    IngressRoute,
 };
 use akula_wire_lab::journal_w4::{Delivery, Insert, Journal, JournalError};
 use akula_wire_lab::mailbox_w5::{Mailbox, MailboxLimits, PutStatus};
+use akula_wire_lab::route_grant_w5::{
+    sign_for_lab, GrantError, RelayGrantClaims, RelayPolicy,
+};
 use akula_wire_lab::trust_w3::TrustRegistry;
 use akula_wire_lab::{stream_frame, WireError, MAX_MESSAGE_BYTES};
 use ed25519_dalek::SigningKey;
@@ -24,6 +27,28 @@ fn enrolled(sender: &SigningKey, recipient: &SigningKey) -> TrustRegistry {
     trust.enroll(id(1), 3, sender.verifying_key()).unwrap();
     trust.enroll(id(2), 4, recipient.verifying_key()).unwrap();
     trust
+}
+
+/// Independently enrolled route owner issues a signed, single-message permit.
+fn grant_for(packet: &[u8], message_id: [u8; 16], expires_at: i64)
+    -> (TrustRegistry, RelayPolicy, Vec<u8>)
+{
+    let issuer = SigningKey::from_bytes(&[10;32]);
+    let mut trust = TrustRegistry::new();
+    trust.enroll(id(42), 3, issuer.verifying_key()).unwrap();
+    let policy = RelayPolicy {
+        issuer_id: id(42), relay_id: id(43),
+        namespace: id(44), route_token: id(9),
+    };
+    let signed = sign_for_lab(&issuer, RelayGrantClaims {
+        issuer_id: policy.issuer_id, issuer_epoch: 3,
+        relay_id: policy.relay_id, namespace: policy.namespace,
+        route_token: policy.route_token, message_id,
+        expires_at,
+        ciphertext_len: u32::try_from(packet.len()).unwrap(),
+        ciphertext_digest: *blake3::hash(packet).as_bytes(),
+    }).unwrap();
+    (trust, policy, signed)
 }
 
 /// Binds a real localhost listener, sends one W2 frame, routes it on the
@@ -74,13 +99,13 @@ fn mailbox_temporary_storage_never_confirms_recipient_but_final_commit_does() {
         &relay_path, MailboxLimits::default(),
     ).unwrap();
     relay.try_resume_after_maintenance().unwrap();
+    let (route_trust, relay_policy, signed_grant) = grant_for(&packet, id(7), 8000);
 
     let (stored, relay_wire) = send(
         IngressRoute::Mailbox {
             store: &mut relay,
-            grant: LabRelayGrant {
-                route_token: id(9), message_id: id(7), now: 100, expires_at: 8000,
-            },
+            signed_grant: &signed_grant,
+            policy: &relay_policy, trust: &route_trust, now: 100,
         },
         &packet,
     );
@@ -203,12 +228,11 @@ fn forged_mailbox_bytes_are_not_authentic_recipient_messages() {
     ).unwrap();
     relay.try_resume_after_maintenance().unwrap();
     let fake=b"not an authenticated W3 packet";
+    let (route_trust, relay_policy, signed_grant) = grant_for(fake, id(9), 200);
     let (stored, wire)=send(
         IngressRoute::Mailbox {
-            store:&mut relay,
-            grant:LabRelayGrant{
-                route_token:id(9),message_id:id(9),now:100,expires_at:200,
-            },
+            store:&mut relay, signed_grant:&signed_grant,
+            policy:&relay_policy, trust:&route_trust, now:100,
         },fake
     );
     assert!(matches!(stored,Ok(IngressOutcome::MailboxStored(PutStatus::Stored))));
@@ -240,11 +264,11 @@ fn corrupt_or_oversized_stream_frames_cannot_touch_mailbox_or_send_ack() {
         &dir.path().join("relay.sqlite"),MailboxLimits::default()
     ).unwrap();
     relay.try_resume_after_maintenance().unwrap();
-    let grant=LabRelayGrant{route_token:id(9),message_id:id(7),now:100,expires_at:200};
+    let (route_trust, relay_policy, signed_grant) = grant_for(b"short", id(7), 200);
 
     let oversized = u32::try_from(MAX_MESSAGE_BYTES+1).unwrap().to_be_bytes();
     let (rejected,ack)=tcp_once(
-        IngressRoute::Mailbox{store:&mut relay,grant},&oversized,
+        IngressRoute::Mailbox{store:&mut relay,signed_grant:&signed_grant,policy:&relay_policy,trust:&route_trust,now:100},&oversized,
     );
     assert!(matches!(rejected,Err(BridgeError::Wire(WireError::TooLarge))));
     assert!(ack.is_empty());
@@ -253,7 +277,7 @@ fn corrupt_or_oversized_stream_frames_cannot_touch_mailbox_or_send_ack() {
     let mut truncated = Vec::from(30u32.to_be_bytes());
     truncated.extend_from_slice(b"short");
     let (rejected,ack)=tcp_once(
-        IngressRoute::Mailbox{store:&mut relay,grant},&truncated,
+        IngressRoute::Mailbox{store:&mut relay,signed_grant:&signed_grant,policy:&relay_policy,trust:&route_trust,now:100},&truncated,
     );
     assert!(matches!(rejected,Err(BridgeError::Io(_))));
     assert!(ack.is_empty());
