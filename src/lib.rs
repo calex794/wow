@@ -23,6 +23,8 @@ pub mod guarded_tcp_w5;
 pub mod peer_proof_w5;
 #[cfg(feature = "iroh-transport")]
 pub mod iroh_mailbox_w6;
+#[cfg(feature = "iroh-transport")]
+pub mod peer_enrollment_w6;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
