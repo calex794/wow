@@ -11,7 +11,7 @@
 use akula_wire_lab::peer_enrollment_w6::{
     sign_operator_change, AnchorError, EnrollmentError, EnrollmentLookup,
     EndpointRouteBinding, OperatorChange, PeerEnrollmentDb, PolicyCheckpoint,
-    PolicyOperation, TrustedPolicyAnchor,
+    PolicyOperation, TrustedPolicyAnchor, sign_anchor_transition,
 };
 use akula_wire_lab::remote_anchor_w6::{
     serve_one_anchor_connection, AnchorServicePolicy, RemoteAnchorClient,
@@ -41,6 +41,7 @@ fn policy()->AnchorServicePolicy {
     AnchorServicePolicy {
         reader:key(41).public(),
         administrator:key(42).public(),
+        operator:root().verifying_key(),
     }
 }
 fn cp(revision:u64,byte:u8)->PolicyCheckpoint {
@@ -201,6 +202,13 @@ impl Drop for ChildAuthority {
 fn client(v:u8,addr:EndpointAddr)->RemoteAnchorClient {
     RemoteAnchorClient::start(key(v),addr).unwrap()
 }
+fn authorized_cas(
+    client:&RemoteAnchorClient,old:PolicyCheckpoint,next:PolicyCheckpoint,
+)->Result<(),AnchorError> {
+    let command=signed(next.revision,PolicyOperation::Revoke);
+    let proof=sign_anchor_transition(&root(),&command,old,next).unwrap();
+    client.advance_signed(old,next,&command,&proof)
+}
 
 #[test]
 fn separate_os_process_crash_restart_retains_cas_and_rejects_unauthorized_quic_keys() {
@@ -219,10 +227,14 @@ fn separate_os_process_crash_restart_retains_cas_and_rejects_unauthorized_quic_k
         reader.advance(initial,advanced).unwrap_err(),
         AnchorError::InvalidAttestation
     );
-    administrator.advance(initial,advanced).unwrap();
-    assert_eq!(reader.current().unwrap(),advanced);
     assert_eq!(
         administrator.advance(initial,advanced).unwrap_err(),
+        AnchorError::InvalidAttestation
+    );
+    authorized_cas(&administrator,initial,advanced).unwrap();
+    assert_eq!(reader.current().unwrap(),advanced);
+    assert_eq!(
+        authorized_cas(&administrator,initial,advanced).unwrap_err(),
         AnchorError::Conflict
     );
     // A sudden OS PROCESS KILL must NOT roll back the already committed
@@ -230,7 +242,7 @@ fn separate_os_process_crash_restart_retains_cas_and_rejects_unauthorized_quic_k
     service.finish(true);
     let service=ChildAuthority::start(dir.path());
     assert_eq!(client(41,service.address()).current().unwrap(),advanced);
-    client(42,service.address()).advance(advanced,cp(3,3)).unwrap();
+    authorized_cas(&client(42,service.address()),advanced,cp(3,3)).unwrap();
     assert_eq!(client(41,service.address()).current().unwrap(),cp(3,3));
     service.finish(false);
 }
@@ -255,7 +267,10 @@ fn separate_os_process_rejects_restored_local_policy_after_signed_revoke() {
     let binding=binding();
     let mut active=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
     assert_eq!(active.authorize_anchored(&reader,lookup(&binding)).unwrap(),(id(7),3));
-    active.apply_signed_anchored(&signed(2,PolicyOperation::Revoke),&admin).unwrap();
+    let change=signed(2,PolicyOperation::Revoke);
+    let (old,next)=active.preview_signed_update(&change).unwrap();
+    let proof=sign_anchor_transition(&root(),&change,old,next).unwrap();
+    active.apply_signed_anchored_with_proof(&change,&proof,&admin).unwrap();
     assert_eq!(reader.current().unwrap(),active.checkpoint().unwrap());
     drop(active);
     flush(&local_path);
