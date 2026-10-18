@@ -19,7 +19,9 @@ use crate::guarded_tcp_w5::GuardedTcpClock;
 use crate::ingress_bridge_w5::{self, BridgeError, IngressOutcome};
 use crate::ingress_guard_w5::{AdmissionError, IngressGuard, Lane, Ticket};
 use crate::mailbox_w5::Mailbox;
-use crate::peer_enrollment_w6::{EnrollmentError, PeerEnrollmentDb};
+use crate::peer_enrollment_w6::{
+    EnrollmentError, PeerEnrollmentDb, TrustedPolicyAnchor,
+};
 use crate::route_grant_w5::{RelayPolicy, SIGNED_GRANT_LEN};
 use crate::trust_w3::TrustRegistry;
 use crate::MAX_MESSAGE_BYTES;
@@ -61,6 +63,10 @@ pub struct IrohMailboxContext<'a> {
     pub local: &'a Endpoint,
     pub expected_local_id: EndpointId,
     pub enrollments: &'a Mutex<PeerEnrollmentDb>,
+    /// Trusted OUT-OF-ROLLBACK-DOMAIN authenticated policy checkpoint.
+    /// This MUST NOT be read from the client's packet or the same SQLite
+    /// snapshot. Missing/unavailable/stale anchor fails closed.
+    pub policy_anchor: &'a dyn TrustedPolicyAnchor,
     pub devices: &'a TrustRegistry,
     pub issuer_trust: &'a TrustRegistry,
     pub relay_policy: &'a RelayPolicy,
@@ -145,13 +151,15 @@ pub async fn receive_authenticated_iroh_mailbox(
     let _lease = Lease { guard: context.guard, ticket };
 
     // TLS authenticates EndpointId, but it DOES NOT authorize a route.
+    // Fail closed if an independent monotonic anchor does not match the
+    // canonical digest of this SQLite policy DB, even before reading a stream.
     // Only a separately signed and persisted operator policy can bind
     // remote_id() to W3 DeviceId / epoch / issuer / namespace / token.
     let (device, epoch) = {
-        let enrollment = context.enrollments.lock()
+        let mut enrollment = context.enrollments.lock()
             .map_err(|_| IrohIngressError::LockPoisoned)?;
-        enrollment.authorize(
-            &connection.remote_id(),
+        enrollment.authorize_anchored(
+            context.policy_anchor, &connection.remote_id(),
             &context.relay_policy.relay_id,
             &context.relay_policy.namespace,
             &context.relay_policy.route_token,
@@ -181,13 +189,13 @@ pub async fn receive_authenticated_iroh_mailbox(
     }
     // BEGIN IMMEDIATE on the *shared* policy SQLite file serializes policy
     // changes from other OS processes with this final authorization+Mailbox
-    // COMMIT. The in-process mutex is still needed for the rusqlite handle.
+    // COMMIT. Re-check external checkpoint under this same SQLite lock. The in-process mutex is still needed for the rusqlite handle.
     // No network I/O or await under either lock. Admin revocation committed
     // first will fail closed; Mailbox COMMIT first completes before revoke.
     let mut enrollment = context.enrollments.lock()
         .map_err(|_| IrohIngressError::LockPoisoned)?;
-    enrollment.with_authorized_write(
-        &connection.remote_id(),
+    enrollment.with_anchored_write(
+        context.policy_anchor, &connection.remote_id(),
         &context.relay_policy.relay_id,
         &context.relay_policy.namespace,
         &context.relay_policy.route_token,
