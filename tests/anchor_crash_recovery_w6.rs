@@ -11,11 +11,20 @@ use ed25519_dalek::SigningKey;
 use iroh::{EndpointId, SecretKey};
 use std::sync::Mutex;
 use tempfile::tempdir;
+use rusqlite::{params, Connection};
 
-struct Anchor(Mutex<PolicyCheckpoint>);
+#[derive(Clone, Copy)]
+enum CasBehavior { CommitThenLoseReply, FailBeforeCas, CommitAndAck }
+
+struct Anchor {
+    checkpoint: Mutex<PolicyCheckpoint>,
+    behavior: CasBehavior,
+}
+
+
 impl TrustedPolicyAnchor for Anchor {
     fn current(&self) -> Result<PolicyCheckpoint, AnchorError> {
-        Ok(*self.0.lock().unwrap())
+        Ok(*self.checkpoint.lock().unwrap())
     }
     fn advance(&self, _: PolicyCheckpoint, _: PolicyCheckpoint) -> Result<(), AnchorError> {
         Err(AnchorError::InvalidAttestation)
@@ -24,10 +33,19 @@ impl TrustedPolicyAnchor for Anchor {
         &self, old: PolicyCheckpoint, next: PolicyCheckpoint,
         _: &[u8], _: &[u8],
     ) -> Result<(), AnchorError> {
-        let mut state=self.0.lock().unwrap();
+        let mut state=self.checkpoint.lock().unwrap();
         if *state!=old { return Err(AnchorError::Conflict); }
-        *state=next;
-        Err(AnchorError::Unavailable) // response lost after durable CAS
+        match self.behavior {
+            CasBehavior::FailBeforeCas => Err(AnchorError::Unavailable),
+            CasBehavior::CommitThenLoseReply => {
+                *state=next;
+                Err(AnchorError::Unavailable) // CAS committed; response lost
+            },
+            CasBehavior::CommitAndAck => {
+                *state=next;
+                Ok(())
+            },
+        }
     }
 }
 fn signer() -> SigningKey { SigningKey::from_bytes(&[172;32]) }
@@ -49,18 +67,21 @@ fn lookup<'a>(b:&'a EndpointRouteBinding)->EnrollmentLookup<'a>{
         token:&b.route_token,issuer:&b.issuer_id,
     }
 }
-fn setup()->(tempfile::TempDir,PeerEnrollmentDb,Anchor) {
+fn setup(behavior:CasBehavior)->(tempfile::TempDir,PeerEnrollmentDb,Anchor) {
     let dir=tempdir().unwrap();
     let path=dir.path().join("policy.sqlite");
     let mut db=PeerEnrollmentDb::open(&path,signer().verifying_key()).unwrap();
     db.apply_signed(&change(1,PolicyOperation::Allow)).unwrap();
-    let anchor=Anchor(Mutex::new(db.checkpoint().unwrap()));
+    let anchor=Anchor {
+        checkpoint:Mutex::new(db.checkpoint().unwrap()),
+        behavior,
+    };
     (dir,db,anchor)
 }
 
 #[test]
 fn signed_intent_survives_unknown_cas_result_and_recovery_commits_exact_policy() {
-    let (dir,mut db,anchor)=setup();
+    let (dir,mut db,anchor)=setup(CasBehavior::CommitThenLoseReply);
     let signed=change(2,PolicyOperation::Revoke);
     let (old,next)=db.preview_signed_update(&signed).unwrap();
     let proof=sign_anchor_transition(&signer(),&signed,old,next).unwrap();
@@ -95,36 +116,45 @@ fn signed_intent_survives_unknown_cas_result_and_recovery_commits_exact_policy()
 
 #[test]
 fn failed_before_remote_cas_can_abort_pending_without_policy_mutation() {
-    let (_dir,mut db,anchor)=setup();
+    let (dir,mut db,anchor)=setup(CasBehavior::FailBeforeCas);
     let signed=change(2,PolicyOperation::Revoke);
     let (old,next)=db.preview_signed_update(&signed).unwrap();
     let proof=sign_anchor_transition(&signer(),&signed,old,next).unwrap();
-    struct Unavailable;
-    impl TrustedPolicyAnchor for Unavailable {
-        fn current(&self)->Result<PolicyCheckpoint,AnchorError>{Err(AnchorError::Unavailable)}
-        fn advance(&self,_:PolicyCheckpoint,_:PolicyCheckpoint)->Result<(),AnchorError>{Err(AnchorError::Unavailable)}
-    }
-    // A known unavailable CAS cannot be submitted if the preflight cannot
-    // read current. Instead use a deterministic before-CAS negative proof.
-    let mut corrupt=proof;
-    corrupt[0]^=1;
-    assert!(db.apply_signed_anchored_with_proof(&signed,&corrupt,&anchor).is_err());
+    // Unlike an invalid signature, the valid intent MUST be durably staged
+    // before the test authority refuses the outbound CAS.
+    assert!(matches!(
+        db.apply_signed_anchored_with_proof(&signed,&proof,&anchor),
+        Err(EnrollmentError::Anchor(AnchorError::Unavailable))
+    ));
     assert_eq!(db.checkpoint().unwrap(),old);
+    assert!(matches!(
+        db.authorize_anchored(&anchor,lookup(&binding())),
+        Err(EnrollmentError::PendingRecovery)
+    ));
+    drop(db);
+    let mut reopened=PeerEnrollmentDb::open(
+        &dir.path().join("policy.sqlite"),signer().verifying_key(),
+    ).unwrap();
     assert_eq!(
-        db.recover_pending_signed_update(&anchor).unwrap(),
+        reopened.recover_pending_signed_update(&anchor).unwrap(),
+        SignedRecoveryOutcome::AbortedBeforeCas
+    );
+    assert_eq!(reopened.checkpoint().unwrap(),old);
+    assert_eq!(reopened.authorize_anchored(&anchor,lookup(&binding())).unwrap().1,1);
+    assert_eq!(
+        reopened.recover_pending_signed_update(&anchor).unwrap(),
         SignedRecoveryOutcome::NoPending
     );
-    let _=Unavailable;
 }
 
 #[test]
 fn remote_checkpoint_divergence_holds_pending_and_denies_access() {
-    let (_dir,mut db,anchor)=setup();
+    let (dir,mut db,anchor)=setup(CasBehavior::CommitThenLoseReply);
     let signed=change(2,PolicyOperation::Revoke);
     let (old,next)=db.preview_signed_update(&signed).unwrap();
     let proof=sign_anchor_transition(&signer(),&signed,old,next).unwrap();
     assert!(db.apply_signed_anchored_with_proof(&signed,&proof,&anchor).is_err());
-    *anchor.0.lock().unwrap()=PolicyCheckpoint {
+    *anchor.checkpoint.lock().unwrap()=PolicyCheckpoint {
         revision:next.revision+1,digest:[99;32],
     };
     assert!(matches!(
@@ -135,4 +165,66 @@ fn remote_checkpoint_divergence_holds_pending_and_denies_access() {
         db.preview_signed_update(&change(3,PolicyOperation::Revoke)),
         Err(EnrollmentError::PendingRecovery)
     ));
+    drop(db);
+    let mut reopened=PeerEnrollmentDb::open(
+        &dir.path().join("policy.sqlite"),signer().verifying_key(),
+    ).unwrap();
+    assert!(matches!(
+        reopened.recover_pending_signed_update(&anchor),
+        Err(EnrollmentError::CheckpointMismatch)
+    ));
+    assert_eq!(reopened.checkpoint().unwrap(),old);
+    assert!(matches!(
+        reopened.with_anchored_write::<(),EnrollmentError,_>(
+            &anchor,lookup(&binding()),|_|Ok(())),
+        Err(EnrollmentError::PendingRecovery)
+    ));
 }
+
+#[test]
+fn successful_signed_cas_commits_local_policy_and_removes_pending() {
+    let (_dir,mut db,anchor)=setup(CasBehavior::CommitAndAck);
+    let signed=change(2,PolicyOperation::Revoke);
+    let (old,next)=db.preview_signed_update(&signed).unwrap();
+    let proof=sign_anchor_transition(&signer(),&signed,old,next).unwrap();
+    db.apply_signed_anchored_with_proof(&signed,&proof,&anchor).unwrap();
+    assert_eq!(db.checkpoint().unwrap(),next);
+    assert_eq!(
+        db.recover_pending_signed_update(&anchor).unwrap(),
+        SignedRecoveryOutcome::NoPending
+    );
+    assert!(matches!(
+        db.authorize_anchored(&anchor,lookup(&binding())),
+        Err(EnrollmentError::Revoked)
+    ));
+}
+
+#[test]
+fn journal_signature_tampering_does_not_enable_recovery_or_access() {
+    let (dir,mut db,anchor)=setup(CasBehavior::CommitThenLoseReply);
+    let signed=change(2,PolicyOperation::Revoke);
+    let (old,next)=db.preview_signed_update(&signed).unwrap();
+    let proof=sign_anchor_transition(&signer(),&signed,old,next).unwrap();
+    assert!(db.apply_signed_anchored_with_proof(&signed,&proof,&anchor).is_err());
+    drop(db);
+    let path=dir.path().join("policy.sqlite");
+    let sql=Connection::open(&path).unwrap();
+    let mut bad=proof;
+    bad[0]^=1;
+    sql.execute(
+        "UPDATE w6_pending_transition SET signed_proof=?1 WHERE singleton=1",
+        params![bad.as_slice()],
+    ).unwrap();
+    drop(sql);
+    let mut reopened=PeerEnrollmentDb::open(&path,signer().verifying_key()).unwrap();
+    assert!(matches!(
+        reopened.recover_pending_signed_update(&anchor),
+        Err(EnrollmentError::InvalidSignature)
+    ));
+    assert_eq!(reopened.checkpoint().unwrap(),old);
+    assert!(matches!(
+        reopened.authorize_anchored(&anchor,lookup(&binding())),
+        Err(EnrollmentError::PendingRecovery)
+    ));
+}
+
