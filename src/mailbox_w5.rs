@@ -79,8 +79,10 @@ impl From<std::io::Error> for MailError {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PutStatus { Stored, Duplicate }
 
-/// Process-local fail-closed intake switch. It is deliberately NOT a durable
-/// storage-quota or a replacement for OS/filesystem-enforced disk isolation.
+/// A fail-closed intake switch. Protected mailboxes start paused after EVERY
+/// process restart, because SQLITE_FULL may make it impossible to persist a
+/// new failure flag. Admission still requires trusted external maintenance;
+/// this is NOT a filesystem quota, identity check, or production service.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MailboxAdmission { Open, PausedStorageFault }
 
@@ -121,6 +123,9 @@ pub struct Mailbox {
     limits: MailboxLimits,
     path: PathBuf,
     admission: MailboxAdmission,
+    /// A recovery grant valid only for this process and admission epoch.
+    /// Never deserialize a previous process's grant from disk.
+    recovery_epoch: Option<i64>,
 }
 impl Mailbox {
     pub fn open(path: &Path, limits: MailboxLimits) -> Result<Self, MailError> {
@@ -158,11 +163,51 @@ impl Mailbox {
                  PRIMARY KEY(route_token,message_id)
              );
              CREATE INDEX IF NOT EXISTS mailbox_tombstone_gc
-               ON mailbox_tombstones(retained_until);",
+               ON mailbox_tombstones(retained_until);
+             CREATE TABLE IF NOT EXISTS mailbox_admission_policy (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                 guard_required INTEGER NOT NULL CHECK(guard_required IN (0,1)),
+                 recovery_epoch INTEGER NOT NULL CHECK(recovery_epoch>=0)
+             );
+             INSERT OR IGNORE INTO mailbox_admission_policy
+               (singleton,guard_required,recovery_epoch) VALUES (1,0,0);",
+        )?;
+        let guard_required: i64 = db.query_row(
+            "SELECT guard_required FROM mailbox_admission_policy WHERE singleton=1",
+            [], |row| row.get(0),
         )?;
         Ok(Self {
-            db, limits, path: path.to_path_buf(), admission: MailboxAdmission::Open,
+            db, limits, path: path.to_path_buf(),
+            admission: if guard_required == 0 {
+                MailboxAdmission::Open
+            } else {
+                MailboxAdmission::PausedStorageFault
+            },
+            recovery_epoch: None,
         })
+    }
+
+    /// Opt into restart-safe fail-closed behavior. Records guard_required=1
+    /// BEFORE allowing any delivery path to use this database. A transaction
+    /// failure aborts opening; nothing is silently enabled. After a restart
+    /// even legacy open() respects the persisted guard and begins paused.
+    ///
+    /// This is not an ACL: only a trusted gateway should expose maintenance.
+    pub fn open_recovery_gated(
+        path: &Path, limits: MailboxLimits,
+    ) -> Result<Self, MailError> {
+        let mut mailbox = Self::open(path, limits)?;
+        let tx = mailbox.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE mailbox_admission_policy
+               SET guard_required=1, recovery_epoch=recovery_epoch+1
+             WHERE singleton=1",
+            [],
+        )?;
+        tx.commit()?;
+        mailbox.admission = MailboxAdmission::PausedStorageFault;
+        mailbox.recovery_epoch = None;
+        Ok(mailbox)
     }
 
     /// Explicit opt-in: apply a connection-scoped SQLite main-database page
@@ -231,24 +276,47 @@ impl Mailbox {
         Ok(WalCheckpointResult { log_frames, checkpointed_frames })
     }
 
-    /// A disk-full or SQLite I/O failure makes subsequent intake fail closed
-    /// in this instance until an explicit maintenance/recovery attempt.
-    /// On process restart this volatile flag is lost: the outer service must
-    /// enforce any persistent admission / health policy.
+    /// A disk-full or SQLite I/O failure pauses this instance. Once the
+    /// persisted restart gate is enabled, every reopened instance (including
+    /// legacy open()) begins paused until a trusted recovery transaction.
     pub fn admission(&self) -> MailboxAdmission { self.admission }
 
-    /// Trusted maintenance only. Attempt a genuine SQLite write transaction
-    /// after freeing disk space; clear the intake pause only on COMMIT success.
-    /// This tests a *small* write, not guaranteed capacity for the next packet:
-    /// a later FULL/IOERR immediately pauses intake again. Never call directly
-    /// from an untrusted network request or treat as an end-recipient ACK.
+    /// Trusted maintenance ONLY. A real SQLite write transaction verifies the
+    /// backend is writable, then advances the durable recovery epoch, revoking
+    /// prior process-local grants. No grant is valid across a restart.
+    ///
+    /// WARNING: a small write cannot guarantee space for the next packet.
+    /// Any later FULL/IOERR pauses the instance again. The caller must
+    /// enforce operator authorization; there is no exposed network API here.
     pub fn try_resume_after_maintenance(&mut self) -> Result<(), MailError> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE mailbox_maintenance SET last_gc_at=last_gc_at WHERE singleton=1",
             [],
         )?;
+        let (required, epoch): (i64,i64) = tx.query_row(
+            "SELECT guard_required,recovery_epoch
+               FROM mailbox_admission_policy WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        let new_epoch = if required != 0 {
+            tx.execute(
+                "UPDATE mailbox_admission_policy
+                 SET recovery_epoch=recovery_epoch+1 WHERE singleton=1",
+                [],
+            )?;
+            let new_epoch: i64 = tx.query_row(
+                "SELECT recovery_epoch FROM mailbox_admission_policy WHERE singleton=1",
+                [], |row| row.get(0),
+            )?;
+            Some(new_epoch)
+        } else {
+            let _ = epoch;
+            None
+        };
         tx.commit()?;
+        self.recovery_epoch = new_epoch;
         self.admission = MailboxAdmission::Open;
         Ok(())
     }
@@ -274,8 +342,11 @@ impl Mailbox {
             return Err(MailError::AdmissionPaused);
         }
         let result = self.put_inner(route_token, message_id, now, expires_at, sealed);
-        if result.as_ref().err().is_some_and(is_storage_fault) {
+        if result.as_ref().err().is_some_and(|error| {
+            is_storage_fault(error) || matches!(error, MailError::AdmissionPaused)
+        }) {
             self.admission = MailboxAdmission::PausedStorageFault;
+            self.recovery_epoch = None;
         }
         result
     }
@@ -299,6 +370,16 @@ impl Mailbox {
         }
         let digest = blake3::hash(sealed);
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Recheck under the same write transaction to stop a handle opened
+        // BEFORE another process enabled the protected admission policy.
+        let (guard_required, active_epoch): (i64,i64) = tx.query_row(
+            "SELECT guard_required,recovery_epoch FROM mailbox_admission_policy
+             WHERE singleton=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?)),
+        )?;
+        if guard_required != 0 && self.recovery_epoch != Some(active_epoch) {
+            return Err(MailError::AdmissionPaused);
+        }
         let last_gc_at: i64 = tx.query_row(
             "SELECT last_gc_at FROM mailbox_maintenance WHERE singleton=1",
             [], |r| r.get(0),
