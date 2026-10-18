@@ -321,3 +321,111 @@ fn forged_or_mismatched_recipient_ack_does_not_advance_sender_journal() {
         ).unwrap(),Delivery::Recipient
     );
 }
+
+
+#[test]
+fn signed_grant_rejects_changed_payload_and_wrong_route_scope_over_tcp() {
+    let dir = tempdir().unwrap();
+    let mut store = Mailbox::open_recovery_gated(
+        &dir.path().join("mail.sqlite"), MailboxLimits::default(),
+    ).unwrap();
+    store.try_resume_after_maintenance().unwrap();
+    let packet = b"opaque-authenticated-w3-shape-for-relay";
+    let (grant_trust, policy, signature) = grant_for(packet, id(7), 200);
+
+    // Valid signature does not authorize DIFFERENT ciphertext bytes.
+    let (outcome, ack) = send(
+        IngressRoute::Mailbox {
+            store: &mut store, signed_grant: &signature,
+            policy: &policy, trust: &grant_trust, now: 100,
+        },
+        b"changed opaque bytes",
+    );
+    assert!(matches!(outcome, Err(BridgeError::Grant(GrantError::PacketMismatch))));
+    assert!(ack.is_empty());
+    assert_eq!(store.stats().unwrap().messages, 0);
+
+    let other = RelayPolicy {route_token:id(55), ..policy};
+    let (outcome, ack) = send(
+        IngressRoute::Mailbox {
+            store: &mut store, signed_grant: &signature,
+            policy: &other, trust: &grant_trust, now: 100,
+        }, packet
+    );
+    assert!(matches!(outcome, Err(BridgeError::Grant(GrantError::WrongRoute))));
+    assert!(ack.is_empty());
+    assert_eq!(store.stats().unwrap().messages, 0);
+
+    let other_namespace = RelayPolicy {namespace:id(77), ..policy};
+    let (outcome, ack) = send(
+        IngressRoute::Mailbox {
+            store: &mut store, signed_grant: &signature,
+            policy: &other_namespace, trust: &grant_trust, now: 100,
+        }, packet
+    );
+    assert!(matches!(outcome, Err(BridgeError::Grant(GrantError::WrongNamespace))));
+    assert!(ack.is_empty());
+    assert_eq!(store.stats().unwrap().messages, 0);
+}
+
+#[test]
+fn tampered_or_expired_grant_never_writes_mailbox_or_sends_ack() {
+    let dir=tempdir().unwrap();
+    let mut store=Mailbox::open_recovery_gated(
+        &dir.path().join("mail.sqlite"),MailboxLimits::default()
+    ).unwrap();
+    store.try_resume_after_maintenance().unwrap();
+    let packet=b"one ciphertext";
+    let (trust, policy, signed) = grant_for(packet,id(7),200);
+
+    let mut tampered=signed.clone();
+    tampered[101] ^= 1; // signed digest field; bytes still the same length
+    let (result, ack)=send(
+        IngressRoute::Mailbox {
+            store:&mut store,signed_grant:&tampered,policy:&policy,trust:&trust,now:100,
+        },packet
+    );
+    assert!(matches!(result,Err(BridgeError::Grant(GrantError::InvalidSignature))));
+    assert!(ack.is_empty());
+
+    let (expired, ack)=send(
+        IngressRoute::Mailbox {
+            store:&mut store,signed_grant:&signed,policy:&policy,trust:&trust,now:200,
+        },packet
+    );
+    assert!(matches!(expired,Err(BridgeError::Grant(GrantError::Expired))));
+    assert!(ack.is_empty());
+    assert_eq!(store.stats().unwrap().messages,0);
+}
+
+#[test]
+fn revocation_invalidates_cached_grant_bytes_even_after_idempotent_accept() {
+    let dir=tempdir().unwrap();
+    let mut store=Mailbox::open_recovery_gated(
+        &dir.path().join("mail.sqlite"),MailboxLimits::default()
+    ).unwrap();
+    store.try_resume_after_maintenance().unwrap();
+    let packet=b"opaque exact packet";
+    let (mut trust,policy,grant)=grant_for(packet,id(7),200);
+    for expected in [PutStatus::Stored,PutStatus::Duplicate] {
+        let (result,wire)=send(
+            IngressRoute::Mailbox {
+                store:&mut store,signed_grant:&grant,
+                policy:&policy,trust:&trust,now:100,
+            },packet
+        );
+        assert!(matches!(result,Ok(IngressOutcome::MailboxStored(found)) if found==expected));
+        assert!(wire.is_empty());
+    }
+    assert_eq!(store.stats().unwrap().messages,1);
+    trust.revoke(id(42)).unwrap();
+    let (denied,wire)=send(
+        IngressRoute::Mailbox {
+            store:&mut store,signed_grant:&grant,
+            policy:&policy,trust:&trust,now:101,
+        },packet
+    );
+    assert!(matches!(denied,Err(BridgeError::Grant(GrantError::UntrustedIssuer))));
+    assert!(wire.is_empty());
+    assert_eq!(store.stats().unwrap().messages,1);
+}
