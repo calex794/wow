@@ -92,7 +92,8 @@ pub struct PolicyCheckpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignedRecoveryOutcome {
     NoPending,
-    AbortedBeforeCas,
+    /// This process submitted the previously signed CAS during recovery.
+    ForwardedPending,
     AppliedAfterCas,
     AlreadyApplied,
 }
@@ -618,6 +619,7 @@ impl PeerEnrollmentDb {
             .map_err(EnrollmentError::Anchor)?;
         match self.recover_pending_signed_update(anchor)? {
             SignedRecoveryOutcome::AppliedAfterCas
+            | SignedRecoveryOutcome::ForwardedPending
             | SignedRecoveryOutcome::AlreadyApplied => Ok(()),
             _ => Err(EnrollmentError::CheckpointMismatch),
         }
@@ -627,6 +629,12 @@ impl PeerEnrollmentDb {
     /// outcome. Never roll back the remote authority: either abort an intent
     /// not yet published, or reapply the exact offline-signed local mutation.
     /// The pending journal is deleted atomically with any local COMMIT.
+    ///
+    /// An observed old remote checkpoint is NOT proof that a previously
+    /// submitted CAS cannot arrive later. Therefore we NEVER abandon a
+    /// staged intent on GET(expected): retry the SAME preapproved signed CAS.
+    /// A failed or ambiguous retry leaves the intent in HOLD until the
+    /// independently trusted authority confirms the replacement checkpoint.
     ///
     /// The remote authority remains a separate trust and rollback domain;
     /// this does not solve cross-host fencing or a compromised offline signer.
@@ -642,16 +650,39 @@ impl PeerEnrollmentDb {
             pending.replacement, &pending.proof,
         )?;
         let local = policy_checkpoint(&tx, &self.operator)?;
-        let remote = anchor.current().map_err(EnrollmentError::Anchor)?;
-        let outcome = if local == pending.expected && remote == pending.expected {
-            // CAS never committed. Aborting this uncommitted intent is safe.
-            SignedRecoveryOutcome::AbortedBeforeCas
-        } else if local == pending.expected && remote == pending.replacement {
+        let mut remote = anchor.current().map_err(EnrollmentError::Anchor)?;
+        let mut forwarded = false;
+        if local == pending.expected && remote == pending.expected {
+            // A late CAS from the interrupted process can still arrive after
+            // this read. Never clear the journal just because GET saw old.
+            // Re-publish only the EXACT existing operator-signed transition.
+            // Even when RPC reports Conflict/Unavailable, GET may reveal that
+            // this or the original request already committed.
+            let publish = anchor.advance_signed(
+                pending.expected, pending.replacement,
+                &pending.change, &pending.proof,
+            );
+            remote = anchor.current().map_err(EnrollmentError::Anchor)?;
+            if remote == pending.expected {
+                return match publish {
+                    Err(error) => Err(EnrollmentError::Anchor(error)),
+                    Ok(()) => Err(EnrollmentError::CheckpointMismatch),
+                };
+            }
+            if remote == pending.replacement {
+                forwarded = true;
+            }
+        }
+        let outcome = if local == pending.expected && remote == pending.replacement {
             apply_change_in_transaction(&tx, action)?;
             if policy_checkpoint(&tx, &self.operator)? != pending.replacement {
                 return Err(EnrollmentError::CheckpointMismatch);
             }
-            SignedRecoveryOutcome::AppliedAfterCas
+            if forwarded {
+                SignedRecoveryOutcome::ForwardedPending
+            } else {
+                SignedRecoveryOutcome::AppliedAfterCas
+            }
         } else if local == pending.replacement && remote == pending.replacement {
             SignedRecoveryOutcome::AlreadyApplied
         } else {
