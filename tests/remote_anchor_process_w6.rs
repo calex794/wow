@@ -137,7 +137,9 @@ impl ChildAuthority {
             .args(["--exact","child_remote_anchor_service_process","--nocapture"])
             .env(CHILD_ROOT,root)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Error diagnostics from the separate OS process stay visible
+            // when the parent test itself fails before reaping the child.
+            .stderr(Stdio::inherit())
             .spawn().unwrap();
         let mut instance=Self {
             root:root.to_owned(), child:Some(child),
