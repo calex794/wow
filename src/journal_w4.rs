@@ -59,6 +59,7 @@ impl Journal {
     /// This journal does not verify receipt signatures on its own.
     pub fn record_verified_receipt(&mut self,recipient:[u8;16],message:[u8;16],level:Delivery)
         ->Result<Delivery,JournalError>{
+        if level == Delivery::Recipient { return Err(JournalError::InvalidState); }
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old:Option<i64>=tx.query_row("SELECT status FROM outbox WHERE recipient=?1 AND message=?2",
             params![recipient.as_slice(),message.as_slice()],|r|r.get(0)).optional()?;
