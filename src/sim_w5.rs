@@ -5,13 +5,22 @@
 //! This is NOT a discovery protocol, production router or trusted delivery
 //! authority. In particular, presence at G does not mean an authenticated
 //! receipt or an accepted Sync Core operation.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write;
+use crate::crypto_identity_w3::{open, TrustedRecipient};
+use crate::crypto_w3::CryptoError;
 
 pub type MessageId = [u8; 16];
 const MAX_TICKS: u64 = 1024;
 const MAX_MESSAGES: usize = 16;
 const MAX_TRACE: usize = 4096;
+const MAX_ALTERNATES_PER_KEY: usize = 2;
+const MAX_REJECTED_PER_KEY: usize = 4;
+const MAX_CACHE_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_FLIGHTS: usize = 256;
+const MAX_FAULT_INJECTIONS: usize = 64;
+const MAX_UNTRUSTED_OFFERS_PER_TICK: usize = 32;
+const MAX_UNTRUSTED_OFFERS_PER_KEY_PER_TICK: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Node { A, B, V, W, Mailbox, G }
@@ -81,10 +90,18 @@ pub struct Simulation {
     opted_in: BTreeSet<Node>,
     links: BTreeSet<(Node, Node)>,
     copies: BTreeMap<(Node, Flow, MessageId), Stored>,
+    // Different bytes with the same ID are UNTRUSTED candidates, not overwrites.
+    // Limit alternate candidates so an attacker cannot grow unbounded memory.
+    alternates: BTreeMap<(Node, Flow, MessageId), Vec<Stored>>,
+    // Only G (using its own crypto keys) can mark invalid data variants here.
+    rejected: BTreeMap<(Node, Flow, MessageId), VecDeque<[u8; 32]>>,
     known: BTreeSet<MessageId>,
     pending: Vec<Transit>,
     faults: Vec<InjectedFault>,
-    trace: Vec<Trace>,
+    trace: VecDeque<Trace>,
+    dropped_trace_events: u64,
+    untrusted_this_tick: usize,
+    untrusted_by_key: BTreeMap<(Node, Flow, MessageId), usize>,
 }
 
 impl Simulation {
@@ -97,16 +114,32 @@ impl Simulation {
             opted_in: BTreeSet::new(),
             links: BTreeSet::new(),
             copies: BTreeMap::new(),
+            alternates: BTreeMap::new(),
+            rejected: BTreeMap::new(),
             known: BTreeSet::new(),
             pending: Vec::new(),
             faults: Vec::new(),
-            trace: Vec::new(),
+            trace: VecDeque::new(),
+            dropped_trace_events: 0,
+            untrusted_this_tick: 0,
+            untrusted_by_key: BTreeMap::new(),
         }
     }
 
     pub fn tick(&self) -> u64 { self.tick }
-    pub fn events(&self) -> &[Trace] { &self.trace }
+    pub fn events(&self) -> &VecDeque<Trace> { &self.trace }
+    pub fn dropped_trace_events(&self) -> u64 { self.dropped_trace_events }
     pub fn copies(&self) -> usize { self.copies.len() }
+    pub fn cached_bytes(&self) -> usize {
+        self.copies.values().map(|v| v.bytes.len()).sum::<usize>()
+            + self.alternates.values().flatten().map(|v| v.bytes.len()).sum::<usize>()
+    }
+    pub fn buffered_bytes(&self) -> usize {
+        self.cached_bytes() + self.pending.iter().map(|v|v.stored.bytes.len()).sum::<usize>()
+    }
+    pub fn rejected_fingerprints(&self) -> usize {
+        self.rejected.values().map(VecDeque::len).sum::<usize>()
+    }
 
     pub fn connect(&mut self, a: Node, b: Node, enabled: bool) {
         if a == b { return; }
@@ -131,13 +164,52 @@ impl Simulation {
             self.alive.remove(&node);
             if node != Node::Mailbox {
                 self.copies.retain(|(n, _, _), _| *n != node);
+                self.alternates.retain(|(n, _, _), _| *n != node);
+                self.rejected.retain(|(n, _, _), _| *n != node);
             }
         }
     }
 
-    /// One deterministic fault on the next attempted crossing of this link.
-    pub fn inject_once(&mut self, from: Node, to: Node, flow: Flow, fault: Fault) {
+    /// Fault queue is bounded even if a caller tries to insert thousands.
+    /// Returns false when full; existing fault injections remain unchanged.
+    pub fn inject_once(&mut self, from: Node, to: Node, flow: Flow, fault: Fault) -> bool {
+        if self.faults.len() >= MAX_FAULT_INJECTIONS { return false; }
         self.faults.push(InjectedFault { from, to, flow, fault });
+        true
+    }
+
+    pub fn fault_queue_len(&self) -> usize { self.faults.len() }
+
+    /// Test-only network-edge model: an UNTRUSTED mailbox can offer bytes
+    /// claiming to be a known message. This is not peer authentication or
+    /// network discovery. Only G's local crypto verification grants trust.
+    /// Enforces per-tick admission limits before copying malicious payloads.
+    pub fn offer_untrusted_mailbox_frame(&mut self, id: MessageId, expires: u64, bytes: &[u8])
+        -> Result<(), SimError>
+    {
+        let from = Node::Mailbox;
+        let to = Node::G;
+        let flow = Flow::Data;
+        let key = (to, flow, id);
+        if !self.available(from, to) { return Err(SimError::InvalidOrigin); }
+        let Some(source) = self.copies.get(&(Node::A, flow, id)) else {
+            return Err(SimError::InvalidOrigin);
+        };
+        if source.expires != expires { return Err(SimError::Conflict); }
+        if bytes.is_empty() || bytes.len() > crate::MAX_MESSAGE_BYTES {
+            return Err(SimError::InvalidPayload);
+        }
+        if expires <= self.tick { return Err(SimError::Expired); }
+        if self.untrusted_this_tick >= MAX_UNTRUSTED_OFFERS_PER_TICK
+            || self.untrusted_by_key.get(&key).copied().unwrap_or(0)
+               >= MAX_UNTRUSTED_OFFERS_PER_KEY_PER_TICK
+        { return Err(SimError::ResourceLimit); }
+        self.untrusted_this_tick += 1;
+        *self.untrusted_by_key.entry(key).or_default() += 1;
+        self.arrive(Transit {
+            from, to, flow, id,
+            stored: Stored { bytes: bytes.to_vec(), expires }, due: self.tick,
+        })
     }
 
     pub fn submit_data(&mut self, id: MessageId, expires: u64, opaque: &[u8])
@@ -169,6 +241,9 @@ impl Simulation {
         if let Some(old) = self.copies.get(&key) {
             return if old.bytes == bytes { Ok(()) } else { Err(SimError::Conflict) };
         }
+        if self.buffered_bytes().saturating_add(bytes.len()) > MAX_CACHE_BYTES {
+            return Err(SimError::ResourceLimit);
+        }
         self.known.insert(id);
         self.copies.insert(key, Stored { bytes: bytes.to_vec(), expires });
         self.emit(node, node, flow, id, "queued")?;
@@ -179,6 +254,68 @@ impl Simulation {
         self.copies.get(&(node, flow, id)).map(|s| s.bytes.as_slice())
     }
 
+    fn has_copy(&self, key: (Node, Flow, MessageId), bytes: &[u8]) -> bool {
+        self.copies.get(&key).is_some_and(|s| s.bytes == bytes)
+            || self.alternates.get(&key).is_some_and(|v| v.iter().any(|s| s.bytes == bytes))
+    }
+
+    fn rejected_here(&self, key: (Node, Flow, MessageId), bytes: &[u8]) -> bool {
+        self.rejected.get(&key).is_some_and(|seen| seen.contains(blake3::hash(bytes).as_bytes()))
+    }
+
+    /// Endpoint-only cryptographic check for the W3 v2 *research* envelope.
+    /// Bad AEAD/signature bytes are quarantined LOCALLY at G. No relay or
+    /// remote rejection request can delete somebody else's stored copy.
+    /// Missing/expired trust alone is not proof of corrupted bytes.
+    /// Successful verification returns a payload, NOT Sync Core permission.
+    pub fn verify_data_at_g(&mut self, id: MessageId, recipient: TrustedRecipient<'_>)
+        -> Result<Option<Vec<u8>>, CryptoError>
+    {
+        let Some(raw) = self.packet(Node::G, Flow::Data, id).map(<[u8]>::to_vec)
+            else { return Ok(None); };
+        match open(&raw, recipient) {
+            Ok((header, body)) if header.message_id == id => Ok(Some(body)),
+            Ok(_) => {
+                self.quarantine_bad_at_g(id, &raw);
+                Err(CryptoError::InvalidPacket)
+            }
+            Err(err @ (CryptoError::DecryptFailed | CryptoError::InvalidSignature
+                | CryptoError::InvalidPacket | CryptoError::UnknownSuite
+                | CryptoError::Oversized)) => {
+                self.quarantine_bad_at_g(id, &raw);
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn quarantine_bad_at_g(&mut self, id: MessageId, observed: &[u8]) {
+        let key = (Node::G, Flow::Data, id);
+        // Exact local compare prevents a stale report from deleting a new copy.
+        if self.packet(Node::G, Flow::Data, id) != Some(observed) { return; }
+        let digest = *blake3::hash(observed).as_bytes();
+        let rejected = self.rejected.entry(key).or_default();
+        if !rejected.contains(&digest) {
+            if rejected.len() >= MAX_REJECTED_PER_KEY {
+                rejected.pop_front(); // bounded recent negatives; crypto always rechecked
+            }
+            rejected.push_back(digest);
+        }
+        self.copies.remove(&key);
+        // Promote a staged DIFFERENT candidate only as unverified data.
+        // It must pass verify_data_at_g separately before an app may use it.
+        let replacement = self.alternates.get_mut(&key).and_then(|candidates| {
+            let index = candidates.iter().position(|s|
+                !rejected.contains(blake3::hash(&s.bytes).as_bytes()))?;
+            Some(candidates.remove(index))
+        });
+        if self.alternates.get(&key).is_some_and(Vec::is_empty) {
+            self.alternates.remove(&key);
+        }
+        if let Some(next) = replacement { self.copies.insert(key, next); }
+        let _ = self.emit(Node::G, Node::G, Flow::Data, id, "quarantined");
+    }
+
     pub fn run(&mut self, ticks: u64) -> Result<(), SimError> {
         for _ in 0..ticks { self.step()?; }
         Ok(())
@@ -187,6 +324,8 @@ impl Simulation {
     pub fn step(&mut self) -> Result<(), SimError> {
         if self.tick >= MAX_TICKS { return Err(SimError::ResourceLimit); }
         self.tick += 1;
+        self.untrusted_this_tick = 0;
+        self.untrusted_by_key.clear();
 
         // Complete flights scheduled on prior ticks before offering new ones.
         let flights = std::mem::take(&mut self.pending);
@@ -198,20 +337,27 @@ impl Simulation {
             }
         }
 
-        // Snapshot before transfers: at most one hop per tick. No copy may
-        // turn into an instantaneous multi-hop delivery.
+        // Snapshot before transfers: at most one hop per tick. Caches may
+        // stage bounded conflicting variants but they never overwrite silently.
         let mut candidates = Vec::new();
-        for (&(from, flow, id), stored) in &self.copies {
-            if !self.alive.contains(&from) || self.tick >= stored.expires
-                || !self.may_forward(from) { continue; }
-            for &to in destinations(from, flow) {
-                if !self.available(from, to) { continue; }
-                if self.copies.contains_key(&(to, flow, id)) { continue; }
-                if self.pending.iter().any(|p|
-                    p.from == from && p.to == to && p.flow == flow && p.id == id) { continue; }
-                candidates.push(Transit {
-                    from, to, flow, id, stored: stored.clone(), due: self.tick,
-                });
+        for (&(from, flow, id), primary) in &self.copies {
+            if !self.alive.contains(&from) || !self.may_forward(from) { continue; }
+            let sources = std::iter::once(primary)
+                .chain(self.alternates.get(&(from, flow, id)).into_iter().flatten());
+            for stored in sources {
+                if self.tick >= stored.expires { continue; }
+                for &to in destinations(from, flow) {
+                    if !self.available(from, to) { continue; }
+                    let target = (to, flow, id);
+                    if self.has_copy(target, &stored.bytes)
+                        || self.rejected_here(target, &stored.bytes) { continue; }
+                    if self.pending.iter().any(|p| p.from == from && p.to == to
+                        && p.flow == flow && p.id == id && p.stored.bytes == stored.bytes)
+                    { continue; }
+                    candidates.push(Transit {
+                        from, to, flow, id, stored: stored.clone(), due: self.tick,
+                    });
+                }
             }
         }
 
@@ -221,9 +367,6 @@ impl Simulation {
             candidates.swap(i, j);
         }
         for mut flight in candidates {
-            if self.copies.contains_key(&(flight.to, flight.flow, flight.id)) {
-                continue;
-            }
             let where_fault = self.faults.iter().position(|f|
                 f.from == flight.from && f.to == flight.to && f.flow == flight.flow);
             let fault = where_fault.map(|i| self.faults.remove(i).fault);
@@ -242,6 +385,12 @@ impl Simulation {
                     self.arrive(flight)?;
                 }
                 Some(Fault::Delay(delta)) => {
+                    if self.pending.len() >= MAX_PENDING_FLIGHTS
+                        || self.buffered_bytes().saturating_add(flight.stored.bytes.len()) > MAX_CACHE_BYTES
+                    {
+                        self.emit(flight.from, flight.to, flight.flow, flight.id, "pending_limit")?;
+                        continue;
+                    }
                     flight.due = self.tick.saturating_add(delta.max(1));
                     self.emit(flight.from, flight.to, flight.flow, flight.id, "delayed")?;
                     self.pending.push(flight);
@@ -260,14 +409,26 @@ impl Simulation {
             return self.emit(f.from, f.to, f.flow, f.id, "unreachable");
         }
         let key = (f.to, f.flow, f.id);
-        if let Some(existing) = self.copies.get(&key) {
-            if existing.bytes != f.stored.bytes {
-                return self.emit(f.from, f.to, f.flow, f.id, "conflict");
-            }
+        if self.rejected_here(key, &f.stored.bytes) {
+            return self.emit(f.from, f.to, f.flow, f.id, "quarantined_repeat");
+        }
+        if self.has_copy(key, &f.stored.bytes) {
             return self.emit(f.from, f.to, f.flow, f.id, "duplicate");
         }
-        if self.copies.len() >= MAX_MESSAGES * 6 * 2 {
-            return Err(SimError::ResourceLimit);
+        if self.copies.contains_key(&key) {
+            if self.alternates.get(&key).is_some_and(|v| v.len() >= MAX_ALTERNATES_PER_KEY) {
+                return self.emit(f.from, f.to, f.flow, f.id, "variant_limit");
+            }
+            if self.buffered_bytes().saturating_add(f.stored.bytes.len()) > MAX_CACHE_BYTES {
+                return self.emit(f.from, f.to, f.flow, f.id, "cache_limit");
+            }
+            self.alternates.entry(key).or_default().push(f.stored);
+            return self.emit(f.from, f.to, f.flow, f.id, "variant_staged");
+        }
+        if self.copies.len() >= MAX_MESSAGES * 6 * 2
+            || self.buffered_bytes().saturating_add(f.stored.bytes.len()) > MAX_CACHE_BYTES
+        {
+            return self.emit(f.from, f.to, f.flow, f.id, "cache_limit");
         }
         self.copies.insert(key, f.stored);
         self.emit(f.from, f.to, f.flow, f.id, "copied")
@@ -284,8 +445,11 @@ impl Simulation {
     fn emit(&mut self, from: Node, to: Node, flow: Flow, id: MessageId, event: &'static str)
         -> Result<(), SimError>
     {
-        if self.trace.len() >= MAX_TRACE { return Err(SimError::ResourceLimit); }
-        self.trace.push(Trace { tick: self.tick, from, to, flow, message_id: id, event });
+        if self.trace.len() >= MAX_TRACE {
+            self.trace.pop_front();
+            self.dropped_trace_events = self.dropped_trace_events.saturating_add(1);
+        }
+        self.trace.push_back(Trace { tick: self.tick, from, to, flow, message_id: id, event });
         Ok(())
     }
     fn random(&mut self) -> u64 {
