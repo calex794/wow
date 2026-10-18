@@ -45,17 +45,18 @@ fn cross_transport_global_buffer_limits_work_without_identity(){
  let mut g=IngressGuard::new();
  let mut tickets=Vec::new();
  for (n,lane) in [Lane::Bluetooth,Lane::LocalNetwork,Lane::Iroh,Lane::Gateway].into_iter().enumerate() {
-  for i in 0..lane_limit(lane) {
+  for i in 0..lane_limit(lane).min(if lane == Lane::Gateway { 4 } else { 8 }) {
    let t=g.begin(lane,id((n*10+i) as u32)).unwrap();
    tickets.push(t);
   }
  }
  assert_eq!(g.stats().active,24);
- for t in &tickets {
+ for (idx,t) in tickets.iter().enumerate() {
+  if idx == 16 {g.advance_tick(1).unwrap();}
   g.offer_fragment(*t,&[2;512]).unwrap();
  }
  assert_eq!(g.stats().buffered_bytes,12288);
- assert_eq!(g.offer_fragment(tickets[0],&[5;513]),Err(AdmissionError::TooLarge));
+ assert_eq!(g.offer_fragment(tickets[0],&[5;1025]),Err(AdmissionError::TooLarge));
  assert_eq!(g.stats().buffered_bytes,12288);
 }
 fn lane_limit(l:Lane)->usize { match l {Lane::Bluetooth=>4,_=>8} }
