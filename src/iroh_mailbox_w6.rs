@@ -5,9 +5,10 @@
 //! the remote EndpointId. We authorize the *actual* connection.remote_id(),
 //! NOT an identity string supplied in the packet.
 //!
-//! The EndpointId <-> W3 DeviceId/epoch mapping is pinned by the trusted
-//! operator and must be independently provisioned and kept current. An iroh
-//! EndpointId is NOT a W3 identity and must not be inferred from remote input.
+//! The EndpointId <-> W3 DeviceId/epoch/route mapping must exist as an
+//! operator-SIGNED durable enrollment in SQLite. It is loaded independently
+//! from remote input and rechecked under a shared lock at commit time. An
+//! iroh EndpointId is NOT a W3 identity.
 //! A separate issuer-signed, exact-ciphertext RelayGrant still controls WHICH
 //! route/message can be written. Neither layer confers a Sync Core operation.
 //!
@@ -18,6 +19,7 @@ use crate::guarded_tcp_w5::GuardedTcpClock;
 use crate::ingress_bridge_w5::{self, BridgeError, IngressOutcome};
 use crate::ingress_guard_w5::{AdmissionError, IngressGuard, Lane, Ticket};
 use crate::mailbox_w5::Mailbox;
+use crate::peer_enrollment_w6::{EnrollmentError, PeerEnrollmentDb};
 use crate::route_grant_w5::{RelayPolicy, SIGNED_GRANT_LEN};
 use crate::trust_w3::TrustRegistry;
 use crate::MAX_MESSAGE_BYTES;
@@ -31,8 +33,8 @@ pub const MAX_IROH_LAB_WIRE: usize = 4 + SIGNED_GRANT_LEN + 4 + MAX_MESSAGE_BYTE
 #[derive(Debug)]
 pub enum IrohIngressError {
     WrongLocalEndpoint,
-    WrongRemoteEndpoint,
     WrongAlpn,
+    Enrollment(EnrollmentError),
     RevokedOrStaleDevice,
     InvalidDeadline,
     DeadlineExceeded,
@@ -49,23 +51,16 @@ impl From<AdmissionError> for IrohIngressError {
 impl From<BridgeError> for IrohIngressError {
     fn from(error: BridgeError) -> Self { Self::Bridge(error) }
 }
-
-/// Trusted owner-issued association. An iroh EndpointId is a cryptographic
-/// QUIC/TLS public-key identity, distinct from the pre-existing W3 DeviceId.
-/// This mapping MUST NOT be constructed from the client's packet contents.
-#[derive(Clone, Debug)]
-pub struct IrohAuthorizedPeer {
-    pub endpoint_id: EndpointId,
-    pub w3_device_id: [u8; 16],
-    pub w3_epoch: u64,
+impl From<EnrollmentError> for IrohIngressError {
+    fn from(error: EnrollmentError) -> Self { Self::Enrollment(error) }
 }
 
-/// Borrowed trusted server configuration; only the caller controls it.
+ /// Borrowed trusted server configuration; only the caller controls it.
 /// Local endpoint should be bound to 127.0.0.1 in the CI laboratory.
 pub struct IrohMailboxContext<'a> {
     pub local: &'a Endpoint,
     pub expected_local_id: EndpointId,
-    pub peer: &'a IrohAuthorizedPeer,
+    pub enrollments: &'a Mutex<PeerEnrollmentDb>,
     pub devices: &'a TrustRegistry,
     pub issuer_trust: &'a TrustRegistry,
     pub relay_policy: &'a RelayPolicy,
@@ -136,15 +131,7 @@ pub async fn receive_authenticated_iroh_mailbox(
     if connection.alpn() != W6_LAB_ALPN {
         return Err(IrohIngressError::WrongAlpn);
     }
-    if connection.remote_id() != context.peer.endpoint_id {
-        return Err(IrohIngressError::WrongRemoteEndpoint);
-    }
-    // Current W3 epoch/revocation is independently enforced; this cannot
-    // self-authorize an EndpointId <-> DeviceId mapping from network bytes.
-    context.devices.key_for(context.peer.w3_device_id, context.peer.w3_epoch)
-        .map_err(|_| IrohIngressError::RevokedOrStaleDevice)?;
-
-    let timeout = context.clock.read_budget;
+     let timeout = context.clock.read_budget;
     if timeout.is_zero() || timeout > Duration::from_secs(5) {
         return Err(IrohIngressError::InvalidDeadline);
     }
@@ -156,6 +143,23 @@ pub async fn receive_authenticated_iroh_mailbox(
         guard.begin(Lane::LocalNetwork, [0;16])?
     };
     let _lease = Lease { guard: context.guard, ticket };
+
+    // TLS authenticates EndpointId, but it DOES NOT authorize a route.
+    // Only a separately signed and persisted operator policy can bind
+    // remote_id() to W3 DeviceId / epoch / issuer / namespace / token.
+    let (device, epoch) = {
+        let enrollment = context.enrollments.lock()
+            .map_err(|_| IrohIngressError::LockPoisoned)?;
+        enrollment.authorize(
+            &connection.remote_id(),
+            &context.relay_policy.relay_id,
+            &context.relay_policy.namespace,
+            &context.relay_policy.route_token,
+            &context.relay_policy.issuer_id,
+        )?
+    };
+    context.devices.key_for(device, epoch)
+        .map_err(|_| IrohIngressError::RevokedOrStaleDevice)?;
 
     let end = tokio::time::Instant::now() + timeout;
     let wire = tokio::time::timeout_at(end, async {
@@ -175,9 +179,22 @@ pub async fn receive_authenticated_iroh_mailbox(
     if tokio::time::Instant::now() >= end {
         return Err(IrohIngressError::DeadlineExceeded);
     }
-    // Reconfirm key is still current at the storage boundary. The registry
-    // here is a snapshot; multi-process revocation needs a live trust source.
-    context.devices.key_for(context.peer.w3_device_id, context.peer.w3_epoch)
+    // Serialize in-process operator revocations with mailbox commits:
+    // the enrollment mutex is held THROUGH storage. No wait/await under
+    // the lock. Separate OS processes need a stronger shared transaction.
+    let enrollment = context.enrollments.lock()
+        .map_err(|_| IrohIngressError::LockPoisoned)?;
+    let (device_again, epoch_again) = enrollment.authorize(
+        &connection.remote_id(),
+        &context.relay_policy.relay_id,
+        &context.relay_policy.namespace,
+        &context.relay_policy.route_token,
+        &context.relay_policy.issuer_id,
+    )?;
+    if device != device_again || epoch != epoch_again {
+        return Err(IrohIngressError::RevokedOrStaleDevice);
+    }
+    context.devices.key_for(device_again, epoch_again)
         .map_err(|_| IrohIngressError::RevokedOrStaleDevice)?;
     let mut mailbox = context.mailbox.lock()
         .map_err(|_| IrohIngressError::StorageLockPoisoned)?;
