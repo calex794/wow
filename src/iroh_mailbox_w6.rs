@@ -20,7 +20,7 @@ use crate::ingress_bridge_w5::{self, BridgeError, IngressOutcome};
 use crate::ingress_guard_w5::{AdmissionError, IngressGuard, Lane, Ticket};
 use crate::mailbox_w5::Mailbox;
 use crate::peer_enrollment_w6::{
-    EnrollmentError, PeerEnrollmentDb, TrustedPolicyAnchor,
+    EnrollmentError, EnrollmentLookup, PeerEnrollmentDb, TrustedPolicyAnchor,
 };
 use crate::route_grant_w5::{RelayPolicy, SIGNED_GRANT_LEN};
 use crate::trust_w3::TrustRegistry;
@@ -159,11 +159,14 @@ pub async fn receive_authenticated_iroh_mailbox(
         let mut enrollment = context.enrollments.lock()
             .map_err(|_| IrohIngressError::LockPoisoned)?;
         enrollment.authorize_anchored(
-            context.policy_anchor, &connection.remote_id(),
-            &context.relay_policy.relay_id,
-            &context.relay_policy.namespace,
-            &context.relay_policy.route_token,
-            &context.relay_policy.issuer_id,
+            context.policy_anchor,
+            EnrollmentLookup {
+                remote: &connection.remote_id(),
+                relay: &context.relay_policy.relay_id,
+                namespace: &context.relay_policy.namespace,
+                token: &context.relay_policy.route_token,
+                issuer: &context.relay_policy.issuer_id,
+            },
         )?
     };
     context.devices.key_for(device, epoch)
@@ -195,11 +198,14 @@ pub async fn receive_authenticated_iroh_mailbox(
     let mut enrollment = context.enrollments.lock()
         .map_err(|_| IrohIngressError::LockPoisoned)?;
     enrollment.with_anchored_write(
-        context.policy_anchor, &connection.remote_id(),
-        &context.relay_policy.relay_id,
-        &context.relay_policy.namespace,
-        &context.relay_policy.route_token,
-        &context.relay_policy.issuer_id,
+        context.policy_anchor,
+        EnrollmentLookup {
+            remote: &connection.remote_id(),
+            relay: &context.relay_policy.relay_id,
+            namespace: &context.relay_policy.namespace,
+            token: &context.relay_policy.route_token,
+            issuer: &context.relay_policy.issuer_id,
+        },
         |(device_again, epoch_again)| {
             if device != device_again || epoch != epoch_again {
                 return Err(IrohIngressError::RevokedOrStaleDevice);
