@@ -16,9 +16,8 @@ use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
 use rusqlite::Connection;
 use std::{
-    path::{Path,PathBuf},
+    path::Path,
     sync::{Arc,Mutex},
-    time::Duration,
 };
 use tempfile::tempdir;
 
