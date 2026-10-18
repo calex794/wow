@@ -19,6 +19,7 @@ fn links(sim:&mut Simulation, backup:bool){
  }
  sim.relay_opt_in(Node::B,true);
  sim.relay_opt_in(Node::V,true);
+ if backup {sim.relay_opt_in(Node::W,true);}
 }
 struct Fixture {
  packet:Vec<u8>,secret:akula_wire_lab::crypto_w3::RecipientSecret,
