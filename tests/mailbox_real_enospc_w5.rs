@@ -31,7 +31,10 @@ fn actual_os_enospc_never_returns_stored_or_loses_prior_ciphertext() {
     assert!(!db.exists());
     assert!(!filler_path.exists());
 
-    let mut mail = Mailbox::open(&db, MailboxLimits::default()).unwrap();
+    // Activation is persisted BEFORE any successful data acceptance.
+    let mut mail = Mailbox::open_recovery_gated(&db, MailboxLimits::default()).unwrap();
+    assert_eq!(mail.admission(), MailboxAdmission::PausedStorageFault);
+    mail.try_resume_after_maintenance().unwrap();
     let first = b"durable-before-real-enospc";
     assert_eq!(
         mail.put(id(1), id(1), 0, 100, first).unwrap(),
@@ -71,24 +74,38 @@ fn actual_os_enospc_never_returns_stored_or_loses_prior_ciphertext() {
         mail.put(id(3), id(3), 0, 100, b"blocked while paused"),
         Err(MailError::AdmissionPaused)
     ));
-    // No successful return implies no delivery receipt or Sync application.
-    // An attempted/failed transaction is not an authoritative receipt.
+    // This mailbox neither signs recipient receipts nor applies Sync Core.
+    // Failure cannot become a successful mailbox store result.
     assert_eq!(
         mail.get_page(id(1), 1, None, 1).unwrap()[0].bytes,
         first
     );
 
+    // Reboot after the OS volume is repaired. A failed write cannot persist
+    // a fault flag under ENOSPC, so protected databases ALWAYS restart paused.
+    drop(mail);
     drop(filler);
     fs::remove_file(&filler_path).unwrap();
-    mail.try_resume_after_maintenance().unwrap();
-    assert_eq!(mail.admission(), MailboxAdmission::Open);
+
+    let mut rebooted = Mailbox::open(&db, MailboxLimits::default()).unwrap();
+    assert_eq!(rebooted.admission(), MailboxAdmission::PausedStorageFault);
+    assert!(matches!(
+        rebooted.put(id(2), id(2), 2, 100, b"not-yet-recovered"),
+        Err(MailError::AdmissionPaused)
+    ));
     assert_eq!(
-        mail.put(id(2), id(2), 2, 100, b"after-storage-repair").unwrap(),
+        rebooted.get_page(id(1), 2, None, 1).unwrap()[0].bytes, first
+    );
+    rebooted.try_resume_after_maintenance().unwrap();
+    assert_eq!(rebooted.admission(), MailboxAdmission::Open);
+    assert_eq!(
+        rebooted.put(id(2), id(2), 2, 100, b"after-storage-repair").unwrap(),
         PutStatus::Stored
     );
-    drop(mail);
+    drop(rebooted);
 
     let opened = Mailbox::open(&db, MailboxLimits::default()).unwrap();
+    assert_eq!(opened.admission(), MailboxAdmission::PausedStorageFault);
     assert_eq!(opened.stats().unwrap().messages, 2);
     assert_eq!(opened.get_page(id(1), 3, None, 1).unwrap()[0].bytes, first);
     assert_eq!(
