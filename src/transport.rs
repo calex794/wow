@@ -160,6 +160,7 @@ pub struct FragmentPool {
     limits: FragmentLimits,
     transfers: BTreeMap<(PeerKey, u32), Transfer>,
     last_time_ms: Option<u64>,
+    recently_completed: BTreeMap<(PeerKey, u32), u64>,
 }
 
 impl FragmentPool {
@@ -168,6 +169,7 @@ impl FragmentPool {
             limits: limits.validate()?,
             transfers: BTreeMap::new(),
             last_time_ms: None,
+            recently_completed: BTreeMap::new(),
         })
     }
 
@@ -182,6 +184,7 @@ impl FragmentPool {
     pub fn reset(&mut self) {
         self.transfers.clear();
         self.last_time_ms = None;
+        self.recently_completed.clear();
     }
 
     /// Drop expired partial transfers. A backward clock step is rejected.
@@ -191,6 +194,9 @@ impl FragmentPool {
             return Err(WireError::NonMonotonicTime);
         }
         self.last_time_ms = Some(now_ms);
+        self.recently_completed.retain(|_, finished| {
+            now_ms.saturating_sub(*finished) < self.limits.absolute_timeout_ms
+        });
         let before = self.transfers.len();
         self.transfers.retain(|_, transfer| {
             now_ms.saturating_sub(transfer.first_ms) < self.limits.absolute_timeout_ms
@@ -201,6 +207,20 @@ impl FragmentPool {
 
     /// Returns a raw reassembled message when ALL pieces are present.
     /// Does not claim confidentiality, integrity, sender authority or delivery.
+    fn record_completed(&mut self, key: (PeerKey, u32), now_ms: u64) {
+        // Bounded tombstones reduce resource exhaustion from late fragments.
+        // In-memory, link-local only; NOT durable message replay protection.
+        if self.recently_completed.len() >= HARD_MAX_TRANSFERS * 4 {
+            if let Some(oldest) = self.recently_completed.iter()
+                .min_by_key(|(_, timestamp)| *timestamp)
+                .map(|(key, _)| *key)
+            {
+                self.recently_completed.remove(&oldest);
+            }
+        }
+        self.recently_completed.insert(key, now_ms);
+    }
+
     pub fn accept(
         &mut self,
         peer: PeerKey,
@@ -226,6 +246,9 @@ impl FragmentPool {
         }
 
         let key = (peer, transfer_id);
+        if self.recently_completed.contains_key(&key) {
+            return Err(WireError::ReplaySuppressed);
+        }
         if let Some(existing) = self.transfers.get(&key) {
             if existing.parts.len() != count {
                 return Err(WireError::FragmentMismatch);
@@ -261,6 +284,7 @@ impl FragmentPool {
                 for piece in state.parts {
                     complete.extend_from_slice(&piece.expect("received count matched"));
                 }
+                self.record_completed(key, now_ms);
                 return Ok(Some(complete));
             }
             return Ok(None);
@@ -274,6 +298,7 @@ impl FragmentPool {
         }
         // A single-fragment message is complete without reserving state.
         if count == 1 {
+            self.record_completed(key, now_ms);
             return Ok(Some(payload.to_vec()));
         }
 
