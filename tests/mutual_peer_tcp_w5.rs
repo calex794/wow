@@ -252,7 +252,8 @@ fn revoked_or_rotated_device_never_receives_an_authorized_challenge() {
 fn missing_response_times_out_and_releases_pre_auth_ticket() {
     let case=Case::new();
     let (outcome,reply,ch)=case.run(&case.grant,|_client,_challenge|{
-        // Keep the write half OPEN: no response, no ciphertext.
+        // Keep the write half OPEN past the one absolute read deadline.
+        thread::sleep(Duration::from_millis(850));
     });
     assert!(ch.is_some());
     assert!(reply.is_empty());
