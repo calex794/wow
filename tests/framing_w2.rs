@@ -63,7 +63,7 @@ fn frame(id:u32,i:u16,count:u16,payload:&[u8])->Vec<u8>{
  for i in 0..2u32 {assert_eq!(p.accept(peer(1),i as u64,&frame(i,0,100,b"x")),Ok(None));}
  assert_eq!(p.accept(peer(1),3,&frame(3,0,100,b"y")),Err(WireError::ResourceLimit));
  assert_eq!(p.stats().reserved_parts,200);
- let mut limits=FragmentLimits::default();limits.max_reserved_parts=150;limits.max_parts_per_transfer=100;
+ let limits=FragmentLimits{max_reserved_parts:150,max_parts_per_transfer:100,..FragmentLimits::default()};
  let mut p=FragmentPool::new(limits).unwrap();
  assert_eq!(p.accept(peer(1),0,&frame(1,0,100,b"x")),Ok(None));
  assert_eq!(p.accept(peer(2),1,&frame(2,0,100,b"x")),Err(WireError::ResourceLimit));
@@ -80,7 +80,7 @@ fn frame(id:u32,i:u16,count:u16,payload:&[u8])->Vec<u8>{
  assert_eq!(p.expire(60_001),Ok(1)); // duplicate does not extend idle timer
 }
 #[test] fn invalid_limits_or_inconsistent_fragment_fail_closed() {
- let mut limits=FragmentLimits::default();limits.max_total_bytes=usize::MAX;
+ let limits=FragmentLimits{max_total_bytes:usize::MAX,..FragmentLimits::default()};
  assert!(matches!(FragmentPool::new(limits),Err(WireError::ResourceLimit)));
  let mut p=FragmentPool::new(FragmentLimits::default()).unwrap();
  assert_eq!(p.accept(peer(1),0,&frame(1,0,2,b"a")),Ok(None));
