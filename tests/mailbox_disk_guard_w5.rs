@@ -110,3 +110,33 @@ fn invalid_page_cap_cannot_silently_become_an_unbounded_guard() {
         Err(MailError::InvalidDiskLimit)
     ));
 }
+
+
+#[test]
+fn pinned_reader_blocks_truncate_and_never_loses_committed_messages() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("mail.sqlite");
+    let mut mail = Mailbox::open(&path, MailboxLimits::default()).unwrap();
+    mail.put(id(1), id(1), 0, 100, b"before-reader").unwrap();
+
+    // This reader holds a WAL snapshot while a new write is committed.
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN;").unwrap();
+    let prior: i64 = reader.query_row(
+        "SELECT COUNT(*) FROM mailbox_entries", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(prior, 1);
+    mail.put(id(1), id(2), 0, 100, b"after-reader").unwrap();
+
+    // A pinned snapshot must not be reported as a successful truncation.
+    assert!(matches!(
+        mail.checkpoint_wal_truncate(),
+        Err(MailError::WalCheckpointBusy)
+    ));
+    assert_eq!(mail.stats().unwrap().messages, 2);
+    reader.execute_batch("ROLLBACK;").unwrap();
+
+    mail.checkpoint_wal_truncate().unwrap();
+    assert_eq!(mail.disk_usage().unwrap().wal_bytes, 0);
+    assert_eq!(mail.get_page(id(1), 1, None, 2).unwrap().len(), 2);
+}
