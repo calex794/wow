@@ -15,6 +15,7 @@ ed25519-dalek = "2.2"
 hpke = "0.14.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1.5"
+getrandom = "0.4"
 
 [dev-dependencies]
 tempfile = "3.12"
