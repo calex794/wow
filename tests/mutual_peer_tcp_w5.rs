@@ -3,7 +3,7 @@
 //! THIS IS NOT A TLS/Noise session or a public TCP listener.
 use akula_wire_lab::guarded_tcp_w5::{
     serve_mutual_peer_proof_loopback_mailbox_tcp_shared,
-    GuardedTcpClock, GuardedTcpError,
+    GuardedTcpClock, GuardedTcpError, MutualPeerConfig,
 };
 use akula_wire_lab::ingress_bridge_w5::{BridgeError, IngressOutcome};
 use akula_wire_lab::ingress_guard_w5::IngressGuard;
@@ -100,7 +100,11 @@ impl Case {
                     monotonic_tick:0,now_seconds:100,
                     read_budget:Duration::from_millis(700),
                 },
-                &store,&policy,&issuer_trust,&devices,&relay,scope,
+                &store,MutualPeerConfig {
+                    policy:&policy,issuer_trust:&issuer_trust,
+                    device_trust:&devices,relay_signer:&relay,
+                    permitted_peer:scope,
+                },
             )
         });
         // Server may reject untrusted peers before issuing a challenge.
