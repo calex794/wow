@@ -151,7 +151,7 @@ async fn real_roha_quic_read_only_and_admin_cas_are_tls_identity_separated(){
     // Replaying an earlier valid write or forging a stale expected revision
     // cannot overwrite the durable checkpoint.
     assert_anchor_error(authorized_cas(&admin,first,second),AnchorError::Conflict);
-    assert_anchor_error(authorized_cas(&admin,second,first),AnchorError::InvalidAttestation);
+    assert_anchor_error(admin.advance(second,first),AnchorError::InvalidAttestation);
     assert_eq!(reader.current().unwrap(),second);
     server.stop().await;
 }
