@@ -6,7 +6,7 @@
 use akula_wire_lab::peer_enrollment_w6::{
     AnchorError, EnrollmentError, EndpointRouteBinding, EnrollmentLookup,
     OperatorChange, PeerEnrollmentDb, PolicyCheckpoint, PolicyOperation,
-    TrustedPolicyAnchor, sign_operator_change,
+    TrustedPolicyAnchor, sign_operator_change, sign_anchor_transition,
 };
 use akula_wire_lab::remote_anchor_w6::{
     ANCHOR_ALPN, AnchorServicePolicy, RemoteAnchorClient, RemoteAnchorError,
@@ -46,7 +46,11 @@ fn lookup<'a>(b:&'a EndpointRouteBinding)->EnrollmentLookup<'a>{
     }
 }
 fn policy_config()->AnchorServicePolicy{
-    AnchorServicePolicy{reader:sec(41).public(),administrator:sec(42).public()}
+    AnchorServicePolicy{
+        reader:sec(41).public(),
+        administrator:sec(42).public(),
+        operator:root().verifying_key(),
+    }
 }
 fn checkpoint_flush(path:&Path){
     let db=Connection::open(path).unwrap();
@@ -104,6 +108,14 @@ fn client(key:u8,addr:EndpointAddr)->RemoteAnchorClient{
 fn cp(revision:u64,value:u8)->PolicyCheckpoint{
     PolicyCheckpoint {revision,digest:[value;32]}
 }
+/// Test fixture only: OFFLINE root signs exact old/new digest transition.
+fn authorized_cas(
+    admin:&RemoteAnchorClient,old:PolicyCheckpoint,new:PolicyCheckpoint,
+)->Result<(),AnchorError>{
+    let change=signed(new.revision,PolicyOperation::Revoke);
+    let proof=sign_anchor_transition(&root(),&change,old,new).unwrap();
+    admin.advance_signed(old,new,&change,&proof)
+}
 fn provision(path:&Path,initial:PolicyCheckpoint){
     let store=RemoteAnchorLedger::provision(
         path,policy_config(),initial
@@ -133,12 +145,13 @@ async fn real_roha_quic_read_only_and_admin_cas_are_tls_identity_separated(){
         reader.advance(first,second),AnchorError::InvalidAttestation
     );
     // TLS-authorized operator CAS advances, ordinary peer observes state.
-    admin.advance(first,second).unwrap();
+    assert_anchor_error(admin.advance(first,second),AnchorError::InvalidAttestation);
+    authorized_cas(&admin,first,second).unwrap();
     assert_eq!(reader.current().unwrap(),second);
     // Replaying an earlier valid write or forging a stale expected revision
     // cannot overwrite the durable checkpoint.
-    assert_anchor_error(admin.advance(first,second),AnchorError::Conflict);
-    assert_anchor_error(admin.advance(second,first),AnchorError::Conflict);
+    assert_anchor_error(authorized_cas(&admin,first,second),AnchorError::Conflict);
+    assert_anchor_error(authorized_cas(&admin,second,first),AnchorError::InvalidAttestation);
     assert_eq!(reader.current().unwrap(),second);
     server.stop().await;
 }
@@ -150,7 +163,7 @@ async fn separately_persisted_remote_state_survives_service_restart_and_stale_cl
     let server=Server::start(&path).await;
     let old_addr=server.addr();
     let admin=client(42,old_addr.clone());
-    admin.advance(cp(0,9),cp(3,3)).unwrap();
+    authorized_cas(&admin,cp(0,9),cp(3,3)).unwrap();
     assert_eq!(client(41,old_addr.clone()).current().unwrap(),cp(3,3));
     server.stop().await;
     // The old client has only an outdated loopback address, and TLS does
@@ -159,7 +172,7 @@ async fn separately_persisted_remote_state_survives_service_restart_and_stale_cl
     let reopened=Server::start(&path).await;
     assert_eq!(client(41,reopened.addr()).current().unwrap(),cp(3,3));
     let new_admin=client(42,reopened.addr());
-    new_admin.advance(cp(3,3),cp(4,4)).unwrap();
+    authorized_cas(&new_admin,cp(3,3),cp(4,4)).unwrap();
     assert_eq!(client(41,reopened.addr()).current().unwrap(),cp(4,4));
     reopened.stop().await;
 }
@@ -189,9 +202,10 @@ async fn old_local_sqlite_snapshot_denied_by_durable_remote_quic_anchor(){
 
     // Authenticated administrator publishes the remote watermark BEFORE
     // the independent local SQLite commit, per W6's fail-closed contract.
-    local.apply_signed_anchored(
-        &signed(2,PolicyOperation::Revoke),&admin
-    ).unwrap();
+    let change=signed(2,PolicyOperation::Revoke);
+    let (old,next)=local.preview_signed_update(&change).unwrap();
+    let proof=sign_anchor_transition(&root(),&change,old,next).unwrap();
+    local.apply_signed_anchored_with_proof(&change,&proof,&admin).unwrap();
     assert_eq!(reader.current().unwrap(),local.checkpoint().unwrap());
     drop(local);
     checkpoint_flush(&local_path);
@@ -235,6 +249,7 @@ async fn provisioning_is_explicit_and_endpoint_keys_cannot_be_replaced_by_db(){
     ));
     let wrong=AnchorServicePolicy{
         reader:sec(45).public(),administrator:sec(46).public(),
+        operator:root().verifying_key(),
     };
     assert!(matches!(
         RemoteAnchorLedger::open(&path,wrong),
