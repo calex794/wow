@@ -4,6 +4,8 @@
 //! This is a logical-quota prototype, not a production mailbox service:
 //! authentication, recipient subscriptions, rate limits, disk/WAL bounds,
 //! trusted clock and signed deletion acknowledgments are separate gates.
+//! Deleted MessageIds are reserved for a bounded retention window only;
+//! this journal cannot guarantee lifetime-unique identifiers.
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
@@ -55,6 +57,8 @@ pub enum MailError {
     InvalidLimits,
     InvalidTime,
     ClockRollback,
+    ReusedMessageId,
+    TombstoneQuotaExceeded,
     InvalidPacket,
     TooLongTtl,
     QuotaExceeded,
@@ -80,6 +84,8 @@ pub struct MailboxStats {
     /// Only logically stored ciphertext bytes, excluding SQLite/WAL overhead.
     pub messages: usize,
     pub payload_bytes: usize,
+    /// Logical tombstone rows, not SQLite disk/WAL usage.
+    pub tombstones: usize,
 }
 
 pub struct Mailbox {
@@ -112,7 +118,17 @@ impl Mailbox {
                  last_gc_at INTEGER NOT NULL CHECK(last_gc_at>=0)
              );
              INSERT OR IGNORE INTO mailbox_maintenance (singleton,last_gc_at)
-               VALUES (1,0);",
+               VALUES (1,0);
+             CREATE TABLE IF NOT EXISTS mailbox_tombstones (
+                 route_token BLOB NOT NULL CHECK(length(route_token)=16),
+                 message_id BLOB NOT NULL CHECK(length(message_id)=16),
+                 digest BLOB NOT NULL CHECK(length(digest)=32),
+                 original_expires_at INTEGER NOT NULL CHECK(original_expires_at>0),
+                 retained_until INTEGER NOT NULL CHECK(retained_until>original_expires_at),
+                 PRIMARY KEY(route_token,message_id)
+             );
+             CREATE INDEX IF NOT EXISTS mailbox_tombstone_gc
+               ON mailbox_tombstones(retained_until);",
         )?;
         Ok(Self {db, limits})
     }
@@ -125,6 +141,7 @@ impl Mailbox {
     /// Token ownership and sender authorization are NOT implemented here.
     /// An ordinary enqueue never uses caller-provided time to delete other
     /// messages. Expired rows retain their quota until explicit maintenance.
+    /// Deleted IDs remain reserved while a bounded tombstone is retained.
     pub fn put(
         &mut self,
         route_token: [u8; 16],
@@ -149,6 +166,13 @@ impl Mailbox {
             [], |r| r.get(0),
         )?;
         if now < last_gc_at { return Err(MailError::ClockRollback); }
+        let was_deleted: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_tombstones
+              WHERE route_token=?1 AND message_id=?2)",
+            params![route_token.as_slice(), message_id.as_slice()],
+            |r| r.get(0),
+        )?;
+        if was_deleted != 0 { return Err(MailError::ReusedMessageId); }
         let existing: Option<(Vec<u8>, Vec<u8>, i64)> = tx.query_row(
             "SELECT digest,sealed,expires_at FROM mailbox_entries
              WHERE route_token=?1 AND message_id=?2",
@@ -245,6 +269,9 @@ impl Mailbox {
     /// time only; arbitrary put() requests cannot authorize deletion.
     /// A durable high-water mark rejects backward clock movement across restarts.
     /// This cannot detect an incorrect *forward* jump in the trusted clock.
+    /// Each deleted ID is reserved for max_ttl_seconds after the GC run.
+    /// When tombstone limits are reached GC fails atomically instead of
+    /// deleting entries without replay protection. This can delay cleanup.
     /// No receipt-driven deletion is allowed without a separate verified
     /// end-recipient deletion protocol.
     pub fn purge_expired(&mut self, now: i64) -> Result<usize, MailError> {
@@ -255,7 +282,46 @@ impl Mailbox {
             [], |r| r.get(0),
         )?;
         if now < last_gc_at { return Err(MailError::ClockRollback); }
-        let deleted=tx.execute(
+        let retained_until = now.checked_add(self.limits.max_ttl_seconds)
+            .ok_or(MailError::InvalidTime)?;
+        // Clearing aged tombstones, reserving new IDs, deleting data, and
+        // advancing the GC high-water mark are one atomic transaction.
+        tx.execute(
+            "DELETE FROM mailbox_tombstones WHERE retained_until<=?1",
+            params![now],
+        )?;
+        let reserved: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM mailbox_tombstones", [], |r| r.get(0),
+        )?;
+        let expiring: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM mailbox_entries WHERE expires_at<=?1",
+            params![now], |r| r.get(0),
+        )?;
+        if reserved.checked_add(expiring)
+            .is_none_or(|n| n > self.limits.total_records as i64)
+        {
+            return Err(MailError::TombstoneQuotaExceeded);
+        }
+        let token_over_quota: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM (
+               SELECT route_token FROM mailbox_tombstones
+               UNION ALL
+               SELECT route_token FROM mailbox_entries WHERE expires_at<=?1
+             ) GROUP BY route_token HAVING COUNT(*)>?2)",
+            params![now, self.limits.per_token_records as i64],
+            |r| r.get(0),
+        )?;
+        if token_over_quota != 0 {
+            return Err(MailError::TombstoneQuotaExceeded);
+        }
+        tx.execute(
+            "INSERT INTO mailbox_tombstones
+               (route_token,message_id,digest,original_expires_at,retained_until)
+             SELECT route_token,message_id,digest,expires_at,?2
+               FROM mailbox_entries WHERE expires_at<=?1",
+            params![now, retained_until],
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM mailbox_entries WHERE expires_at<=?1",
             params![now],
         )?;
@@ -273,8 +339,12 @@ impl Mailbox {
             [],
             |r| Ok((r.get(0)?,r.get(1)?)),
         )?;
+        let tombstones: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM mailbox_tombstones", [], |r| r.get(0),
+        )?;
         let messages=usize::try_from(n).map_err(|_|MailError::CorruptStorage)?;
         let payload_bytes=usize::try_from(bytes).map_err(|_|MailError::CorruptStorage)?;
-        Ok(MailboxStats {messages,payload_bytes})
+        let tombstones=usize::try_from(tombstones).map_err(|_|MailError::CorruptStorage)?;
+        Ok(MailboxStats {messages,payload_bytes,tombstones})
     }
 }
