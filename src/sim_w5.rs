@@ -20,6 +20,7 @@ const MAX_CACHE_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_FLIGHTS: usize = 256;
 const MAX_FAULT_INJECTIONS: usize = 64;
 const MAX_UNTRUSTED_OFFERS_PER_TICK: usize = 32;
+const MAX_UNTRUSTED_OFFERS_PER_SOURCE_PER_TICK: usize = 12;
 const MAX_UNTRUSTED_OFFERS_PER_KEY_PER_TICK: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -102,6 +103,7 @@ pub struct Simulation {
     dropped_trace_events: u64,
     untrusted_this_tick: usize,
     untrusted_by_key: BTreeMap<(Node, Flow, MessageId), usize>,
+    untrusted_by_source: BTreeMap<Node, usize>,
 }
 
 impl Simulation {
@@ -123,6 +125,7 @@ impl Simulation {
             dropped_trace_events: 0,
             untrusted_this_tick: 0,
             untrusted_by_key: BTreeMap::new(),
+            untrusted_by_source: BTreeMap::new(),
         }
     }
 
@@ -179,19 +182,33 @@ impl Simulation {
     }
 
     pub fn fault_queue_len(&self) -> usize { self.faults.len() }
+    pub fn untrusted_offers_this_tick(&self) -> usize { self.untrusted_this_tick }
+    pub fn source_offers_this_tick(&self, from: Node) -> usize {
+        self.untrusted_by_source.get(&from).copied().unwrap_or(0)
+    }
 
-    /// Test-only network-edge model: an UNTRUSTED mailbox can offer bytes
-    /// claiming to be a known message. This is not peer authentication or
-    /// network discovery. Only G's local crypto verification grants trust.
-    /// Enforces per-tick admission limits before copying malicious payloads.
-    pub fn offer_untrusted_mailbox_frame(&mut self, id: MessageId, expires: u64, bytes: &[u8])
-        -> Result<(), SimError>
+    /// Test-only edge model for untrusted submissions, NOT a socket API.
+    /// The caller cannot spoof a generic peer label: only the modeled
+    /// upstream V/W -> Mailbox or Mailbox -> G links are allowed.
+    /// These Node labels are assumed by the test harness, not authenticated
+    /// identities. Real link authentication remains a separate W6 task.
+    /// All sources share a global rate budget; per-source and per-message
+    /// budgets prevent one noisy modeled link from monopolizing ingress.
+    pub fn offer_untrusted_from(&mut self, from: Node, id: MessageId,
+        expires: u64, bytes: &[u8]) -> Result<(), SimError>
     {
-        let from = Node::Mailbox;
-        let to = Node::G;
+        let to = match from {
+            Node::V | Node::W => Node::Mailbox,
+            Node::Mailbox => Node::G,
+            _ => return Err(SimError::InvalidOrigin),
+        };
         let flow = Flow::Data;
         let key = (to, flow, id);
-        if !self.available(from, to) { return Err(SimError::InvalidOrigin); }
+        if !self.available(from, to) || !self.may_forward(from) {
+            return Err(SimError::InvalidOrigin);
+        }
+        // The laboratory only simulates hostile copies of already submitted
+        // messages; it cannot model arbitrary unknown IDs or user admission.
         let Some(source) = self.copies.get(&(Node::A, flow, id)) else {
             return Err(SimError::InvalidOrigin);
         };
@@ -203,13 +220,23 @@ impl Simulation {
         if self.untrusted_this_tick >= MAX_UNTRUSTED_OFFERS_PER_TICK
             || self.untrusted_by_key.get(&key).copied().unwrap_or(0)
                >= MAX_UNTRUSTED_OFFERS_PER_KEY_PER_TICK
+            || self.untrusted_by_source.get(&from).copied().unwrap_or(0)
+               >= MAX_UNTRUSTED_OFFERS_PER_SOURCE_PER_TICK
         { return Err(SimError::ResourceLimit); }
         self.untrusted_this_tick += 1;
         *self.untrusted_by_key.entry(key).or_default() += 1;
+        *self.untrusted_by_source.entry(from).or_default() += 1;
         self.arrive(Transit {
             from, to, flow, id,
             stored: Stored { bytes: bytes.to_vec(), expires }, due: self.tick,
         })
+    }
+
+    /// Compatibility wrapper for the original single mailbox attack tests.
+    pub fn offer_untrusted_mailbox_frame(&mut self, id: MessageId, expires: u64, bytes: &[u8])
+        -> Result<(), SimError>
+    {
+        self.offer_untrusted_from(Node::Mailbox, id, expires, bytes)
     }
 
     pub fn submit_data(&mut self, id: MessageId, expires: u64, opaque: &[u8])
@@ -326,6 +353,7 @@ impl Simulation {
         self.tick += 1;
         self.untrusted_this_tick = 0;
         self.untrusted_by_key.clear();
+        self.untrusted_by_source.clear();
 
         // Complete flights scheduled on prior ticks before offering new ones.
         let flights = std::mem::take(&mut self.pending);
