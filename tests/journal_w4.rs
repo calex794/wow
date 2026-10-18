@@ -14,8 +14,8 @@ fn a(n:u8)->[u8;16]{[n;16]}
   assert!(matches!(j.enqueue(a(1),a(2),900,b"conflict"),Err(JournalError::Conflict)));
   assert_eq!(j.record_verified_receipt(a(1),a(2),Delivery::Neighbor).unwrap(),Delivery::Gateway);
   assert_eq!(j.state(a(1),a(2)).unwrap(),Delivery::Gateway);
-  assert_eq!(j.record_verified_receipt(a(1),a(2),Delivery::Recipient).unwrap(),Delivery::Recipient);
-  assert_eq!(j.retry_bytes(a(1),a(2),100).unwrap(),None);
+  assert!(matches!(j.record_verified_receipt(a(1),a(2),Delivery::Recipient),Err(JournalError::InvalidState)));
+  assert_eq!(j.retry_bytes(a(1),a(2),100).unwrap(),Some(ciphertext.clone()));
  }
 }
 #[test] fn inbox_idempotent_across_restart_and_scoped_to_sender(){
