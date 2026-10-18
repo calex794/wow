@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
 #[derive(Debug)]
-pub enum JournalError { Db(rusqlite::Error), Conflict, TooLarge, InvalidState, NotFound }
+pub enum JournalError { Db(rusqlite::Error), Conflict, TooLarge, InvalidState, NotFound, Unauthorized }
 impl From<rusqlite::Error> for JournalError {
     fn from(e: rusqlite::Error) -> Self { Self::Db(e) }
 }
@@ -37,6 +37,12 @@ impl Journal {
                 sender BLOB NOT NULL CHECK(length(sender)=16),
                 message BLOB NOT NULL CHECK(length(message)=16),
                 digest BLOB NOT NULL CHECK(length(digest)=32),
+                PRIMARY KEY(sender,message));
+            CREATE TABLE IF NOT EXISTS receipt_outbox(
+                sender BLOB NOT NULL CHECK(length(sender)=16),
+                message BLOB NOT NULL CHECK(length(message)=16),
+                digest BLOB NOT NULL CHECK(length(digest)=32),
+                receipt BLOB NOT NULL CHECK(length(receipt)=137),
                 PRIMARY KEY(sender,message));")?;
         Ok(Self{db})
     }
@@ -114,6 +120,94 @@ impl Journal {
             }
         }
     }
+    /// Authenticate the sender, persist inbox dedup AND queue a signed recipient
+    /// acknowledgment in ONE transaction. A receipt is returned only after
+    /// successful commit; a network sender cannot infer receipt from an attempted
+    /// INSERT. The receipt means durable network acceptance, NOT Sync application.
+    ///
+    /// The recipient's signing key must also be enrolled for this exact epoch;
+    /// the sender's identity and epoch come from the signed encrypted header.
+    pub fn accept_authenticated_and_queue_receipt(
+        &mut self,
+        packet: &[u8],
+        context: crate::crypto_identity_w3::TrustedRecipient<'_>,
+        recipient_signer: &ed25519_dalek::SigningKey,
+        recipient_epoch: u64,
+    ) -> Result<(Insert, Vec<u8>), JournalError> {
+        let expected_key=context.registry
+            .key_for(context.recipient_id, recipient_epoch)
+            .map_err(|_| JournalError::Unauthorized)?;
+        if expected_key != &recipient_signer.verifying_key() {
+            return Err(JournalError::Unauthorized);
+        }
+        let (header, _payload)=crate::crypto_identity_w3::open(packet, context)
+            .map_err(|_| JournalError::Unauthorized)?;
+        // Header's recipient identity was authenticated by open().
+        let digest=blake3::hash(packet);
+        let sender=header.sender_id;
+        let message=header.message_id;
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing:Option<Vec<u8>>=tx.query_row(
+            "SELECT digest FROM inbox WHERE sender=?1 AND message=?2",
+            params![sender.as_slice(), message.as_slice()],
+            |r|r.get(0),
+        ).optional()?;
+        let result=if let Some(old)=existing {
+            if old.as_slice()!=digest.as_bytes() { return Err(JournalError::Conflict); }
+            Insert::Duplicate
+        } else {
+            tx.execute("INSERT INTO inbox(sender,message,digest) VALUES(?1,?2,?3)",
+                params![sender.as_slice(),message.as_slice(),digest.as_bytes().as_slice()])?;
+            Insert::New
+        };
+        let saved:Option<(Vec<u8>,Vec<u8>)>=tx.query_row(
+            "SELECT digest,receipt FROM receipt_outbox WHERE sender=?1 AND message=?2",
+            params![sender.as_slice(),message.as_slice()],
+            |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let receipt=if let Some((old_digest,old_receipt))=saved {
+            if old_digest.as_slice()!=digest.as_bytes(){
+                return Err(JournalError::Conflict);
+            }
+            old_receipt
+        } else {
+            let receipt=crate::receipt_w4::sign(
+                recipient_signer,
+                header.recipient_id,
+                message,
+                *digest.as_bytes(),
+                recipient_epoch,
+            );
+            tx.execute(
+                "INSERT INTO receipt_outbox(sender,message,digest,receipt) VALUES(?1,?2,?3,?4)",
+                params![sender.as_slice(),message.as_slice(),digest.as_bytes().as_slice(),&receipt],
+            )?;
+            receipt
+        };
+        tx.commit()?;
+        Ok((result,receipt))
+    }
+
+    /// Retransmit the original signed receipt after restart/ACK loss.
+    /// Caller is responsible for rate limits, current trust and network egress.
+    pub fn queued_recipient_receipt(
+        &self, sender:[u8;16], message:[u8;16],
+    ) -> Result<Option<Vec<u8>>, JournalError> {
+        let stored:Option<(Vec<u8>,Vec<u8>,Vec<u8>)>=self.db.query_row(
+            "SELECT r.digest,r.receipt,i.digest
+             FROM receipt_outbox r JOIN inbox i
+               ON i.sender=r.sender AND i.message=r.message
+             WHERE r.sender=?1 AND r.message=?2",
+            params![sender.as_slice(),message.as_slice()],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        match stored {
+            None=>Ok(None),
+            Some((a,receipt,b)) if a==b=>Ok(Some(receipt)),
+            Some(_)=>Err(JournalError::Conflict),
+        }
+    }
+
     /// Caller MUST validate signature, trusted identity and permissions first.
     /// Marking as received does NOT mean the corresponding Sync Core operation was applied.
     pub fn accept_verified(&mut self,sender:[u8;16],message:[u8;16],packet:&[u8])
