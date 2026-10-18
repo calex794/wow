@@ -1,5 +1,5 @@
 use akula_wire_lab::trust_w3::{TrustRegistry,TrustError};
-use akula_wire_lab::crypto_w3::{new_recipient,seal,open,RecipientContext};
+use akula_wire_lab::crypto_w3::{new_recipient,seal,open_with_trust,RecipientContext,CryptoError};
 use ed25519_dalek::SigningKey;
 fn key(n:u8)->SigningKey{SigningKey::from_bytes(&[n;32])}
 #[test] fn explicit_enrollment_rotation_revocation() {
@@ -25,12 +25,19 @@ fn key(n:u8)->SigningKey{SigningKey::from_bytes(&[n;32])}
  let (secret,public)=new_recipient();
  let packet=seal(&alice,&public,[1;16],target,1000,b"notice").unwrap();
  assert_eq!(registry.verify(id,1,&alice.verifying_key()),Err(TrustError::Untrusted));
+ assert_eq!(open_with_trust(&packet,RecipientContext{secret:&secret,
+  expected_sender:&alice.verifying_key(),expected_recipient:target,now:100},
+  &registry,id,1),Err(CryptoError::UnauthorizedSender));
  registry.enroll(id,1,alice.verifying_key()).unwrap();
  assert_eq!(registry.verify(id,1,&mallory.verifying_key()),Err(TrustError::WrongKey));
  registry.verify(id,1,&alice.verifying_key()).unwrap();
- assert_eq!(open(&packet,RecipientContext{secret:&secret,
-  expected_sender:&alice.verifying_key(),expected_recipient:target,now:100}).unwrap().1,b"notice");
+ assert_eq!(open_with_trust(&packet,RecipientContext{secret:&secret,
+  expected_sender:&alice.verifying_key(),expected_recipient:target,now:100},
+  &registry,id,1).unwrap().1,b"notice");
  registry.revoke(id).unwrap();
  assert_eq!(registry.verify(id,1,&alice.verifying_key()),Err(TrustError::Revoked));
- // Application must gate open()/dispatch on the result above. No Sync Core bridge yet.
+ assert_eq!(open_with_trust(&packet,RecipientContext{secret:&secret,
+  expected_sender:&alice.verifying_key(),expected_recipient:target,now:100},
+  &registry,id,1),Err(CryptoError::UnauthorizedSender));
+ // No Sync Core bridge and no file permission is conferred by trust.
 }
