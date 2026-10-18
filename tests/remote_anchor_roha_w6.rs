@@ -67,13 +67,26 @@ impl Server {
             .alpns(vec![ANCHOR_ALPN.to_vec()])
             .bind().await.unwrap();
         let ep=endpoint.clone();
+        let slots=Arc::new(tokio::sync::Semaphore::new(4));
         let task=tokio::spawn(async move {
             loop {
                 let Some(incoming)=ep.accept().await else {return};
-                let Ok(conn)=incoming.await else {continue};
-                if let Err(error)=serve_one_anchor_connection(&conn,&ledger).await {
-                    eprintln!("W6 LAB anchor responder failure: {error:?}");
-                }
+                // Bounded worker admission, never serially wait for one
+                // client's RPC reply acknowledgement before accepting the
+                // next independently authenticated TLS identity.
+                let Ok(slot)=Arc::clone(&slots).try_acquire_owned() else {
+                    drop(incoming); // fail closed under overload
+                    continue;
+                };
+                let ledger=Arc::clone(&ledger);
+                tokio::spawn(async move {
+                    let _slot=slot;
+                    if let Ok(conn)=incoming.await {
+                        if let Err(error)=serve_one_anchor_connection(&conn,&ledger).await {
+                            eprintln!("W6 LAB anchor responder failure: {error:?}");
+                        }
+                    }
+                });
             }
         });
         Self{endpoint,task}
