@@ -32,3 +32,25 @@ jobs:
         run: |
           ROOT="$RUNNER_TEMP/staya-enospc"
           if mountpoint -q "$ROOT"; then sudo umount "$ROOT"; fi
+
+  w4_recipient_enospc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Mount isolated 16 MiB Linux tmpfs
+        run: |
+          ROOT="$RUNNER_TEMP/staya-w4-enospc"
+          mkdir -p "$ROOT"
+          sudo mount -t tmpfs -o size=16m,mode=0777,nosuid,nodev tmpfs "$ROOT"
+          mountpoint -q "$ROOT"
+          test "$(stat -c %d "$ROOT")" != "$(stat -c %d "$RUNNER_TEMP")"
+      - name: Assert real ENOSPC cannot yield recipient ACK
+        env:
+          STAYA_W4_ENOSPC_MOUNT: ${{ runner.temp }}/staya-w4-enospc
+        run: cargo test --test recipient_enospc_w4 -- --ignored --nocapture
+      - name: Unmount isolated test filesystem
+        if: always()
+        run: |
+          ROOT="$RUNNER_TEMP/staya-w4-enospc"
+          if mountpoint -q "$ROOT"; then sudo umount "$ROOT"; fi
