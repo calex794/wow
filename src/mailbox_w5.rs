@@ -54,6 +54,7 @@ pub enum MailError {
     Db(rusqlite::Error),
     InvalidLimits,
     InvalidTime,
+    ClockRollback,
     InvalidPacket,
     TooLongTtl,
     QuotaExceeded,
@@ -105,7 +106,13 @@ impl Mailbox {
              CREATE INDEX IF NOT EXISTS mailbox_expiry
                 ON mailbox_entries(expires_at);
              CREATE INDEX IF NOT EXISTS mailbox_paging
-                ON mailbox_entries(route_token, message_id);",
+                ON mailbox_entries(route_token, message_id);
+             CREATE TABLE IF NOT EXISTS mailbox_maintenance (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                 last_gc_at INTEGER NOT NULL CHECK(last_gc_at>=0)
+             );
+             INSERT OR IGNORE INTO mailbox_maintenance (singleton,last_gc_at)
+               VALUES (1,0);",
         )?;
         Ok(Self {db, limits})
     }
@@ -116,6 +123,8 @@ impl Mailbox {
     /// a changed expiry cannot extend TTL. The SQLite IMMEDIATE transaction
     /// serializes quota checks and insertion across writers.
     /// Token ownership and sender authorization are NOT implemented here.
+    /// An ordinary enqueue never uses caller-provided time to delete other
+    /// messages. Expired rows retain their quota until explicit maintenance.
     pub fn put(
         &mut self,
         route_token: [u8; 16],
@@ -135,7 +144,11 @@ impl Mailbox {
         }
         let digest = blake3::hash(sealed);
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("DELETE FROM mailbox_entries WHERE expires_at <= ?1", params![now])?;
+        let last_gc_at: i64 = tx.query_row(
+            "SELECT last_gc_at FROM mailbox_maintenance WHERE singleton=1",
+            [], |r| r.get(0),
+        )?;
+        if now < last_gc_at { return Err(MailError::ClockRollback); }
         let existing: Option<(Vec<u8>, Vec<u8>, i64)> = tx.query_row(
             "SELECT digest,sealed,expires_at FROM mailbox_entries
              WHERE route_token=?1 AND message_id=?2",
@@ -191,6 +204,11 @@ impl Mailbox {
     ) -> Result<Vec<OpaqueMessage>, MailError> {
         if now < 0 { return Err(MailError::InvalidTime); }
         if limit == 0 || limit > HARD_MAX_PAGE { return Err(MailError::InvalidPage); }
+        let last_gc_at: i64 = self.db.query_row(
+            "SELECT last_gc_at FROM mailbox_maintenance WHERE singleton=1",
+            [], |r| r.get(0),
+        )?;
+        if now < last_gc_at { return Err(MailError::ClockRollback); }
         let anchor = after.map(|a| a.to_vec());
         let mut stmt = self.db.prepare(
             "SELECT message_id,expires_at,sealed,digest
@@ -223,13 +241,26 @@ impl Mailbox {
         Ok(result)
     }
 
-    /// Explicit garbage collection. No receipt-driven deletion is allowed
-    /// without a separate verified end-recipient deletion protocol.
+    /// Explicit, privileged garbage collection. Call with trusted maintenance
+    /// time only; arbitrary put() requests cannot authorize deletion.
+    /// A durable high-water mark rejects backward clock movement across restarts.
+    /// This cannot detect an incorrect *forward* jump in the trusted clock.
+    /// No receipt-driven deletion is allowed without a separate verified
+    /// end-recipient deletion protocol.
     pub fn purge_expired(&mut self, now: i64) -> Result<usize, MailError> {
         if now < 0 { return Err(MailError::InvalidTime); }
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let last_gc_at: i64 = tx.query_row(
+            "SELECT last_gc_at FROM mailbox_maintenance WHERE singleton=1",
+            [], |r| r.get(0),
+        )?;
+        if now < last_gc_at { return Err(MailError::ClockRollback); }
         let deleted=tx.execute(
             "DELETE FROM mailbox_entries WHERE expires_at<=?1",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE mailbox_maintenance SET last_gc_at=?1 WHERE singleton=1",
             params![now],
         )?;
         tx.commit()?;
