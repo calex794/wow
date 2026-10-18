@@ -117,7 +117,15 @@ impl Simulation {
     /// Relay participation must be opted in, never implied by network access.
     pub fn relay_opt_in(&mut self, node: Node, enabled: bool) {
         if !matches!(node, Node::B | Node::V | Node::W) { return; }
-        if enabled { self.opted_in.insert(node); } else { self.opted_in.remove(&node); }
+        if enabled {
+            self.opted_in.insert(node);
+        } else {
+            self.opted_in.remove(&node);
+            // Revoking voluntary participation also discards unsent and stored
+            // relay copies. Disconnecting is not a license to send queued data.
+            self.copies.retain(|(owner, _, _), _| *owner != node);
+            self.pending.retain(|flight| flight.from != node && flight.to != node);
+        }
     }
 
     /// A crashed intermediary loses only its volatile simulated copies.
@@ -128,7 +136,13 @@ impl Simulation {
             self.alive.insert(node);
         } else {
             self.alive.remove(&node);
-            self.copies.retain(|(n, _, _), _| *n != node);
+            // A mailbox is modeled as a durable node: downtime prevents
+            // delivery, but does not erase previously stored envelopes.
+            // Other nodes only have volatile local transport copies.
+            if node != Node::Mailbox {
+                self.copies.retain(|(n, _, _), _| *n != node);
+            }
+            self.pending.retain(|flight| flight.from != node && flight.to != node);
         }
     }
 
@@ -277,6 +291,12 @@ impl Simulation {
     fn available(&self, from: Node, to: Node) -> bool {
         self.alive.contains(&from) && self.alive.contains(&to)
             && self.links.contains(&ordered_pair(from, to))
+            // A connection never implies consent to receive or relay foreign
+            // packets. Check opt-in again for delayed flights upon arrival.
+            && (!matches!(from, Node::B | Node::V | Node::W)
+                || self.opted_in.contains(&from))
+            && (!matches!(to, Node::B | Node::V | Node::W)
+                || self.opted_in.contains(&to))
     }
     fn emit(&mut self, from: Node, to: Node, flow: Flow, id: MessageId, event: &'static str)
         -> Result<(), SimError>
