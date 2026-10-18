@@ -90,6 +90,18 @@ fn await_active(guard: &Arc<Mutex<IngressGuard>>, count: usize) {
     panic!("expected {count} live tickets, got {}", guard.lock().unwrap().stats().active);
 }
 
+fn await_buffered(guard: &Arc<Mutex<IngressGuard>>, minimum: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if guard.lock().unwrap().stats().buffered_bytes >= minimum { return; }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "expected {minimum} buffered grant bytes, got {}",
+        guard.lock().unwrap().stats().buffered_bytes
+    );
+}
+
 #[test]
 fn eight_simultaneous_partial_clients_block_ninth_without_locking_sqlite() {
     let tmp = tempdir().unwrap();
@@ -229,8 +241,8 @@ fn blocked_sqlite_writer_does_not_block_shared_ingress_accounting() {
     let (accepted, _) = listener.accept().unwrap();
     let handler = spawn_handler(accepted, &guard, &mailbox, &trust, policy);
 
-    await_active(&guard, 1);
-    assert_eq!(guard.lock().unwrap().stats().buffered_bytes, SIGNED_GRANT_LEN);
+    await_buffered(&guard, SIGNED_GRANT_LEN);
+    assert_eq!(guard.lock().unwrap().stats().active, 1);
     assert!(guard.try_lock().is_ok(), "storage lock must not hold guard lock");
     drop(db_busy);
     assert!(matches!(
