@@ -44,7 +44,7 @@ fn next(seed:&mut u64)->u64{*seed^=*seed<<13;*seed^=*seed>>7;*seed^=*seed<<17;*s
    let byte=next(&mut seed) as u8;
    let _=d.push(&[byte]);
    assert!(d.buffered_bytes()<=16*1024+4);
-   if next(&mut seed)%13==0 {d.reset();}
+   if next(&mut seed).is_multiple_of(13) {d.reset();}
  }
 }
 #[test] fn stale_replay_does_not_reserve_new_transfer() {
