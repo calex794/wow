@@ -268,7 +268,12 @@ pub async fn serve_one_anchor_connection(
             encode_reply(service.current_for(remote))
         } else if wire.len()==CAS_BYTES && wire[0]==OP_CAS {
             let first=decode_checkpoint(&wire[1..1+CHECKPOINT_BYTES]);
-            let second=decode_checkpoint(&wire[1+CHECKPOINT_BYTES..]);
+            // Signed operator change follows two *exactly 40-byte* checkpoint
+            // fields. Decoding the entire remaining packet would include the
+            // Ed25519 proofs and reject every legitimate signed CAS.
+            let second=decode_checkpoint(
+                &wire[1+CHECKPOINT_BYTES..1+2*CHECKPOINT_BYTES],
+            );
             let change_start=1+2*CHECKPOINT_BYTES;
             let proof_start=change_start+SIGNED_ENROLLMENT_BYTES;
             let change=&wire[change_start..proof_start];
