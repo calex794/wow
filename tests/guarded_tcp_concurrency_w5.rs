@@ -139,7 +139,7 @@ fn eight_simultaneous_partial_clients_block_ninth_without_locking_sqlite() {
     let mut no_ack = Vec::new();
     let _ = ninth.read_to_end(&mut no_ack);
     assert!(no_ack.is_empty());
-    assert_eq!(mailbox.lock().unwrap().stats().messages, 0);
+    assert_eq!(mailbox.lock().unwrap().stats().unwrap().messages, 0);
 
     // Cancelling slow clients must release all eight slots even when
     // the mailbox has not received any ciphertext.
@@ -165,7 +165,7 @@ fn eight_simultaneous_partial_clients_block_ninth_without_locking_sqlite() {
     let mut no_ack = Vec::new();
     accepted_client.read_to_end(&mut no_ack).unwrap();
     assert!(no_ack.is_empty());
-    assert_eq!(mailbox.lock().unwrap().stats().messages, 1);
+    assert_eq!(mailbox.lock().unwrap().stats().unwrap().messages, 1);
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn concurrent_identical_signed_packets_commit_once_without_recipient_ack() {
         assert!(reply.is_empty(), "relay must never issue end-recipient ACK");
     }
     assert_eq!((stored, duplicates), (1, 7));
-    assert_eq!(mailbox.lock().unwrap().stats().messages, 1);
+    assert_eq!(mailbox.lock().unwrap().stats().unwrap().messages, 1);
     let stats = guard.lock().unwrap().stats();
     assert_eq!(stats.active, 0);
     assert_eq!(stats.buffered_bytes, 0);
@@ -253,5 +253,5 @@ fn blocked_sqlite_writer_does_not_block_shared_ingress_accounting() {
     client.read_to_end(&mut reply).unwrap();
     assert!(reply.is_empty());
     assert_eq!(guard.lock().unwrap().stats().active, 0);
-    assert_eq!(mailbox.lock().unwrap().stats().messages, 1);
+    assert_eq!(mailbox.lock().unwrap().stats().unwrap().messages, 1);
 }
