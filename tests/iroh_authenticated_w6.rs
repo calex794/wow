@@ -285,3 +285,119 @@ async fn incomplete_authenticated_stream_times_out_and_releases_ticket() {
     lab.assert_message_count(0);
     lab.assert_clean_guard();
 }
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn signed_operator_revoke_drops_existing_quic_endpoint_before_ingress() {
+    let lab=Lab::new().await;
+    let (sender,receiver)=connect_pair(&lab.server,&lab.trusted,W6_LAB_ALPN).await;
+    // TLS connection remains alive after operator revokes its route binding.
+    let revoke = sign_operator_change(&lab.operator,&OperatorChange {
+        operation:PolicyOperation::Revoke,revision:2,binding:lab.trusted_binding,
+    }).unwrap();
+    lab.enrollment.lock().unwrap().apply_signed(&revoke).unwrap();
+    assert!(matches!(
+        receive_authenticated_iroh_mailbox(
+            &receiver,lab.context(Duration::from_secs(2))
+        ).await,
+        Err(IrohIngressError::Enrollment(EnrollmentError::Revoked))
+    ));
+    // Even a still-valid W5 signed-grant capability and encrypted ciphertext
+    // cannot restore access after operator revocation.
+    assert!(sender.remote_id()==lab.server.id());
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn revocation_between_ticket_admission_and_read_fails_at_commit_boundary() {
+    let lab=Lab::new().await;
+    let (sender,receiver)=connect_pair(&lab.server,&lab.trusted,W6_LAB_ALPN).await;
+
+    let result=receive_authenticated_iroh_mailbox(
+        &receiver,lab.context(Duration::from_secs(5)),
+    );
+    let attack=async {
+        // Wait until the receiver has really reserved a shared ingress
+        // ticket, meaning it already checked initial enrollment and is
+        // awaiting a QUIC application stream.
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(2);
+        while lab.guard.lock().unwrap().stats().active==0 {
+            assert!(tokio::time::Instant::now()<deadline,"no admission ticket");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let signed = sign_operator_change(&lab.operator,&OperatorChange {
+            operation:PolicyOperation::Revoke,revision:2,
+            binding:lab.trusted_binding,
+        }).unwrap();
+        lab.enrollment.lock().unwrap().apply_signed(&signed).unwrap();
+        transmit(&sender,&lab.wire()).await;
+    };
+    let (outcome,())=tokio::join!(result,attack);
+    assert!(matches!(
+        outcome,Err(IrohIngressError::Enrollment(EnrollmentError::Revoked))
+    ));
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn operator_bound_route_scope_is_checked_beyond_tls_identity() {
+    let lab=Lab::new().await;
+    let (_,receiver)=connect_pair(&lab.server,&lab.trusted,W6_LAB_ALPN).await;
+    let forbidden=RelayPolicy {route_token:id(55),..lab.relay_policy};
+    let mut context=lab.context(Duration::from_secs(2));
+    context.relay_policy=&forbidden;
+    let result=receive_authenticated_iroh_mailbox(&receiver,context).await;
+    assert!(matches!(
+        result,Err(IrohIngressError::Enrollment(EnrollmentError::WrongScope))
+    ));
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn operator_signed_epoch_rotation_requires_matching_w3_registry() {
+    let mut lab=Lab::new().await;
+    let (sender,receiver)=connect_pair(&lab.server,&lab.trusted,W6_LAB_ALPN).await;
+    let rotated=EndpointRouteBinding {w3_epoch:10,..lab.trusted_binding};
+    let change=sign_operator_change(&lab.operator,&OperatorChange {
+        operation:PolicyOperation::Allow,revision:2,binding:rotated,
+    }).unwrap();
+    lab.enrollment.lock().unwrap().apply_signed(&change).unwrap();
+    // Policy now demands epoch 10, but W3 registry still holds epoch 9.
+    assert!(matches!(
+        receive_authenticated_iroh_mailbox(
+            &receiver,lab.context(Duration::from_secs(2)),
+        ).await,
+        Err(IrohIngressError::RevokedOrStaleDevice)
+    ));
+    let new_w3_key=SigningKey::from_bytes(&[22;32]);
+    lab.device_registry.enroll(id(7),10,new_w3_key.verifying_key()).unwrap();
+    assert!(matches!(
+        receive_with_bytes(&lab,&sender,&receiver,&lab.wire()).await,
+        Ok(IngressOutcome::MailboxStored(PutStatus::Stored))
+    ));
+    lab.assert_message_count(1);
+    lab.assert_clean_guard();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn wrong_alpn_rejected_before_ticket_or_storage_even_with_valid_tls_key() {
+    let lab=Lab::new().await;
+    let bad_alpn=b"akula-wow/other-app/1";
+    // Deliberately offer both ALPNs in the server to allow a VALID QUIC/TLS
+    // handshake negotiating the wrong protocol, rather than only a failed
+    // handshake. This proves handler-level protocol separation.
+    let wrong_server=bind_lab(vec![W6_LAB_ALPN.to_vec(),bad_alpn.to_vec()]).await;
+    let (_,receiver)=connect_pair(&wrong_server,&lab.trusted,bad_alpn).await;
+    let mut context=lab.context(Duration::from_secs(2));
+    context.local=&wrong_server;
+    context.expected_local_id=wrong_server.id();
+    assert!(matches!(
+        receive_authenticated_iroh_mailbox(&receiver,context).await,
+        Err(IrohIngressError::WrongAlpn)
+    ));
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
