@@ -7,8 +7,9 @@
 mod w6_memory_anchor;
 
 use akula_wire_lab::peer_enrollment_w6::{
-    AnchorError, EnrollmentError, EndpointRouteBinding, OperatorChange,
-    PeerEnrollmentDb, PolicyOperation, TrustedPolicyAnchor, sign_operator_change,
+    AnchorError, EnrollmentError, EnrollmentLookup, EndpointRouteBinding,
+    OperatorChange, PeerEnrollmentDb, PolicyOperation, TrustedPolicyAnchor,
+    sign_operator_change,
 };
 use ed25519_dalek::SigningKey;
 use iroh::EndpointId;
@@ -36,7 +37,10 @@ fn signed(revision:u64,operation:PolicyOperation)->Vec<u8>{
 fn allowed(policy:&mut PeerEnrollmentDb, anchor:&MemoryAnchor)->Result<([u8;16],u64),EnrollmentError>{
     let b=binding();
     policy.authorize_anchored(
-        anchor,&b.endpoint_id,&b.relay_id,&b.namespace,&b.route_token,&b.issuer_id
+        anchor,EnrollmentLookup {
+            remote:&b.endpoint_id,relay:&b.relay_id,
+            namespace:&b.namespace,token:&b.route_token,issuer:&b.issuer_id,
+        }
     )
 }
 fn try_store(policy:&mut PeerEnrollmentDb,anchor:&MemoryAnchor,called:&mut bool)
@@ -44,8 +48,10 @@ fn try_store(policy:&mut PeerEnrollmentDb,anchor:&MemoryAnchor,called:&mut bool)
 {
     let b=binding();
     policy.with_anchored_write(
-        anchor,&b.endpoint_id,&b.relay_id,&b.namespace,
-        &b.route_token,&b.issuer_id,
+        anchor,EnrollmentLookup {
+            remote:&b.endpoint_id,relay:&b.relay_id,
+            namespace:&b.namespace,token:&b.route_token,issuer:&b.issuer_id,
+        },
         |_| {*called=true; Ok(())}
     )
 }
