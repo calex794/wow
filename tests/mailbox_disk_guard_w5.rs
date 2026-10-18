@@ -36,7 +36,7 @@ fn main_database_page_cap_fails_closed_and_keeps_committed_rows() {
         match mail.put(id(next), id(1), 0, 500, &bytes) {
             Ok(PutStatus::Stored) => successful += 1,
             Err(MailError::Db(rusqlite::Error::SqliteFailure(inner, _)))
-                if inner.code == rusqlite::ErrorCode::DatabaseFull =>
+                if inner.code == rusqlite::ErrorCode::DiskFull =>
             {
                 saw_sqlite_full = true;
                 break;
