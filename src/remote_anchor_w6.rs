@@ -5,17 +5,24 @@
 //! a production anti-rollback trust boundary.
 //!
 //! The relay is a READ-ONLY TLS identity. A separately pinned admin TLS
-//! identity may publish a strictly monotonic CAS. No network bootstrap:
+//! identity may publish a strictly monotonic CAS ONLY when it carries TWO
+//! valid offline operator Ed25519 signatures binding the change, original
+//! checkpoint and exact replacement digest. Admin TLS key alone CANNOT
+//! create or change any checkpoint. No network bootstrap:
 //! provisioning is an explicit local service-owner operation.
 //!
 //! Protocol v1: exactly one bounded bidirectional QUIC stream per connection,
-//! 1-byte GET or 81-byte CAS request. Responses are 41-byte checkpoint
+//! 1-byte GET or fixed-size SIGNED CAS request. Responses are 41-byte checkpoint
 //! (status 0) or 1-byte refusal. No 0-RTT or custom signature handshake.
 //! QUIC identity always comes from connection.remote_id(), never a frame.
 //!
 //! This is a bounded LAB service and synchronous client adapter, not a
 //! production accept scheduler, physical HSM, quorum audit log or disk quota.
-use crate::peer_enrollment_w6::{AnchorError, PolicyCheckpoint, TrustedPolicyAnchor};
+use crate::peer_enrollment_w6::{
+    AnchorError, PolicyCheckpoint, TrustedPolicyAnchor, SIGNED_ENROLLMENT_BYTES,
+    SIGNED_TRANSITION_PROOF_BYTES, verify_signed_anchor_transition,
+};
+use ed25519_dalek::VerifyingKey;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::{Connection, presets}};
 use rusqlite::{params, Connection as Sqlite, OpenFlags, TransactionBehavior};
 use std::{
@@ -36,7 +43,8 @@ const STATUS_MALFORMED: u8 = 6;
 const CLIENT_RESPONSE_RECEIVED: u8 = 0x71;
 const CHECKPOINT_BYTES: usize = 40;
 const GET_BYTES: usize = 1;
-const CAS_BYTES: usize = 1 + 2 * CHECKPOINT_BYTES;
+const CAS_BYTES: usize = 1 + 2 * CHECKPOINT_BYTES
+    + SIGNED_ENROLLMENT_BYTES + SIGNED_TRANSITION_PROOF_BYTES;
 const RESPONSE_BYTES: usize = 1 + CHECKPOINT_BYTES;
 const IO_BUDGET: Duration = Duration::from_secs(2);
 
@@ -47,6 +55,7 @@ pub enum RemoteAnchorError {
     NotProvisioned,
     ConfigurationMismatch,
     UntrustedPeer,
+    UntrustedOperatorTransition,
     Conflict,
     CorruptStorage,
     Protocol,
@@ -63,6 +72,10 @@ impl From<rusqlite::Error> for RemoteAnchorError {
 pub struct AnchorServicePolicy {
     pub reader: EndpointId,
     pub administrator: EndpointId,
+    /// Independently pinned OFFLINE Ed25519 operator signing authority.
+    /// The corresponding private key must NEVER run on this anchor server,
+    /// W6 relay, or the TLS-administrator client.
+    pub operator: VerifyingKey,
 }
 fn to_int(revision:u64) -> Result<i64,RemoteAnchorError> {
     if revision>i64::MAX as u64 {return Err(RemoteAnchorError::Protocol);}
@@ -89,6 +102,7 @@ fn decode_checkpoint(bytes:&[u8])->Result<PolicyCheckpoint,RemoteAnchorError> {
 struct StoredAnchorRow {
     reader: Vec<u8>,
     administrator: Vec<u8>,
+    operator: Vec<u8>,
     checkpoint: PolicyCheckpoint,
 }
 
@@ -111,10 +125,12 @@ impl RemoteAnchorLedger {
         if existing!=0 {return Err(RemoteAnchorError::AlreadyProvisioned);}
         tx.execute(
             "INSERT INTO w6_external_anchor
-             (id,reader,administrator,revision,digest) VALUES(1,?1,?2,?3,?4)",
+             (id,reader,administrator,operator,revision,digest)
+             VALUES(1,?1,?2,?3,?4,?5)",
             params![
                 policy.reader.as_bytes().as_slice(),
                 policy.administrator.as_bytes().as_slice(),
+                policy.operator.as_bytes().as_slice(),
                 to_int(initial.revision)?, initial.digest.as_slice(),
             ],
         )?;
@@ -131,6 +147,7 @@ impl RemoteAnchorLedger {
         let trusted=found.ok_or(RemoteAnchorError::NotProvisioned)?;
         if trusted.reader.as_slice()!=policy.reader.as_bytes()
             || trusted.administrator.as_slice()!=policy.administrator.as_bytes()
+            || trusted.operator.as_slice()!=policy.operator.as_bytes()
         {
             return Err(RemoteAnchorError::ConfigurationMismatch);
         }
@@ -145,6 +162,7 @@ impl RemoteAnchorLedger {
                id INTEGER PRIMARY KEY CHECK(id=1),
                reader BLOB NOT NULL CHECK(length(reader)=32),
                administrator BLOB NOT NULL CHECK(length(administrator)=32),
+               operator BLOB NOT NULL CHECK(length(operator)=32),
                revision INTEGER NOT NULL CHECK(revision>=0),
                digest BLOB NOT NULL CHECK(length(digest)=32)
              );"
@@ -154,21 +172,23 @@ impl RemoteAnchorLedger {
     fn record(db:&Sqlite)->Result<Option<StoredAnchorRow>,RemoteAnchorError>{
         use rusqlite::OptionalExtension;
         let rec=db.query_row(
-            "SELECT reader,administrator,revision,digest FROM w6_external_anchor WHERE id=1",
+            "SELECT reader,administrator,operator,revision,digest FROM w6_external_anchor WHERE id=1",
             [],|row|Ok((
                 row.get::<_,Vec<u8>>(0)?,
                 row.get::<_,Vec<u8>>(1)?,
-                row.get::<_,i64>(2)?,
-                row.get::<_,Vec<u8>>(3)?,
+                row.get::<_,Vec<u8>>(2)?,
+                row.get::<_,i64>(3)?,
+                row.get::<_,Vec<u8>>(4)?,
             )),
         ).optional()?;
-        let Some((reader,administrator,rev,digest))=rec else {return Ok(None)};
-        if reader.len()!=32 || administrator.len()!=32 || digest.len()!=32 || rev<0 {
+        let Some((reader,administrator,operator,rev,digest))=rec else {return Ok(None)};
+        if reader.len()!=32 || administrator.len()!=32
+            || operator.len()!=32 || digest.len()!=32 || rev<0 {
             return Err(RemoteAnchorError::CorruptStorage);
         }
         let mut d=[0u8;32];d.copy_from_slice(&digest);
         Ok(Some(StoredAnchorRow {
-            reader, administrator,
+            reader, administrator, operator,
             checkpoint:PolicyCheckpoint {revision:rev as u64,digest:d},
         }))
     }
@@ -183,17 +203,22 @@ impl RemoteAnchorLedger {
             .ok_or(RemoteAnchorError::NotProvisioned)?;
         Ok(record.checkpoint)
     }
-    /// Strictly monotonic, FULL-synchronous SQLite BEGIN IMMEDIATE CAS;
-    /// only operator TLS key may change the independent trust watermark.
+    /// Strictly monotonic, FULL-synchronous SQLite BEGIN IMMEDIATE CAS.
+    /// BOTH the pinned admin TLS identity and independently OFFLINE-signed
+    /// operator change + checkpoint transition MUST validate. The server
+    /// verifies these signatures itself, never accepting an arbitrary digest
+    /// chosen solely by an online TLS administrator.
     pub fn advance_for(
         &mut self,peer:EndpointId,expected:PolicyCheckpoint,
-        next:PolicyCheckpoint,
+        next:PolicyCheckpoint,change:&[u8],proof:&[u8],
     )->Result<PolicyCheckpoint,RemoteAnchorError>{
         if peer!=self.policy.administrator {
             return Err(RemoteAnchorError::UntrustedPeer);
         }
+        verify_signed_anchor_transition(
+            &self.policy.operator,change,expected,next,proof,
+        ).map_err(|_|RemoteAnchorError::UntrustedOperatorTransition)?;
         to_int(next.revision)?;
-        if next.revision<=expected.revision {return Err(RemoteAnchorError::Conflict);}
         let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record=Self::record(&tx)?
             .ok_or(RemoteAnchorError::NotProvisioned)?;
@@ -215,7 +240,8 @@ fn encode_reply(out:Result<PolicyCheckpoint,RemoteAnchorError>)->Vec<u8>{
             let mut r=Vec::with_capacity(RESPONSE_BYTES);
             r.push(STATUS_OK);r.extend_from_slice(&checkpoint_bytes(v));r
         }
-        Err(RemoteAnchorError::UntrustedPeer)=>vec![STATUS_DENIED],
+        Err(RemoteAnchorError::UntrustedPeer
+            | RemoteAnchorError::UntrustedOperatorTransition)=>vec![STATUS_DENIED],
         Err(RemoteAnchorError::Conflict)=>vec![STATUS_CONFLICT],
         Err(RemoteAnchorError::Protocol)=>vec![STATUS_MALFORMED],
         Err(_)=>vec![STATUS_FAULT],
@@ -242,13 +268,27 @@ pub async fn serve_one_anchor_connection(
             encode_reply(service.current_for(remote))
         } else if wire.len()==CAS_BYTES && wire[0]==OP_CAS {
             let first=decode_checkpoint(&wire[1..1+CHECKPOINT_BYTES]);
-            let second=decode_checkpoint(&wire[1+CHECKPOINT_BYTES..]);
+            // Signed operator change follows two *exactly 40-byte* checkpoint
+            // fields. Decoding the entire remaining packet would include the
+            // Ed25519 proofs and reject every legitimate signed CAS.
+            let second=decode_checkpoint(
+                &wire[1+CHECKPOINT_BYTES..1+2*CHECKPOINT_BYTES],
+            );
+            let change_start=1+2*CHECKPOINT_BYTES;
+            let proof_start=change_start+SIGNED_ENROLLMENT_BYTES;
+            let change=&wire[change_start..proof_start];
+            let proof=&wire[proof_start..CAS_BYTES];
             match (first,second) {
                 (Ok(old),Ok(new))=>
-                    encode_reply(service.advance_for(remote,old,new)),
-                _=>vec![STATUS_MALFORMED],
+                    encode_reply(service.advance_for(remote,old,new,change,proof)),
+                _=>{
+                    eprintln!("W6 anchor invalid signed-CAS checkpoint encoding");
+                    vec![STATUS_MALFORMED]
+                },
             }
         } else {
+            // Redacted structural-only telemetry, no keys or patient data.
+            eprintln!("W6 anchor unexpected request wire bytes: len={} expected-CAS={}",wire.len(),CAS_BYTES);
             vec![STATUS_MALFORMED]
         }
     };
@@ -287,8 +327,7 @@ pub struct RemoteAnchorClient {
     tx:SyncSender<ClientRequest>,
 }
 struct ClientRequest {
-    old:Option<PolicyCheckpoint>,
-    next:Option<PolicyCheckpoint>,
+    wire:Vec<u8>,
     reply:mpsc::SyncSender<Result<PolicyCheckpoint,AnchorError>>,
 }
 impl RemoteAnchorClient {
@@ -328,23 +367,15 @@ impl RemoteAnchorClient {
         requests:Receiver<ClientRequest>,
     ) {
         for req in requests {
-            let output=rt.block_on(Self::invoke(local,remote.clone(),req.old,req.next));
+            let output=rt.block_on(Self::invoke(local,remote.clone(),req.wire));
             let _=req.reply.send(output);
         }
     }
     async fn invoke(
-        local:&Endpoint,remote:EndpointAddr,
-        old:Option<PolicyCheckpoint>,next:Option<PolicyCheckpoint>,
+        local:&Endpoint,remote:EndpointAddr,request:Vec<u8>,
     )->Result<PolicyCheckpoint,AnchorError>{
-        let mut request=Vec::with_capacity(CAS_BYTES);
-        match (old,next) {
-            (None,None)=>request.push(OP_GET),
-            (Some(o),Some(n))=>{
-                request.push(OP_CAS);
-                request.extend_from_slice(&checkpoint_bytes(o));
-                request.extend_from_slice(&checkpoint_bytes(n));
-            }
-            _=>return Err(AnchorError::InvalidAttestation),
+        if request.len()!=GET_BYTES && request.len()!=CAS_BYTES {
+            return Err(AnchorError::InvalidAttestation);
         }
         let response=tokio::time::timeout(IO_BUDGET,async {
             let conn=local.connect(remote,ANCHOR_ALPN).await
@@ -384,15 +415,20 @@ impl RemoteAnchorClient {
             [STATUS_OK,rest @ ..] if rest.len()==CHECKPOINT_BYTES=>
                 decode_checkpoint(rest).map_err(|_|AnchorError::InvalidAttestation),
             [STATUS_CONFLICT]=>Err(AnchorError::Conflict),
-            [STATUS_DENIED]|[STATUS_MALFORMED]=>Err(AnchorError::InvalidAttestation),
+            [STATUS_DENIED]=>{
+                eprintln!("W6 anchor rejected TLS identity or offline operator proof");
+                Err(AnchorError::InvalidAttestation)
+            }
+            [STATUS_MALFORMED]=>{
+                eprintln!("W6 anchor rejected malformed signed-CAS wire frame");
+                Err(AnchorError::InvalidAttestation)
+            }
             _=>Err(AnchorError::Unavailable),
         }
     }
-    fn rpc(
-        &self,old:Option<PolicyCheckpoint>,next:Option<PolicyCheckpoint>,
-    )->Result<PolicyCheckpoint,AnchorError>{
+    fn rpc(&self,wire:Vec<u8>)->Result<PolicyCheckpoint,AnchorError>{
         let (reply,receiver)=mpsc::sync_channel(1);
-        self.tx.try_send(ClientRequest {old,next,reply})
+        self.tx.try_send(ClientRequest {wire,reply})
             .map_err(|_|AnchorError::Unavailable)?;
         receiver.recv_timeout(IO_BUDGET+Duration::from_secs(1))
             .map_err(|_|AnchorError::Unavailable)?
@@ -400,12 +436,31 @@ impl RemoteAnchorClient {
 }
 impl TrustedPolicyAnchor for RemoteAnchorClient {
     fn current(&self)->Result<PolicyCheckpoint,AnchorError>{
-        self.rpc(None,None)
+        self.rpc(vec![OP_GET])
     }
     fn advance(
-        &self,expected:PolicyCheckpoint,replacement:PolicyCheckpoint,
+        &self,_expected:PolicyCheckpoint,_replacement:PolicyCheckpoint,
     )->Result<(),AnchorError>{
-        let result=self.rpc(Some(expected),Some(replacement))?;
+        // SECURITY: Disable unauthenticated legacy CAS. TLS admin identity
+        // alone may NOT choose any new revision or BLAKE3 digest.
+        Err(AnchorError::InvalidAttestation)
+    }
+    fn advance_signed(
+        &self,expected:PolicyCheckpoint,replacement:PolicyCheckpoint,
+        change:&[u8],proof:&[u8],
+    )->Result<(),AnchorError>{
+        if change.len()!=SIGNED_ENROLLMENT_BYTES
+            || proof.len()!=SIGNED_TRANSITION_PROOF_BYTES
+        {
+            return Err(AnchorError::InvalidAttestation);
+        }
+        let mut wire=Vec::with_capacity(CAS_BYTES);
+        wire.push(OP_CAS);
+        wire.extend_from_slice(&checkpoint_bytes(expected));
+        wire.extend_from_slice(&checkpoint_bytes(replacement));
+        wire.extend_from_slice(change);
+        wire.extend_from_slice(proof);
+        let result=self.rpc(wire)?;
         if result!=replacement {return Err(AnchorError::InvalidAttestation);}
         Ok(())
     }
