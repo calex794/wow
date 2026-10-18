@@ -33,6 +33,7 @@ const STATUS_DENIED: u8 = 3;
 const STATUS_CONFLICT: u8 = 4;
 const STATUS_FAULT: u8 = 5;
 const STATUS_MALFORMED: u8 = 6;
+const CLIENT_RESPONSE_RECEIVED: u8 = 0x71;
 const CHECKPOINT_BYTES: usize = 40;
 const GET_BYTES: usize = 1;
 const CAS_BYTES: usize = 1 + 2 * CHECKPOINT_BYTES;
@@ -249,6 +250,21 @@ pub async fn serve_one_anchor_connection(
             .map_err(|e|RemoteAnchorError::Transport(e.to_string()))?;
         response_send.finish().map_err(|e|RemoteAnchorError::Transport(e.to_string()))
     }).await.map_err(|_|RemoteAnchorError::Deadline)??;
+
+    // QUIC Connection drops in this lab immediately after handler return.
+    // A response FIN is not evidence that the peer received its bytes.
+    // Keep this authenticated connection alive until the client confirms
+    // that it read the result. This is a transport-level service receipt,
+    // NOT a medical recipient ACK.
+    let ack=tokio::time::timeout(IO_BUDGET,async {
+        let mut peer_ack=conn.accept_uni().await
+            .map_err(|e|RemoteAnchorError::Transport(e.to_string()))?;
+        peer_ack.read_to_end(1).await
+            .map_err(|e|RemoteAnchorError::Transport(e.to_string()))
+    }).await.map_err(|_|RemoteAnchorError::Deadline)??;
+    if ack != [CLIENT_RESPONSE_RECEIVED] {
+        return Err(RemoteAnchorError::Protocol);
+    }
     Ok(())
 }
 
@@ -338,11 +354,19 @@ impl RemoteAnchorClient {
                 AnchorError::Unavailable
             })?;
             send.finish().map_err(|_|AnchorError::Unavailable)?;
-            response.read_to_end(RESPONSE_BYTES).await
+            let result=response.read_to_end(RESPONSE_BYTES).await
                 .map_err(|e|{
                     eprintln!("W6 LAB anchor reply read failed: {e:?}");
                     AnchorError::Unavailable
-                })
+                })?;
+            // Do not let the server close the QUIC Connection before
+            // the authenticated client has read its authoritative response.
+            let mut confirmation=conn.open_uni().await
+                .map_err(|_|AnchorError::Unavailable)?;
+            confirmation.write_all(&[CLIENT_RESPONSE_RECEIVED]).await
+                .map_err(|_|AnchorError::Unavailable)?;
+            confirmation.finish().map_err(|_|AnchorError::Unavailable)?;
+            Ok(result)
         }).await.map_err(|e| {
             eprintln!("W6 LAB anchor RPC timeout: {e:?}");
             AnchorError::Unavailable
