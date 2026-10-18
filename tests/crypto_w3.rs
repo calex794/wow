@@ -1,5 +1,6 @@
 use akula_wire_lab::crypto_w3::{new_recipient,seal,open,RecipientContext,CryptoError};
 use ed25519_dalek::SigningKey;
+use hpke::Serializable;
 
 fn signer(b: u8) -> SigningKey { SigningKey::from_bytes(&[b;32]) }
 
