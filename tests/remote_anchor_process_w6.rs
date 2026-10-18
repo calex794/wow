@@ -328,3 +328,86 @@ fn separate_os_process_unavailable_anchor_fails_closed_without_cached_trust() {
     assert!(matches!(res,Err(EnrollmentError::Anchor(AnchorError::Unavailable))));
     assert!(!called);
 }
+
+
+/// Simulate a dropped QUIC response AFTER the real remote authority committed
+/// the signed CAS. The fake part is only the lost reply; the CAS itself crosses
+/// a real Roha/noq connection into an independent OS child and SQLite WAL.
+struct LostCasReply<'a>(&'a RemoteAnchorClient);
+impl TrustedPolicyAnchor for LostCasReply<'_> {
+    fn current(&self) -> Result<PolicyCheckpoint,AnchorError> {
+        self.0.current()
+    }
+    fn advance(
+        &self,_:PolicyCheckpoint,_:PolicyCheckpoint,
+    ) -> Result<(),AnchorError> {
+        Err(AnchorError::InvalidAttestation)
+    }
+    fn advance_signed(
+        &self,old:PolicyCheckpoint,next:PolicyCheckpoint,
+        change:&[u8],proof:&[u8],
+    ) -> Result<(),AnchorError> {
+        self.0.advance_signed(old,next,change,proof)?;
+        Err(AnchorError::Unavailable)
+    }
+}
+
+#[test]
+fn real_quic_signed_cas_lost_reply_recovers_after_both_processes_restart() {
+    let dir=tempdir().unwrap();
+    let local_path=dir.path().join("policy.sqlite");
+    let remote_path=dir.path().join("anchor.sqlite");
+    let mut local=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    local.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
+    let expected=local.checkpoint().unwrap();
+    provision(&remote_path,expected);
+    let server=ChildAuthority::start(dir.path());
+    let admin=client(42,server.address());
+    let reader=client(41,server.address());
+    let change=signed(2,PolicyOperation::Revoke);
+    let (old,next)=local.preview_signed_update(&change).unwrap();
+    assert_eq!(old,expected);
+    let proof=sign_anchor_transition(&root(),&change,old,next).unwrap();
+    let lost=LostCasReply(&admin);
+    assert!(matches!(
+        local.apply_signed_anchored_with_proof(&change,&proof,&lost),
+        Err(EnrollmentError::Anchor(AnchorError::Unavailable))
+    ));
+    // Remote CAS succeeded on the wire, local policy is unchanged and HELD.
+    assert_eq!(reader.current().unwrap(),next);
+    assert_eq!(local.checkpoint().unwrap(),old);
+    let trusted_binding=binding();
+    let mut invoked=false;
+    let blocked:Result<(),EnrollmentError>=local.with_anchored_write(
+        &reader,lookup(&trusted_binding),|_| {invoked=true;Ok(())}
+    );
+    assert!(matches!(blocked,Err(EnrollmentError::PendingRecovery)));
+    assert!(!invoked);
+    drop(lost);
+    drop(admin);
+    drop(reader);
+    drop(local);
+    server.finish(true);
+
+    // A new local DB connection and a killed/restarted remote process must
+    // recover using ONLY the read-only, pinned authority identity. No second
+    // signing ceremony, blind retry, or rewrite of the remote CAS is needed.
+    let restarted=ChildAuthority::start(dir.path());
+    let fresh_reader=client(41,restarted.address());
+    assert_eq!(fresh_reader.current().unwrap(),next);
+    let mut local=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    assert_eq!(
+        local.recover_pending_signed_update(&fresh_reader).unwrap(),
+        akula_wire_lab::peer_enrollment_w6::SignedRecoveryOutcome::AppliedAfterCas
+    );
+    assert_eq!(local.checkpoint().unwrap(),next);
+    assert!(matches!(
+        local.authorize_anchored(&fresh_reader,lookup(&trusted_binding)),
+        Err(EnrollmentError::Revoked)
+    ));
+    assert_eq!(
+        local.recover_pending_signed_update(&fresh_reader).unwrap(),
+        akula_wire_lab::peer_enrollment_w6::SignedRecoveryOutcome::NoPending
+    );
+    restarted.finish(false);
+}
