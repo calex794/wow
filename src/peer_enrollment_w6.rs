@@ -107,6 +107,16 @@ pub trait TrustedPolicyAnchor: Send + Sync {
     ) -> Result<(), AnchorError>;
 }
 
+/// Scope from trusted W6 server config, NEVER network-provided fields.
+#[derive(Clone, Copy)]
+pub struct EnrollmentLookup<'a> {
+    pub remote: &'a EndpointId,
+    pub relay: &'a [u8;16],
+    pub namespace: &'a [u8;16],
+    pub token: &'a [u8;16],
+    pub issuer: &'a [u8;16],
+}
+
 fn ensure_anchor(
     anchor: &dyn TrustedPolicyAnchor, local: PolicyCheckpoint,
 ) -> Result<(), EnrollmentError> {
@@ -488,13 +498,14 @@ impl PeerEnrollmentDb {
     /// to read a canonical snapshot and verify the *external* anchor before
     /// the stream is read. No mailbox write is authorized by this alone.
     pub fn authorize_anchored(
-        &mut self, anchor: &dyn TrustedPolicyAnchor, remote: &EndpointId,
-        relay: &[u8;16], namespace: &[u8;16],
-        token: &[u8;16], issuer: &[u8;16],
+        &mut self, anchor: &dyn TrustedPolicyAnchor, lookup: EnrollmentLookup<'_>,
     ) -> Result<([u8;16],u64), EnrollmentError> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_anchor(anchor, policy_checkpoint(&tx, &self.operator)?)?;
-        let identity = authorize_from(&tx, remote, relay, namespace, token, issuer)?;
+        let identity = authorize_from(
+            &tx, lookup.remote, lookup.relay, lookup.namespace,
+            lookup.token, lookup.issuer,
+        )?;
         tx.commit()?;
         Ok(identity)
     }
@@ -523,7 +534,8 @@ impl PeerEnrollmentDb {
         F: FnOnce(([u8;16], u64)) -> Result<T, E>,
     {
         self.with_write_internal(
-            None, remote, relay, namespace, token, issuer, commit_mailbox,
+            None, EnrollmentLookup { remote, relay, namespace, token, issuer },
+            commit_mailbox,
         )
     }
 
@@ -533,25 +545,19 @@ impl PeerEnrollmentDb {
     /// Do not substitute the legacy unanchored method in a network adapter.
     pub fn with_anchored_write<T, E, F>(
         &mut self, anchor: &dyn TrustedPolicyAnchor,
-        remote: &EndpointId, relay: &[u8;16],
-        namespace: &[u8;16], token: &[u8;16], issuer: &[u8;16],
-        commit_mailbox: F,
+        lookup: EnrollmentLookup<'_>, commit_mailbox: F,
     ) -> Result<T, E>
     where
         E: From<EnrollmentError>,
         F: FnOnce(([u8;16],u64)) -> Result<T,E>,
     {
-        self.with_write_internal(
-            Some(anchor), remote, relay, namespace, token, issuer, commit_mailbox,
-        )
+        self.with_write_internal(Some(anchor), lookup, commit_mailbox)
     }
 
 
     fn with_write_internal<T, E, F>(
         &mut self, anchor: Option<&dyn TrustedPolicyAnchor>,
-        remote: &EndpointId, relay: &[u8;16],
-        namespace: &[u8;16], token: &[u8;16], issuer: &[u8;16],
-        commit_mailbox: F,
+        lookup: EnrollmentLookup<'_>, commit_mailbox: F,
     ) -> Result<T, E>
     where
         E: From<EnrollmentError>,
@@ -564,7 +570,8 @@ impl PeerEnrollmentDb {
             ensure_anchor(anchor, snapshot).map_err(E::from)?;
         }
         let identity = authorize_from(
-            &tx, remote, relay, namespace, token, issuer,
+            &tx, lookup.remote, lookup.relay, lookup.namespace,
+            lookup.token, lookup.issuer,
         ).map_err(E::from)?;
         let result = commit_mailbox(identity)?;
         tx.commit().map_err(EnrollmentError::from).map_err(E::from)?;
