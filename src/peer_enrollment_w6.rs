@@ -272,10 +272,10 @@ fn decode(raw: &[u8]) -> Result<OperatorChange, EnrollmentError> {
 const TRANSITION_DOMAIN: &[u8] = b"Akula/WOW/W6/operator-anchor-transition/lab-v1\0";
 pub const SIGNED_TRANSITION_PROOF_BYTES: usize = 64;
 
-/// Two distinct offline signatures are required for a remote transition:
-/// 1) original W6 signed operator change, and 2) signature over the exact
-/// expected and new checkpoint (including BLAKE3 digest) AND change bytes.
-/// TLS admin possession ALONE cannot invent a new checkpoint.
+/// A remote transition requires two distinct offline signatures.
+/// The first covers the original W6 operator change. The second binds the
+/// exact old and new checkpoint digests to those same signed-change bytes.
+/// TLS administrator possession alone cannot invent a new checkpoint.
 fn transition_message(
     change: &[u8], expected: PolicyCheckpoint, replacement: PolicyCheckpoint,
 ) -> Vec<u8> {
@@ -642,7 +642,7 @@ fn apply_change_in_transaction(
         if action.revision <= last as u64 {
             return Err(EnrollmentError::RevisionRollback);
         }
-        let existing = stored_at(&tx, &action.binding.endpoint_id)?;
+        let existing = stored_at(tx, &action.binding.endpoint_id)?;
         match action.operation {
             PolicyOperation::Allow => {
                 if let Some(old) = existing {
