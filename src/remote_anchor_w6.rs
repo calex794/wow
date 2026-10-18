@@ -405,7 +405,14 @@ impl RemoteAnchorClient {
             [STATUS_OK,rest @ ..] if rest.len()==CHECKPOINT_BYTES=>
                 decode_checkpoint(rest).map_err(|_|AnchorError::InvalidAttestation),
             [STATUS_CONFLICT]=>Err(AnchorError::Conflict),
-            [STATUS_DENIED]|[STATUS_MALFORMED]=>Err(AnchorError::InvalidAttestation),
+            [STATUS_DENIED]=>{
+                eprintln!("W6 anchor rejected TLS identity or offline operator proof");
+                Err(AnchorError::InvalidAttestation)
+            }
+            [STATUS_MALFORMED]=>{
+                eprintln!("W6 anchor rejected malformed signed-CAS wire frame");
+                Err(AnchorError::InvalidAttestation)
+            }
             _=>Err(AnchorError::Unavailable),
         }
     }
