@@ -72,6 +72,20 @@ pub fn seal(
     Ok(encoded)
 }
 
+/// Authorization adapter for trusted device identity. Still experimental:
+/// caller MUST authenticate epoch provisioning out-of-band and enforce file ACL.
+pub fn open_with_trust(
+    packet: &[u8],
+    context: RecipientContext<'_>,
+    registry: &crate::trust_w3::TrustRegistry,
+    device_id: [u8;16],
+    epoch: u64,
+) -> Result<([u8;16],Vec<u8>),CryptoError> {
+    registry.verify(device_id,epoch,context.expected_sender)
+        .map_err(|_| CryptoError::UnauthorizedSender)?;
+    open(packet,context)
+}
+
 pub fn open(packet: &[u8], recipient: RecipientContext<'_>) -> Result<([u8;16],Vec<u8>), CryptoError> {
     if packet.len() > MAX_BYTES { return Err(CryptoError::Oversized); }
     if packet.len() <= HEADER_BYTES + ENCAP_BYTES + 16 { return Err(CryptoError::InvalidPacket); }
