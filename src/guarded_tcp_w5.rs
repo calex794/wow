@@ -15,10 +15,12 @@
 use crate::ingress_bridge_w5::{self, BridgeError, IngressOutcome};
 use crate::ingress_guard_w5::{AdmissionError, IngressGuard, Lane, Ticket};
 use crate::mailbox_w5::Mailbox;
+use crate::peer_proof_w5::{self, PeerProofError, PeerRouteScope, SIGNED_RESPONSE_LEN};
 use crate::route_grant_w5::{RelayPolicy, SIGNED_GRANT_LEN};
 use crate::trust_w3::TrustRegistry;
 use crate::{WireError, MAX_MESSAGE_BYTES};
-use std::io::{self, Read};
+use ed25519_dalek::SigningKey;
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -31,6 +33,7 @@ pub enum GuardedTcpError {
     Wire(WireError),
     LockPoisoned,
     StorageLockPoisoned,
+    PeerProof(PeerProofError),
     NotLoopback,
     InvalidDeadline,
     DeadlineExceeded,
@@ -42,6 +45,9 @@ impl From<AdmissionError> for GuardedTcpError {
 }
 impl From<BridgeError> for GuardedTcpError {
     fn from(value: BridgeError) -> Self { Self::Bridge(value) }
+}
+impl From<PeerProofError> for GuardedTcpError {
+    fn from(value: PeerProofError) -> Self { Self::PeerProof(value) }
 }
 impl From<io::Error> for GuardedTcpError {
     fn from(value: io::Error) -> Self { Self::Io(value) }
@@ -110,6 +116,35 @@ fn read_exact_before(
     Ok(())
 }
 
+/// Writes one short signed challenge against the SAME absolute deadline
+/// used to read the grant, client proof and E2E packet.
+fn write_before(
+    socket: &mut TcpStream,
+    mut remaining: &[u8],
+    deadline: Instant,
+) -> Result<(), GuardedTcpError> {
+    while !remaining.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return Err(GuardedTcpError::DeadlineExceeded); }
+        socket.set_write_timeout(Some(left))?;
+        match socket.write(remaining) {
+            Ok(0) => return Err(GuardedTcpError::Io(
+                io::Error::from(io::ErrorKind::WriteZero)
+            )),
+            Ok(n) => remaining = &remaining[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if matches!(
+                e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) => return Err(GuardedTcpError::DeadlineExceeded),
+            Err(e) => return Err(GuardedTcpError::Io(e)),
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(GuardedTcpError::DeadlineExceeded);
+    }
+    Ok(())
+}
+
 fn read_frame_before(
     socket: &mut TcpStream,
     deadline: Instant,
@@ -150,7 +185,7 @@ pub fn serve_guarded_loopback_mailbox_tcp(
     policy: &RelayPolicy,
     issuer_trust: &TrustRegistry,
 ) -> Result<IngressOutcome, GuardedTcpError> {
-    serve_bounded_one(socket, admission, clock, |grant, ciphertext| {
+    serve_bounded_one(socket, admission, clock, |_, _, _, _, _| Ok(()), |grant, ciphertext| {
         let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
             store, grant, policy, issuer_trust, clock.now_seconds, ciphertext,
         )?;
@@ -173,7 +208,7 @@ pub fn serve_guarded_loopback_mailbox_tcp_shared(
     policy: &RelayPolicy,
     issuer_trust: &TrustRegistry,
 ) -> Result<IngressOutcome, GuardedTcpError> {
-    serve_bounded_one(socket, admission, clock, |grant, ciphertext| {
+    serve_bounded_one(socket, admission, clock, |_, _, _, _, _| Ok(()), |grant, ciphertext| {
         let mut db = store.lock().map_err(|_| GuardedTcpError::StorageLockPoisoned)?;
         let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
             &mut db, grant, policy, issuer_trust, clock.now_seconds, ciphertext,
@@ -182,16 +217,82 @@ pub fn serve_guarded_loopback_mailbox_tcp_shared(
     })
 }
 
+/// Extra lab-only endpoint: the relay proves its currently trusted key and
+/// the caller answers a NEW unpredictable challenge using a pinned enrolled
+/// peer key, BEFORE the relay accepts the 16-KiB W3 packet. Both signatures
+/// are bound to this route and the byte-exact signed grant. A valid grant
+/// alone cannot authorize an unknown/revoked peer.
+///
+/// IMPORTANT: challenge-response over unauthenticated TCP is susceptible to
+/// live relaying. There is NO encrypted/channel-bound session, forward secrecy,
+/// protected peer IP identity, certificate provisioning or production ACL.
+/// This endpoint remains 127.0.0.1-only pending vetted mTLS/Noise/iroh use.
+pub fn serve_mutual_peer_proof_loopback_mailbox_tcp_shared(
+    socket: TcpStream,
+    admission: &Mutex<IngressGuard>,
+    clock: GuardedTcpClock,
+    store: &Mutex<Mailbox>,
+    policy: &RelayPolicy,
+    issuer_trust: &TrustRegistry,
+    device_trust: &TrustRegistry,
+    relay_signer: &SigningKey,
+    permitted_peer: PeerRouteScope,
+) -> Result<IngressOutcome, GuardedTcpError> {
+    serve_bounded_one(
+        socket, admission, clock,
+        |socket, deadline, signed_grant, shared, ticket| {
+            let challenge = peer_proof_w5::sign_fresh_relay_challenge(
+                relay_signer, device_trust, policy, permitted_peer, signed_grant,
+            )?;
+            // One framed relay-authenticated challenge; no recipient ACK.
+            let challenge_frame = crate::stream_frame(&challenge)
+                .map_err(GuardedTcpError::Wire)?;
+            write_before(socket, &challenge_frame, deadline)?;
+
+            // Only an exact small signed response is accepted as pre-auth
+            // input; its bytes are charged under the SAME active ticket.
+            let response = read_frame_before(
+                socket, deadline, SIGNED_RESPONSE_LEN, Some(SIGNED_RESPONSE_LEN),
+            )?;
+            lock(shared)?.offer_fragment(ticket, &response)?;
+            peer_proof_w5::verify_peer_answer(
+                &challenge, &response, permitted_peer, device_trust,
+            )?;
+            Ok(())
+        },
+        |signed_grant, ciphertext| {
+            // Re-evaluate the peer epoch/revocation at the storage boundary.
+            device_trust.key_for(
+                permitted_peer.device_id, permitted_peer.device_epoch,
+            ).map_err(|_| PeerProofError::UntrustedPeer)?;
+            let mut db = store.lock().map_err(
+                |_| GuardedTcpError::StorageLockPoisoned
+            )?;
+            let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
+                &mut db, signed_grant, policy, issuer_trust,
+                clock.now_seconds, ciphertext,
+            )?;
+            Ok(IngressOutcome::MailboxStored(stored))
+        },
+    )
+}
+
 /// Shared admission + bounded network-read path. The storage callback is
 /// called at most once, only after all admission checks succeed. Never hold
 /// the shared ingress guard lock over blocking network I/O or SQLite.
-fn serve_bounded_one<F>(
+/// An optional lab mutual-key proof runs after the bounded grant frame and
+/// before body allocation, but never elevates a peer without signed grant.
+fn serve_bounded_one<F, A>(
     mut socket: TcpStream,
     admission: &Mutex<IngressGuard>,
     clock: GuardedTcpClock,
+    authenticate: A,
     store_packet: F,
 ) -> Result<IngressOutcome, GuardedTcpError>
 where
+    A: FnOnce(
+        &mut TcpStream, Instant, &[u8], &Mutex<IngressGuard>, Ticket
+    ) -> Result<(), GuardedTcpError>,
     F: FnOnce(&[u8], &[u8]) -> Result<IngressOutcome, GuardedTcpError>,
 {
     if !socket.peer_addr()?.ip().is_loopback()
@@ -221,6 +322,14 @@ where
         &mut socket, deadline, SIGNED_GRANT_LEN, Some(SIGNED_GRANT_LEN),
     )?;
     lock(admission)?.offer_fragment(ticket, &signed_grant)?;
+
+    // Optional proof binds an enrolled peer's signing key to a fresh,
+    // relay-signed challenge and the exact grant. No W3 bytes read before it.
+    authenticate(&mut socket, deadline, &signed_grant, admission, ticket)?;
+    lock(admission)?.ensure_pending(ticket)?;
+    if Instant::now() >= deadline {
+        return Err(GuardedTcpError::DeadlineExceeded);
+    }
 
     // The *existing* W3 ciphertext bytes are transported unchanged.
     let ciphertext = read_frame_before(
