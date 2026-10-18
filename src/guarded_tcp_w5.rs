@@ -30,6 +30,7 @@ pub enum GuardedTcpError {
     Io(io::Error),
     Wire(WireError),
     LockPoisoned,
+    StorageLockPoisoned,
     NotLoopback,
     InvalidDeadline,
     DeadlineExceeded,
@@ -142,13 +143,57 @@ fn read_frame_before(
 /// session auth is implemented. Caller must ensure unprivileged local
 /// processes cannot access trusted relay grants.
 pub fn serve_guarded_loopback_mailbox_tcp(
-    mut socket: TcpStream,
+    socket: TcpStream,
     admission: &Mutex<IngressGuard>,
     clock: GuardedTcpClock,
     store: &mut Mailbox,
     policy: &RelayPolicy,
     issuer_trust: &TrustRegistry,
 ) -> Result<IngressOutcome, GuardedTcpError> {
+    serve_bounded_one(socket, admission, clock, |grant, ciphertext| {
+        let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
+            store, grant, policy, issuer_trust, clock.now_seconds, ciphertext,
+        )?;
+        Ok(IngressOutcome::MailboxStored(stored))
+    })
+}
+
+/// Concurrent variant: many connections may be reading their bounded inputs
+/// simultaneously, but the SQLite handle is locked only AFTER pre-auth
+/// admission, framed reads and ticket lifetime validation. This does NOT
+/// bound OS accept queues or provide authenticated network sessions.
+///
+/// Callers MUST share ONE Arc<Mutex<IngressGuard>> for the entire service,
+/// and must keep a consistent, independently trusted RelayPolicy and registry.
+pub fn serve_guarded_loopback_mailbox_tcp_shared(
+    socket: TcpStream,
+    admission: &Mutex<IngressGuard>,
+    clock: GuardedTcpClock,
+    store: &Mutex<Mailbox>,
+    policy: &RelayPolicy,
+    issuer_trust: &TrustRegistry,
+) -> Result<IngressOutcome, GuardedTcpError> {
+    serve_bounded_one(socket, admission, clock, |grant, ciphertext| {
+        let mut db = store.lock().map_err(|_| GuardedTcpError::StorageLockPoisoned)?;
+        let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
+            &mut db, grant, policy, issuer_trust, clock.now_seconds, ciphertext,
+        )?;
+        Ok(IngressOutcome::MailboxStored(stored))
+    })
+}
+
+/// Shared admission + bounded network-read path. The storage callback is
+/// called at most once, only after all admission checks succeed. Never hold
+/// the shared ingress guard lock over blocking network I/O or SQLite.
+fn serve_bounded_one<F>(
+    mut socket: TcpStream,
+    admission: &Mutex<IngressGuard>,
+    clock: GuardedTcpClock,
+    store_packet: F,
+) -> Result<IngressOutcome, GuardedTcpError>
+where
+    F: FnOnce(&[u8], &[u8]) -> Result<IngressOutcome, GuardedTcpError>,
+{
     if !socket.peer_addr()?.ip().is_loopback()
         || !socket.local_addr()?.ip().is_loopback()
     {
@@ -186,11 +231,8 @@ pub fn serve_guarded_loopback_mailbox_tcp(
         return Err(GuardedTcpError::DeadlineExceeded);
     }
 
-    // Reuse PR #26's sole storage authorization boundary. Neither the
-    // signed grant nor the mailbox store ever produces RecipientAccepted.
-    let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
-        store, &signed_grant, policy, issuer_trust,
-        clock.now_seconds, &ciphertext,
-    )?;
-    Ok(IngressOutcome::MailboxStored(stored))
+    // Storage is called only after all pre-auth checks. The callback must
+    // still verify the signed grant against trusted issuer/scope policy.
+    // A Mailbox return value is never a final-recipient acknowledgement.
+    store_packet(&signed_grant, &ciphertext)
 }
