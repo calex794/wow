@@ -10,7 +10,8 @@ fn three_hostile_edges_share_global_budget_and_cannot_replace_clean_mailbox_copy
  for n in [Node::B,Node::V,Node::W]{sim.relay_opt_in(n,true);}
  // Eight independent identities: 8 offers each per tick.
  for i in 1..=8 {sim.submit_data(id(i),900,&[i;512]).unwrap();}
- sim.run(1).unwrap();
+ sim.run(4).unwrap();
+ // Establish genuine copies before hostile alternatives are offered.
  let mut permitted=0;let mut denied=0;
  for from in [Node::V,Node::W,Node::Mailbox] {
   for i in 1..=8 {
