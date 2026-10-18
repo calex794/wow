@@ -86,6 +86,12 @@ fn decode_checkpoint(bytes:&[u8])->Result<PolicyCheckpoint,RemoteAnchorError> {
 /// Remote SQLite anchor. An operator must bootstrap it independently.
 /// Reopening an empty or missing DB must NOT silently accept a digest
 /// obtained from potentially rolled-back W6 policy.sqlite.
+struct StoredAnchorRow {
+    reader: Vec<u8>,
+    administrator: Vec<u8>,
+    checkpoint: PolicyCheckpoint,
+}
+
 pub struct RemoteAnchorLedger {
     sql: Sqlite,
     policy: AnchorServicePolicy,
@@ -118,13 +124,13 @@ impl RemoteAnchorLedger {
     /// Open uses SQLITE_OPEN_READ_WRITE without CREATE. If the independent
     /// remote datastore is lost, the service MUST stop, not reinitialize.
     pub fn open(path:&Path,policy:AnchorServicePolicy)->Result<Self,RemoteAnchorError>{
-        let mut sql=Sqlite::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let sql=Sqlite::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         sql.busy_timeout(Duration::from_secs(2))?;
         sql.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL;")?;
         let found=Self::record(&sql)?;
-        let (read,admin,_)=found.ok_or(RemoteAnchorError::NotProvisioned)?;
-        if read.as_slice()!=policy.reader.as_bytes()
-            || admin.as_slice()!=policy.administrator.as_bytes()
+        let trusted=found.ok_or(RemoteAnchorError::NotProvisioned)?;
+        if trusted.reader.as_slice()!=policy.reader.as_bytes()
+            || trusted.administrator.as_slice()!=policy.administrator.as_bytes()
         {
             return Err(RemoteAnchorError::ConfigurationMismatch);
         }
@@ -145,7 +151,7 @@ impl RemoteAnchorLedger {
         )?;
         Ok(())
     }
-    fn record(db:&Sqlite)->Result<Option<(Vec<u8>,Vec<u8>,PolicyCheckpoint)>,RemoteAnchorError>{
+    fn record(db:&Sqlite)->Result<Option<StoredAnchorRow>,RemoteAnchorError>{
         use rusqlite::OptionalExtension;
         let rec=db.query_row(
             "SELECT reader,administrator,revision,digest FROM w6_external_anchor WHERE id=1",
@@ -161,7 +167,10 @@ impl RemoteAnchorLedger {
             return Err(RemoteAnchorError::CorruptStorage);
         }
         let mut d=[0u8;32];d.copy_from_slice(&digest);
-        Ok(Some((reader,administrator,PolicyCheckpoint{revision:rev as u64,digest:d})))
+        Ok(Some(StoredAnchorRow {
+            reader, administrator,
+            checkpoint:PolicyCheckpoint {revision:rev as u64,digest:d},
+        }))
     }
     /// Only the two pinned QUIC identities may query current state.
     pub fn current_for(
@@ -170,9 +179,9 @@ impl RemoteAnchorLedger {
         if peer!=self.policy.reader && peer!=self.policy.administrator {
             return Err(RemoteAnchorError::UntrustedPeer);
         }
-        let (_,_,value)=Self::record(&self.sql)?
+        let record=Self::record(&self.sql)?
             .ok_or(RemoteAnchorError::NotProvisioned)?;
-        Ok(value)
+        Ok(record.checkpoint)
     }
     /// Strictly monotonic, FULL-synchronous SQLite BEGIN IMMEDIATE CAS;
     /// only operator TLS key may change the independent trust watermark.
@@ -186,9 +195,9 @@ impl RemoteAnchorLedger {
         to_int(next.revision)?;
         if next.revision<=expected.revision {return Err(RemoteAnchorError::Conflict);}
         let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_,_,seen)=Self::record(&tx)?
+        let record=Self::record(&tx)?
             .ok_or(RemoteAnchorError::NotProvisioned)?;
-        if seen!=expected {return Err(RemoteAnchorError::Conflict);}
+        if record.checkpoint!=expected {return Err(RemoteAnchorError::Conflict);}
         tx.execute(
             "UPDATE w6_external_anchor SET revision=?1,digest=?2 WHERE id=1",
             params![to_int(next.revision)?,next.digest.as_slice()],
@@ -198,8 +207,8 @@ impl RemoteAnchorLedger {
     }
 }
 
-/// Response is deliberately indistinguishable from a signed recipient ACK:
-/// it is ONLY policy audit state inside an authenticated TLS channel.
+/// This response is explicitly distinct from a signed W4 recipient ACK:
+/// it is ONLY internal policy audit state in an authenticated TLS channel.
 fn encode_reply(out:Result<PolicyCheckpoint,RemoteAnchorError>)->Vec<u8>{
     match out {
         Ok(v)=>{
