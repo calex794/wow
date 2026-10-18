@@ -276,9 +276,14 @@ pub async fn serve_one_anchor_connection(
             match (first,second) {
                 (Ok(old),Ok(new))=>
                     encode_reply(service.advance_for(remote,old,new,change,proof)),
-                _=>vec![STATUS_MALFORMED],
+                _=>{
+                    eprintln!("W6 anchor invalid signed-CAS checkpoint encoding");
+                    vec![STATUS_MALFORMED]
+                },
             }
         } else {
+            // Redacted structural-only telemetry, no keys or patient data.
+            eprintln!("W6 anchor unexpected request wire bytes: len={} expected-CAS={}",wire.len(),CAS_BYTES);
             vec![STATUS_MALFORMED]
         }
     };
