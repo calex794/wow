@@ -227,22 +227,28 @@ pub fn serve_guarded_loopback_mailbox_tcp_shared(
 /// live relaying. There is NO encrypted/channel-bound session, forward secrecy,
 /// protected peer IP identity, certificate provisioning or production ACL.
 /// This endpoint remains 127.0.0.1-only pending vetted mTLS/Noise/iroh use.
+/// The owner, route and peer keys must be provisioned by local policy,
+/// never constructed from remote network frames.
+pub struct MutualPeerConfig<'a> {
+    pub policy: &'a RelayPolicy,
+    pub issuer_trust: &'a TrustRegistry,
+    pub device_trust: &'a TrustRegistry,
+    pub relay_signer: &'a SigningKey,
+    pub permitted_peer: PeerRouteScope,
+}
+
 pub fn serve_mutual_peer_proof_loopback_mailbox_tcp_shared(
     socket: TcpStream,
     admission: &Mutex<IngressGuard>,
     clock: GuardedTcpClock,
     store: &Mutex<Mailbox>,
-    policy: &RelayPolicy,
-    issuer_trust: &TrustRegistry,
-    device_trust: &TrustRegistry,
-    relay_signer: &SigningKey,
-    permitted_peer: PeerRouteScope,
+    config: MutualPeerConfig<'_>,
 ) -> Result<IngressOutcome, GuardedTcpError> {
     serve_bounded_one(
         socket, admission, clock,
         |socket, deadline, signed_grant, shared, ticket| {
             let challenge = peer_proof_w5::sign_fresh_relay_challenge(
-                relay_signer, device_trust, policy, permitted_peer, signed_grant,
+                config.relay_signer, config.device_trust, config.policy, config.permitted_peer, signed_grant,
             )?;
             // One framed relay-authenticated challenge; no recipient ACK.
             let challenge_frame = crate::stream_frame(&challenge)
@@ -256,20 +262,20 @@ pub fn serve_mutual_peer_proof_loopback_mailbox_tcp_shared(
             )?;
             lock(shared)?.offer_fragment(ticket, &response)?;
             peer_proof_w5::verify_peer_answer(
-                &challenge, &response, permitted_peer, device_trust,
+                &challenge, &response, config.permitted_peer, config.device_trust,
             )?;
             Ok(())
         },
         |signed_grant, ciphertext| {
             // Re-evaluate the peer epoch/revocation at the storage boundary.
-            device_trust.key_for(
-                permitted_peer.device_id, permitted_peer.device_epoch,
+            config.device_trust.key_for(
+                config.permitted_peer.device_id, config.permitted_peer.device_epoch,
             ).map_err(|_| PeerProofError::UntrustedPeer)?;
             let mut db = store.lock().map_err(
                 |_| GuardedTcpError::StorageLockPoisoned
             )?;
             let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
-                &mut db, signed_grant, policy, issuer_trust,
+                &mut db, signed_grant, config.policy, config.issuer_trust,
                 clock.now_seconds, ciphertext,
             )?;
             Ok(IngressOutcome::MailboxStored(stored))
