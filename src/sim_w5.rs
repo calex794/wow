@@ -120,15 +120,18 @@ impl Simulation {
         if enabled { self.opted_in.insert(node); } else { self.opted_in.remove(&node); }
     }
 
-    /// A crashed intermediary loses only its volatile simulated copies.
-    /// Sender's real W4 journal and mailbox's separate persistence are NOT
-    /// modified here. A restart does not manufacture any recipient receipts.
+    /// An offline intermediary loses its volatile forwarding copies.
+    /// The modeled Mailbox retains previously accepted bytes across restarts;
+    /// its durable behavior is only an abstraction, not a tested disk store.
+    /// The real sender's W4 journal is independent from this simulator.
     pub fn set_alive(&mut self, node: Node, enabled: bool) {
         if enabled {
             self.alive.insert(node);
         } else {
             self.alive.remove(&node);
-            self.copies.retain(|(n, _, _), _| *n != node);
+            if node != Node::Mailbox {
+                self.copies.retain(|(n, _, _), _| *n != node);
+            }
         }
     }
 
