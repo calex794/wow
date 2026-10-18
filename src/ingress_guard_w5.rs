@@ -109,6 +109,18 @@ impl IngressGuard {
 
     pub fn active_on(&self, lane: Lane) -> usize { self.active_by_lane[lane.index()] }
 
+    /// Ensure that a previously reserved connection is still admitted
+    /// after network reads; advancing the trusted tick may expire it.
+    /// This checks capacity/lifetime only, NEVER a network identity or grant.
+    pub fn ensure_pending(&self, ticket: Ticket) -> Result<(), AdmissionError> {
+        let pending = self.sessions.get(&ticket)
+            .ok_or(AdmissionError::InvalidTicket)?;
+        if self.now >= pending.expires {
+            return Err(AdmissionError::InvalidTicket);
+        }
+        Ok(())
+    }
+
     /// Invoke ONLY with a trusted local monotonic tick. Equal ticks do NOT
     /// replenish quotas; stale ticks cannot move this guard backwards.
     pub fn advance_tick(&mut self, now: u64) -> Result<(), AdmissionError> {
