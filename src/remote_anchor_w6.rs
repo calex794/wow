@@ -228,7 +228,7 @@ pub async fn serve_one_anchor_connection(
         .map_err(|e|RemoteAnchorError::Transport(e.to_string()))?;
     let response={
         let mut service=service.lock().map_err(|_|RemoteAnchorError::CorruptStorage)?;
-        if wire==[OP_GET] {
+        if wire.len()==GET_BYTES && wire[0]==OP_GET {
             encode_reply(service.current_for(remote))
         } else if wire.len()==CAS_BYTES && wire[0]==OP_CAS {
             let first=decode_checkpoint(&wire[1..1+CHECKPOINT_BYTES]);
