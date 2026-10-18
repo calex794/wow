@@ -128,16 +128,18 @@ impl Lab {
 async fn connect_pair(server:&Endpoint, client:&Endpoint, alpn:&[u8])
     -> (Connection,Connection)
 {
-    let outgoing=tokio::time::timeout(
-        Duration::from_secs(10),client.connect(server.addr(),alpn),
-    ).await.unwrap().unwrap();
-    let incoming=tokio::time::timeout(
-        Duration::from_secs(10),server.accept(),
-    ).await.unwrap().expect("server must accept");
-    let accepted=tokio::time::timeout(
-        Duration::from_secs(10),incoming,
-    ).await.unwrap().unwrap();
-    (outgoing,accepted)
+    // Both halves of iroh's TLS/QUIC handshake must be polled together.
+    // Awaiting connect() before accept() deadlocks until the client times out.
+    let (outgoing,incoming)=tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(10), client.connect(server.addr(),alpn),
+        ),
+        tokio::time::timeout(Duration::from_secs(10),async {
+            let incoming=server.accept().await.expect("server must accept");
+            incoming.await
+        }),
+    );
+    (outgoing.unwrap().unwrap(), incoming.unwrap().unwrap())
 }
 async fn transmit(client:&Connection, bytes:&[u8]) {
     let (mut send,_recv)=client.open_bi().await.unwrap();
