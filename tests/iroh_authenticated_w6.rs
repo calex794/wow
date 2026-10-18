@@ -411,3 +411,52 @@ async fn wrong_alpn_rejected_before_ticket_or_storage_even_with_valid_tls_key() 
     lab.assert_message_count(0);
     lab.assert_clean_guard();
 }
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn trust_anchor_unavailable_rejects_genuine_roha_tls_before_stream() {
+    let lab=Lab::new().await;
+    let (_sender,receiver)=connect_pair(
+        &lab.server,&lab.trusted,W6_LAB_ALPN,
+    ).await;
+    assert_eq!(receiver.remote_id(),lab.trusted.id());
+    lab.anchor.set_unavailable(true);
+    assert!(matches!(
+        receive_authenticated_iroh_mailbox(
+            &receiver,lab.context(Duration::from_secs(2)),
+        ).await,
+        Err(IrohIngressError::Enrollment(
+            EnrollmentError::Anchor(
+                akula_wire_lab::peer_enrollment_w6::AnchorError::Unavailable
+            )
+        ))
+    ));
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn unanchored_sql_policy_revoke_cannot_masquerade_as_verified_state() {
+    let lab=Lab::new().await;
+    let (_sender,receiver)=connect_pair(
+        &lab.server,&lab.trusted,W6_LAB_ALPN,
+    ).await;
+    let forged_local_state=sign_operator_change(&lab.operator,&OperatorChange {
+        operation:PolicyOperation::Revoke,revision:2,
+        binding:lab.trusted_binding,
+    }).unwrap();
+    // This simulates a local-only policy mutation bypassing external
+    // checkpoint publication. W6 network ingress MUST refuse both the old
+    // and new state until an independently trusted checkpoint matches it.
+    lab.enrollment.lock().unwrap().apply_signed(&forged_local_state).unwrap();
+    assert!(matches!(
+        receive_authenticated_iroh_mailbox(
+            &receiver,lab.context(Duration::from_secs(2)),
+        ).await,
+        Err(IrohIngressError::Enrollment(
+            EnrollmentError::CheckpointMismatch
+        ))
+    ));
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
