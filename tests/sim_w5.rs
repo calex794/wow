@@ -193,3 +193,66 @@ fn intermediate_receipt_and_offline_recipient_never_mean_delivered(){
  assert_eq!(journal.state(id(6),id(1)).unwrap(),Delivery::Queued);
  assert_eq!(journal.retry_bytes(id(6),id(1),sim.tick() as i64).unwrap(),Some(f.packet));
 }
+
+#[test]
+fn both_gateways_fail_then_backup_returns_and_recipient_reconnects(){
+ let f=fixture();let mut sim=Simulation::new(123);links(&mut sim,true);
+ sim.set_alive(Node::W,false);
+ sim.set_alive(Node::G,false);
+ sim.submit_data(id(1),200,&f.packet).unwrap();
+ sim.run(2).unwrap();
+ sim.set_alive(Node::V,false);
+ sim.run(5).unwrap();
+ assert!(sim.packet(Node::Mailbox,Flow::Data,id(1)).is_none());
+ sim.set_alive(Node::W,true);
+ sim.run(2).unwrap();
+ sim.set_alive(Node::W,false);
+ sim.run(2).unwrap();
+ assert_eq!(sim.packet(Node::Mailbox,Flow::Data,id(1)),Some(f.packet.as_slice()));
+ sim.set_alive(Node::Mailbox,false);
+ sim.run(2).unwrap();
+ sim.set_alive(Node::Mailbox,true);
+ assert_eq!(sim.packet(Node::Mailbox,Flow::Data,id(1)),Some(f.packet.as_slice()));
+ assert!(sim.packet(Node::G,Flow::Data,id(1)).is_none());
+ sim.set_alive(Node::G,true);
+ sim.run(1).unwrap();
+ assert_eq!(sim.packet(Node::G,Flow::Data,id(1)),Some(f.packet.as_slice()));
+ let verified=open(sim.packet(Node::G,Flow::Data,id(1)).unwrap(),TrustedRecipient{
+   secret:&f.secret,recipient_id:id(6),now:sim.tick(),registry:&f.trust
+ }).unwrap();
+ assert_eq!(verified.1,b"short synthetic message");
+ // V and W are still offline: data delivered does not imply return of ACK.
+ let receipt=sign(&f.recipient,id(6),id(1),*blake3::hash(&f.packet).as_bytes(),8);
+ sim.submit_receipt(id(1),200,&receipt).unwrap();
+ sim.run(2).unwrap();
+ assert!(sim.packet(Node::A,Flow::Receipt,id(1)).is_none());
+ sim.set_alive(Node::V,true);
+ sim.run(3).unwrap();
+ assert_eq!(sim.packet(Node::A,Flow::Receipt,id(1)),Some(receipt.as_slice()));
+}
+#[test]
+fn expired_message_is_never_transmitted_after_reconnection(){
+ let mut sim=Simulation::new(21);
+ sim.submit_data(id(1),3,b"expires soon").unwrap();
+ sim.run(4).unwrap();
+ links(&mut sim,true);
+ sim.run(5).unwrap();
+ assert!(sim.packet(Node::B,Flow::Data,id(1)).is_none());
+ assert!(sim.packet(Node::G,Flow::Data,id(1)).is_none());
+}
+#[test]
+fn revoking_relay_consent_prevents_future_transfers(){
+ let mut sim=Simulation::new(32);
+ sim.connect(Node::A,Node::B,true);
+ sim.connect(Node::B,Node::V,true);
+ sim.connect(Node::V,Node::Mailbox,true);
+ sim.connect(Node::Mailbox,Node::G,true);
+ sim.submit_data(id(1),100,b"private test").unwrap();
+ sim.run(1).unwrap();
+ assert!(sim.packet(Node::B,Flow::Data,id(1)).is_some());
+ sim.relay_opt_in(Node::B,false);
+ sim.relay_opt_in(Node::V,true);
+ sim.run(8).unwrap();
+ assert!(sim.packet(Node::V,Flow::Data,id(1)).is_none());
+ assert!(sim.packet(Node::G,Flow::Data,id(1)).is_none());
+}
