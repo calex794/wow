@@ -1,0 +1,112 @@
+name: NOQ multipath keepalive — pinned RED/GREEN
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - "research/noq-forks/tests/multipath_keepalive_injected.rs"
+      - ".github/workflows/noq-fork-keepalive.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-keepalive-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PINNED_NOQ: "2eabf9895d40c263aa3369afd66efcf4a5d95056"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check out the exact pinned noq source
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git pinned-noq
+          git -C pinned-noq checkout --detach "$PINNED_NOQ"
+          test "$(git -C pinned-noq rev-parse HEAD)" = "$PINNED_NOQ"
+      - name: Inject isolated original-behavior regression
+        run: |
+          set -euo pipefail
+          cat research/noq-forks/tests/multipath_keepalive_injected.rs >> pinned-noq/noq-proto/src/tests/multipath.rs
+          git -C pinned-noq diff --check
+      - name: RED — detect whether idle secondary path is incorrectly abandoned
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked -p noq-proto --lib fork_audit_secondary_path_survives_asymmetric_keepalives -- --nocapture > /tmp/noq-keepalive-red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/noq-keepalive-red.log
+          test "$status" -ne 0
+          grep -F "fork audit: secondary path abandoned during keepalive-only traffic" /tmp/noq-keepalive-red.log
+          echo "RED observed on pinned original implementation." >> "$GITHUB_STEP_SUMMARY"
+      - name: Adapt smallest send-only path timer fix to the temporary test checkout
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("noq-proto/src/connection/mod.rs")
+          code = p.read_text()
+          receive_old = (
+              "        self.total_authed_packets += 1;\n"
+              "        self.reset_keep_alive(path_id, now);\n"
+              "        self.reset_idle_timeout(now, space_id, path_id);"
+          )
+          receive_new = receive_old.replace("self.reset_keep_alive(path_id, now);", "self.reset_conn_keep_alive(now);")
+          assert code.count(receive_old) == 1, "pinned authenticated receive site changed"
+          code = code.replace(receive_old, receive_new, 1)
+          func_old = (
+              "    /// Resets both the [`ConnTimer::KeepAlive`] and [`PathTimer::PathKeepAlive`] timers\n"
+              "    fn reset_keep_alive(&mut self, path_id: PathId, now: Instant) {\n"
+              "        if !self.state.is_established() {\n"
+              "            return;\n"
+              "        }\n\n"
+              "        if let Some(interval) = self.config.keep_alive_interval {\n"
+              "            self.timers.set(\n"
+              "                Timer::Conn(ConnTimer::KeepAlive),\n"
+              "                now + interval,\n"
+              "                self.qlog.with_time(now),\n"
+              "            );\n"
+              "        }\n\n"
+              "        if let Some(interval) = self.path_data(path_id).keep_alive {"
+          )
+          func_new = (
+              "    /// Connection-wide keepalive may reset on authenticated receive.\n"
+              "    fn reset_conn_keep_alive(&mut self, now: Instant) {\n"
+              "        if !self.state.is_established() {\n"
+              "            return;\n"
+              "        }\n"
+              "        if let Some(interval) = self.config.keep_alive_interval {\n"
+              "            self.timers.set(\n"
+              "                Timer::Conn(ConnTimer::KeepAlive),\n"
+              "                now + interval,\n"
+              "                self.qlog.with_time(now),\n"
+              "            );\n"
+              "        }\n"
+              "    }\n\n"
+              "    /// Reset path keepalive only on SEND inactivity.\n"
+              "    fn reset_keep_alive(&mut self, path_id: PathId, now: Instant) {\n"
+              "        self.reset_conn_keep_alive(now);\n"
+              "        if !self.state.is_established() {\n"
+              "            return;\n"
+              "        }\n\n"
+              "        if let Some(interval) = self.path_data(path_id).keep_alive {"
+          )
+          assert code.count(func_old) == 1, "pinned keepalive method changed"
+          code = code.replace(func_old, func_new, 1)
+          p.write_text(code)
+          PY
+          git diff --check
+      - name: GREEN — the same scenario survives with no path abandonment
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib fork_audit_secondary_path_survives_asymmetric_keepalives -- --nocapture
+          cargo test --locked -p noq-proto --lib path_recovers_after_silent_gap_via_keepalive -- --nocapture
+          printf '%s\n'             "Independent RED -> temporary minimal GREEN on exact pinned noq source."             "No runtime patches merged to calex794/noq or Akula."             >> "$GITHUB_STEP_SUMMARY"
