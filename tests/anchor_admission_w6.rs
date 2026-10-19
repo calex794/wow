@@ -13,7 +13,7 @@ use akula_wire_lab::remote_anchor_w6::{
     ANCHOR_ALPN, AnchorServicePolicy, RemoteAnchorClient, RemoteAnchorLedger,
 };
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint, SecretKey, endpoint::presets};
+use iroh::{Endpoint, SecretKey, endpoint::{presets,ServerIncomingLimits}};
 use std::{sync::{Arc,Mutex},time::Duration};
 use tempfile::tempdir;
 
@@ -42,7 +42,7 @@ async fn prehandshake_capacity_denies_real_quic_without_reserving_more_workers()
         .clear_ip_transports()
         .bind_addr("127.0.0.1:0").unwrap()
         .transport_config(anchor_transport_config())
-            .server_incoming_limits(anchor_incoming_limits())
+        .server_incoming_limits(anchor_incoming_limits())
         .secret_key(key(43))
         .alpns(vec![ANCHOR_ALPN.to_vec()])
         .bind().await.unwrap();
@@ -89,4 +89,77 @@ async fn prehandshake_capacity_denies_real_quic_without_reserving_more_workers()
     server.close().await;
     runner.abort();
     let _=runner.await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn one_pending_transport_incoming_blocks_a_second_quic_initial_until_release(){
+    // This tests transport admission before the application accepts TLS.
+    // It is NOT a CPU/memory measurement of malicious UDP Initial floods.
+    let server=Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0").unwrap()
+        .secret_key(key(43))
+        .alpns(vec![ANCHOR_ALPN.to_vec()])
+        .server_incoming_limits(ServerIncomingLimits::new(1,4096,4096).unwrap())
+        .bind().await.unwrap();
+    let addr=server.addr();
+    let first_client=Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0").unwrap()
+        .secret_key(key(41))
+        .bind().await.unwrap();
+    let first_ep=first_client.clone();
+    let first_addr=addr.clone();
+    let first_task=tokio::spawn(async move {
+        let _=first_ep.connect(first_addr,ANCHOR_ALPN).await;
+    });
+    // Hold Incoming itself without polling handshake or accepting the
+    // authenticated connection. This occupies one NOQ pre-Incoming slot.
+    let first=tokio::time::timeout(
+        Duration::from_secs(5),server.accept()
+    ).await.unwrap().unwrap();
+    let second_client=Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0").unwrap()
+        .secret_key(key(49))
+        .bind().await.unwrap();
+    let second_ep=second_client.clone();
+    let second_addr=addr.clone();
+    let second_task=tokio::spawn(async move {
+        let _=second_ep.connect(second_addr,ANCHOR_ALPN).await;
+    });
+    // The second unaccepted Initial cannot create an additional Incoming
+    // while noq::ServerConfig::max_incoming is one.
+    assert!(tokio::time::timeout(
+        Duration::from_millis(750),server.accept()
+    ).await.is_err());
+
+    second_task.abort();
+    drop(first);
+    // After releasing the unaccepted transport slot a distinct peer
+    // can create a new incoming request, rather than leaving a false
+    // permanent saturation condition.
+    let third_client=Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0").unwrap()
+        .secret_key(key(50))
+        .bind().await.unwrap();
+    let third_ep=third_client.clone();
+    let third_task=tokio::spawn(async move {
+        let _=third_ep.connect(addr,ANCHOR_ALPN).await;
+    });
+    let third=tokio::time::timeout(
+        Duration::from_secs(5),server.accept()
+    ).await.unwrap().unwrap();
+    let connected=tokio::time::timeout(
+        Duration::from_secs(5),third
+    ).await.unwrap().unwrap();
+    assert_eq!(connected.remote_id(),key(50).public());
+    drop(connected);
+    first_task.abort();
+    third_task.abort();
+    first_client.close().await;
+    second_client.close().await;
+    third_client.close().await;
+    server.close().await;
 }
