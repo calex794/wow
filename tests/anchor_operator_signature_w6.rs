@@ -28,6 +28,7 @@ fn policy()->AnchorServicePolicy{
     AnchorServicePolicy {
         reader:endpoint(41),administrator:endpoint(42),
         operator:root().verifying_key(),
+        recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:authority(90),
     }
 }
