@@ -24,6 +24,10 @@ def record_part(data, part, run_url):
         "candidates": len(candidates), "uncertain_branches": missed,
         "snapshot": data["timestamp"], "run": run_url,
         "preview": bool(data["preview_limit"]),
+        "inventory_complete": bool(
+            data["coverage"]["public_branch_inventory_complete"]
+        ),
+        "details_complete": bool(data["coverage"]["commit_details_complete"]),
         "partial": bool(data["coverage"]["partial_reasons"]),
     }
 
@@ -51,7 +55,11 @@ def decode_state(body):
 
 def render_index(state, data):
     p = state["parts"]
-    completed = sum(str(i) in p and not p[str(i)].get("preview") for i in range(1, PARTS + 1))
+    completed = sum(
+        str(i) in p and p[str(i)].get("inventory_complete")
+        and not p[str(i)].get("preview")
+        for i in range(1, PARTS + 1)
+    )
     lines = [
         "# NOQ fork audit: 17-part index",
         "",
@@ -59,25 +67,26 @@ def render_index(state, data):
         "[n0-computer/noq](https://github.com/n0-computer/noq).",
         "**Every part can be captured on a different day; this is NOT one "
         "atomic global snapshot.**",
-        f"Parts with at least one non-preview snapshot: **{completed}/{PARTS}**.",
+        f"Parts with verified public-branch inventory: **{completed}/{PARTS}**.",
         f"Latest Github fork counter: **{data['coverage']['github_reported_forks']}**; "
         f"public listings: **{data['coverage']['public_listed_forks']}**.",
         "All candidate priorities are unreviewed suggestions. No fork code "
         "is executed or automatically adopted.",
         "",
-        "| Part | Forks | Branches | SHA candidates | Uncertain | Last updated | Evidence |",
-        "|---:|---:|---:|---:|---:|---|---|",
+        "| Part | Forks | Branches | SHA candidates | Uncertain | Inventory | Last updated | Evidence |",
+        "|---:|---:|---:|---:|---:|---|---|---|",
     ]
     for i in range(1, PARTS + 1):
         one = p.get(str(i))
         if not one:
-            lines.append(f"| {i:02d} | — | — | — | — | not scanned | — |")
+            lines.append(f"| {i:02d} | — | — | — | — | not scanned | — | — |")
             continue
         status = " preview" if one.get("preview") else ""
+        verified = "complete" if one.get("inventory_complete") else "partial"
         url = one["run"]
         lines.append(
             f"| {i:02d} | {one['forks']} | {one['branches']} | "
-            f"{one['candidates']} | {one['uncertain_branches']} | "
+            f"{one['candidates']} | {one['uncertain_branches']} | {verified} | "
             f"{one['snapshot'][:10]}{status} | [Actions]({url}) |"
         )
     lines += [
