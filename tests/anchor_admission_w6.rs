@@ -3,7 +3,7 @@
 #![cfg(feature="iroh-transport")]
 
 use akula_wire_lab::anchor_admission_w6::{
-    AnchorAdmission, AnchorAdmissionPolicy, anchor_transport_config,
+    AnchorAdmission, AnchorAdmissionPolicy, anchor_incoming_limits,anchor_transport_config,
 };
 use akula_wire_lab::peer_enrollment_w6::{
     AuthorityDomainId, PolicyCheckpoint, AnchorError,
@@ -42,6 +42,7 @@ async fn prehandshake_capacity_denies_real_quic_without_reserving_more_workers()
         .clear_ip_transports()
         .bind_addr("127.0.0.1:0").unwrap()
         .transport_config(anchor_transport_config())
+            .server_incoming_limits(anchor_incoming_limits())
         .secret_key(key(43))
         .alpns(vec![ANCHOR_ALPN.to_vec()])
         .bind().await.unwrap();
