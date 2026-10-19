@@ -36,12 +36,10 @@ jobs:
           test -z "$(git -C integrated status --porcelain)"
           git -C integrated diff --name-only "$PARENT" "$PIN" > /tmp/noq-files.txt
           diff -u <(printf '%s\n'             noq-proto/src/connection/mod.rs             noq-proto/src/connection/paths.rs             noq-proto/src/tests/multipath.rs) /tmp/noq-files.txt
-          git -C integrated show "$PIN:noq-proto/src/tests/multipath.rs" |
-            grep -q 'backup_path_keepalive_not_suppressed_by_incoming_ping'
-          git -C integrated show "$PIN:noq-proto/src/tests/multipath.rs" |
-            grep -q 'regression_locally_abandoned_unseen_path_discarded'
-          git -C integrated show "$PIN:noq-proto/src/connection/paths.rs" | grep -q 'self_drain_armed'
-          git -C integrated show "$PIN:noq-proto/src/connection/mod.rs" | grep -q 'reset_conn_keep_alive'
+          grep -F -q 'backup_path_keepalive_not_suppressed_by_incoming_ping' integrated/noq-proto/src/tests/multipath.rs
+          grep -F -q 'regression_locally_abandoned_unseen_path_discarded' integrated/noq-proto/src/tests/multipath.rs
+          grep -F -q 'self_drain_armed' integrated/noq-proto/src/connection/paths.rs
+          grep -F -q 'reset_conn_keep_alive' integrated/noq-proto/src/connection/mod.rs
       - name: Rustfmt — no new drift vs precise upstream parent
         working-directory: integrated
         run: |
