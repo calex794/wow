@@ -438,6 +438,7 @@ fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
     let dir=tempdir().unwrap();
     let a_path=dir.path().join("a-policy.sqlite");
     let b_path=dir.path().join("b-policy.sqlite");
+    let mailbox_path=dir.path().join("b-mailbox.sqlite");
     let anchor_path=dir.path().join("anchor.sqlite");
     // Two physically separate SQLite files model two independent hosts.
     // Both are first bootstrapped with the SAME operator-approved state.
@@ -457,6 +458,7 @@ fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
     let (entered_tx,entered_rx)=mpsc::sync_channel::<()>(1);
     let (finish_tx,finish_rx)=mpsc::sync_channel::<()>(1);
     let writer_addr=server.address();
+    let writer_mailbox_path=mailbox_path.clone();
     let writer=thread::spawn(move || -> Result<(),EnrollmentError> {
         let mut host_b=PeerEnrollmentDb::open_for_authority(
             &b_path,root().verifying_key(),authority(),
@@ -468,9 +470,24 @@ fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
                 // The remote fence was granted BEFORE callback entry.
                 entered_tx.send(()).unwrap();
                 finish_rx.recv_timeout(Duration::from_secs(7)).unwrap();
-                // In production this is the durable Mailbox COMMIT. Our
-                // unit callback proves that no signed CAS can pass DURING
-                // the window, even though the host SQLite DBs differ.
+                // Actual independently durable Mailbox SQLite COMMIT on
+                // host B, NOT merely an in-memory callback flag.
+                let mut mailbox=Connection::open(&writer_mailbox_path)?;
+                mailbox.execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA synchronous=FULL;
+                     CREATE TABLE IF NOT EXISTS received (
+                       id INTEGER PRIMARY KEY, body BLOB NOT NULL
+                     );"
+                )?;
+                let tx=mailbox.transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Immediate
+                )?;
+                tx.execute(
+                    "INSERT INTO received(id,body) VALUES(1,?1)",
+                    rusqlite::params![b"durable mailbox commit".as_slice()],
+                )?;
+                tx.commit()?;
                 Ok(())
             },
         )
@@ -497,6 +514,11 @@ fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
 
     finish_tx.send(()).unwrap();
     writer.join().unwrap().unwrap(); // writer's durable callback completed
+    // Independent process/file reader verifies persisted Mailbox content.
+    let persisted:i64=Connection::open(&mailbox_path).unwrap().query_row(
+        "SELECT COUNT(*) FROM received WHERE id=1",[],|r|r.get(0)
+    ).unwrap();
+    assert_eq!(persisted,1);
     assert_eq!(
         host_a.recover_pending_signed_update(&admin).unwrap(),
         akula_wire_lab::peer_enrollment_w6::SignedRecoveryOutcome::ForwardedPending
