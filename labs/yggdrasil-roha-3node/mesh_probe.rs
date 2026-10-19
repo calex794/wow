@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         assert_eq!(echo, payload, "Roha QUIC echo mismatch");
         let selected = conn.paths().into_iter().find(|p| p.is_selected())
             .expect("selected QUIC path").remote_addr();
-        assert!(matches!(selected, TransportAddr::Ip(ip) if ip == remote),
+        assert!(matches!(selected, TransportAddr::Ip(ip) if *ip == remote),
             "expected Yggdrasil IPv6 IP path, got {selected:?}");
         println!("CLIENT_ROHA_QUIC_OK size={} selected={selected:?} relay=disabled",
             echo.len());
