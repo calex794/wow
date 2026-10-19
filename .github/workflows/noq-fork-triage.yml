@@ -30,6 +30,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s research/noq-forks/tests -p 'test_*.py' -v
+      - name: Verify Rust ACK-delay arithmetic against unsafe checked_shl proposal
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --test research/noq-forks/tests/ack_delay_shift.rs -o /tmp/noq-ack-delay-arithmetic
+          /tmp/noq-ack-delay-arithmetic --nocapture
       - name: Verify exact successful prior DAG evidence run and download all 17 parts
         run: |
           set -euo pipefail
