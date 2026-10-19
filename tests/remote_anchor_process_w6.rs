@@ -112,6 +112,7 @@ async fn child_remote_anchor_service_process() {
     let ledger=Arc::new(Mutex::new(ledger));
     let endpoint=Endpoint::builder(presets::Minimal)
         .clear_ip_transports()
+        .transport_config(anchor_transport_config())
         .bind_addr("127.0.0.1:0").unwrap()
         .secret_key(key(43))
         .alpns(vec![ANCHOR_ALPN.to_vec()])
