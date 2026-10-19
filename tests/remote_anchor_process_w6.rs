@@ -36,6 +36,7 @@ const CHILD_ROOT: &str = "STAYA_W6_REMOTE_ANCHOR_CHILD_ROOT";
 const READY_FILE: &str = "anchor-ready.addr";
 const STOP_FILE: &str = "anchor-stop";
 const ROTATED_READER_FILE: &str = "authority-reader-rotated.flag";
+const SECOND_WRITER_FILE: &str = "authority-second-writer.flag";
 
 fn key(v:u8)->SecretKey {SecretKey::from_bytes(&[v;32])}
 fn id(v:u8)->[u8;16] {[v;16]}
@@ -43,6 +44,7 @@ fn authority()->AuthorityDomainId {AuthorityDomainId::new([90;32]).unwrap()}
 fn policy()->AnchorServicePolicy {
     AnchorServicePolicy {
         reader:key(41).public(),
+        additional_readers:[None;4],
         administrator:key(42).public(),
         operator:root().verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
@@ -55,6 +57,9 @@ fn child_policy(root:&Path)->AnchorServicePolicy {
     let mut provisioned=policy();
     if root.join(ROTATED_READER_FILE).exists() {
         provisioned.reader=key(49).public();
+    }
+    if root.join(SECOND_WRITER_FILE).exists() {
+        provisioned.additional_readers[0]=Some(key(49).public());
     }
     provisioned
 }
@@ -84,7 +89,9 @@ fn lookup<'a>(b:&'a EndpointRouteBinding)->EnrollmentLookup<'a> {
     }
 }
 fn provision(db:&Path,checkpoint:PolicyCheckpoint) {
-    RemoteAnchorLedger::provision(db,policy(),checkpoint).unwrap();
+    // This simulates independently provisioned immutable reader registry.
+    let parent=db.parent().unwrap();
+    RemoteAnchorLedger::provision(db,child_policy(parent),checkpoint).unwrap();
 }
 fn flush(path:&Path) {
     Connection::open(path).unwrap()
@@ -462,6 +469,9 @@ fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
     drop(bootstrap);
     flush(&a_path);
     fs::copy(&a_path,&b_path).unwrap();
+    // Host A and host B have DISTINCT pinned reader TLS identities, not
+    // one shared credential. The primary reader is 41, secondary 49.
+    fs::write(dir.path().join(SECOND_WRITER_FILE),b"pinned-reader:49").unwrap();
     provision(&anchor_path,initial);
     let server=ChildAuthority::start(dir.path());
     let admin=client(42,server.address());
@@ -477,7 +487,7 @@ fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
         let mut host_b=PeerEnrollmentDb::open_for_authority(
             &b_path,root().verifying_key(),authority(),
         )?;
-        let reader=client(41,writer_addr);
+        let reader=client(49,writer_addr);
         let local_binding=binding();
         host_b.with_anchored_write(
             &reader,lookup(&local_binding),|_|{
@@ -544,7 +554,7 @@ fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
     let mut host_b=PeerEnrollmentDb::open_for_authority(
         &dir.path().join("b-policy.sqlite"),root().verifying_key(),authority(),
     ).unwrap();
-    let reader=client(41,server.address());
+    let reader=client(49,server.address());
     let mut wrongly_committed=false;
     let stale:Result<(),EnrollmentError>=host_b.with_anchored_write(
         &reader,lookup(&binding()),|_|{wrongly_committed=true;Ok(())}

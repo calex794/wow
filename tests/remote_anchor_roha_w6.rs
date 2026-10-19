@@ -50,6 +50,7 @@ fn lookup<'a>(b:&'a EndpointRouteBinding)->EnrollmentLookup<'a>{
 fn policy_config()->AnchorServicePolicy{
     AnchorServicePolicy{
         reader:sec(41).public(),
+        additional_readers:[None;4],
         administrator:sec(42).public(),
         operator:root().verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
@@ -78,7 +79,11 @@ impl Server {
             .alpns(vec![ANCHOR_ALPN.to_vec()])
             .bind().await.unwrap();
         let ep=endpoint.clone();
-        let slots=Arc::new(tokio::sync::Semaphore::new(4));
+        // Three independent TLS writer clients plus admin, repeated
+        // short-lived RPC connections and cleanup overlap. Keep admission
+        // BOUNDED but do not conflate honest burst saturation with an
+        // authorization failure. Production pre-TLS quotas are separate P0.
+        let slots=Arc::new(tokio::sync::Semaphore::new(16));
         let task=tokio::spawn(async move {
             loop {
                 let Some(incoming)=ep.accept().await else {return};
@@ -262,7 +267,7 @@ async fn provisioning_is_explicit_and_endpoint_keys_cannot_be_replaced_by_db(){
         Err(RemoteAnchorError::AlreadyProvisioned)
     ));
     let wrong=AnchorServicePolicy{
-        reader:sec(45).public(),administrator:sec(46).public(),
+        reader:sec(45).public(),additional_readers:[None;4],administrator:sec(46).public(),
         operator:root().verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:current_domain(),
@@ -360,7 +365,7 @@ async fn pinned_offline_operator_key_cannot_be_replaced_at_anchor_reopen() {
     let db=dir.path().join("remote.sqlite");
     provision(&db,cp(1,2));
     let wrong=AnchorServicePolicy {
-        reader:sec(41).public(),administrator:sec(42).public(),
+        reader:sec(41).public(),additional_readers:[None;4],administrator:sec(42).public(),
         operator:SigningKey::from_bytes(&[221;32]).verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:current_domain(),
@@ -465,4 +470,54 @@ async fn cross_authority_replay_rejected_over_real_quic_even_with_same_tls_key()
     assert_eq!(admin_b.current().unwrap(),new);
     first_service.stop().await;
     second_service.stop().await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn real_quic_independent_writer_keys_share_global_fence_and_revoke() {
+    let dir=tempdir().unwrap();
+    let db=dir.path().join("multi-reader.sqlite");
+    let old=cp(1,33);
+    let next=cp(2,34);
+    let mut pinned=policy_config();
+    pinned.additional_readers[0]=Some(sec(49).public());
+    pinned.additional_readers[1]=Some(sec(50).public());
+    drop(RemoteAnchorLedger::provision(&db,pinned,old).unwrap());
+    let service=Server::start_with_policy(&db,pinned).await;
+    let a=client(41,service.addr());
+    let b=client(49,service.addr());
+    let c=client(50,service.addr());
+    let admin=client(42,service.addr());
+    let stranger=client(51,service.addr());
+    assert_eq!(a.current().unwrap(),old);
+    assert_eq!(b.current().unwrap(),old);
+    assert_eq!(c.current().unwrap(),old);
+    assert_anchor_error(stranger.current(),AnchorError::InvalidAttestation);
+    // Real, separate TLS/EndpointId keys for A, B and C. A's fence
+    // prevents B/C from entering even when they know the same checkpoint.
+    a.begin_write_fence(old,[201;32]).unwrap();
+    assert_anchor_error(
+        b.begin_write_fence(old,[202;32]),AnchorError::Conflict
+    );
+    assert_anchor_error(
+        c.finish_write_fence(old,[201;32]),AnchorError::Conflict
+    );
+    assert_anchor_error(
+        authorized_cas(&admin,old,next),AnchorError::Conflict
+    );
+    a.finish_write_fence(old,[201;32]).unwrap();
+    b.begin_write_fence(old,[203;32]).unwrap();
+    assert_anchor_error(
+        a.begin_write_fence(old,[204;32]),AnchorError::Conflict
+    );
+    b.finish_write_fence(old,[203;32]).unwrap();
+    c.begin_write_fence(old,[205;32]).unwrap();
+    c.finish_write_fence(old,[205;32]).unwrap();
+    authorized_cas(&admin,old,next).unwrap();
+    for reader in [&a,&b,&c] {
+        assert_anchor_error(
+            reader.begin_write_fence(old,[206;32]),AnchorError::Conflict
+        );
+        assert_eq!(reader.current().unwrap(),next);
+    }
+    service.stop().await;
 }

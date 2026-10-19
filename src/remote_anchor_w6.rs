@@ -36,7 +36,10 @@ use std::{
     time::Duration,
 };
 
-pub const ANCHOR_ALPN: &[u8] = b"akula-wow/w6-external-anchor-lab/3";
+// v4 breaks the protected reader registry schema; do not negotiate v3.
+pub const ANCHOR_ALPN: &[u8] = b"akula-wow/w6-external-anchor-lab/4";
+const EXTRA_READER_SLOTS: usize = 4;
+const EXTRA_READER_BYTES: usize = EXTRA_READER_SLOTS * 33;
 const OP_GET: u8 = 1;
 const OP_CAS: u8 = 2;
 const OP_WRITE_BEGIN: u8 = 3;
@@ -86,7 +89,12 @@ impl From<std::io::Error> for RemoteAnchorError {
 /// not user-supplied network frames or a database field treated as authority.
 #[derive(Clone, Copy, Debug)]
 pub struct AnchorServicePolicy {
+    /// Primary, externally provisioned writer TLS identity.
     pub reader: EndpointId,
+    /// Four additional independently provisioned writer TLS identities.
+    /// Every slot (including None) is pinned and compared with authority
+    /// SQLite; these values never come from a QUIC peer or local policy DB.
+    pub additional_readers: [Option<EndpointId>; EXTRA_READER_SLOTS],
     pub administrator: EndpointId,
     /// Independent pinned ID of the logical authority/cluster, NOT its
     /// QUIC key or an untrusted value supplied by the request.
@@ -101,6 +109,22 @@ pub struct AnchorServicePolicy {
     /// Never store its private key on the authority service.
     pub recovery_witness: VerifyingKey,
 }
+fn additional_reader_bytes(
+    policy:AnchorServicePolicy,
+)->[u8;EXTRA_READER_BYTES]{
+    let mut bytes=[0u8;EXTRA_READER_BYTES];
+    for (i,slot) in policy.additional_readers.iter().enumerate() {
+        if let Some(reader)=slot {
+            bytes[i*33]=1;
+            bytes[i*33+1..(i+1)*33].copy_from_slice(reader.as_bytes());
+        }
+    }
+    bytes
+}
+fn is_writer(policy:AnchorServicePolicy,peer:EndpointId)->bool{
+    peer==policy.reader
+        || policy.additional_readers.contains(&Some(peer))
+}
 fn validate_distinct_trust_roles(
     policy:&AnchorServicePolicy,
 )->Result<(),RemoteAnchorError>{
@@ -113,6 +137,17 @@ fn validate_distinct_trust_roles(
         || reader==administrator
     {
         return Err(RemoteAnchorError::ConfigurationMismatch);
+    }
+    for (i,entry) in policy.additional_readers.iter().enumerate() {
+        if let Some(id)=entry {
+            let bytes=id.as_bytes();
+            if bytes==reader || bytes==operator || bytes==witness
+                || bytes==administrator
+                || policy.additional_readers[..i].contains(&Some(*id))
+            {
+                return Err(RemoteAnchorError::ConfigurationMismatch);
+            }
+        }
     }
     Ok(())
 }
@@ -140,6 +175,7 @@ fn decode_checkpoint(bytes:&[u8])->Result<PolicyCheckpoint,RemoteAnchorError> {
 /// obtained from potentially rolled-back W6 policy.sqlite.
 struct StoredAnchorRow {
     reader: Vec<u8>,
+    additional_readers: Vec<u8>,
     administrator: Vec<u8>,
     operator: Vec<u8>,
     authority: Vec<u8>,
@@ -248,10 +284,12 @@ impl RemoteAnchorLedger {
         if existing!=0 {return Err(RemoteAnchorError::AlreadyProvisioned);}
         tx.execute(
             "INSERT INTO w6_external_anchor
-             (id,reader,administrator,operator,authority,recovery_witness,revision,digest)
-             VALUES(1,?1,?2,?3,?4,?5,?6,?7)",
+             (id,reader,additional_readers,administrator,operator,authority,
+              recovery_witness,revision,digest)
+             VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 policy.reader.as_bytes().as_slice(),
+                additional_reader_bytes(policy).as_slice(),
                 policy.administrator.as_bytes().as_slice(),
                 policy.operator.as_bytes().as_slice(),
                 policy.authority.as_bytes().as_slice(),
@@ -281,6 +319,7 @@ impl RemoteAnchorLedger {
         // cross-host CAS versus Mailbox COMMIT race.
         let _ = Self::writer_fence(&sql)?;
         if trusted.reader.as_slice()!=policy.reader.as_bytes()
+            || trusted.additional_readers.as_slice()!=additional_reader_bytes(policy)
             || trusted.administrator.as_slice()!=policy.administrator.as_bytes()
             || trusted.operator.as_slice()!=policy.operator.as_bytes()
             || trusted.authority.as_slice()!=policy.authority.as_bytes()
@@ -298,6 +337,8 @@ impl RemoteAnchorLedger {
              CREATE TABLE IF NOT EXISTS w6_external_anchor (
                id INTEGER PRIMARY KEY CHECK(id=1),
                reader BLOB NOT NULL CHECK(length(reader)=32),
+               additional_readers BLOB NOT NULL
+                 CHECK(length(additional_readers)=132),
                administrator BLOB NOT NULL CHECK(length(administrator)=32),
                operator BLOB NOT NULL CHECK(length(operator)=32),
                authority BLOB NOT NULL CHECK(length(authority)=32),
@@ -329,7 +370,7 @@ impl RemoteAnchorLedger {
     fn record(db:&Sqlite)->Result<Option<StoredAnchorRow>,RemoteAnchorError>{
         use rusqlite::OptionalExtension;
         let rec=db.query_row(
-            "SELECT reader,administrator,operator,authority,
+            "SELECT reader,additional_readers,administrator,operator,authority,
                     recovery_witness,revision,digest
              FROM w6_external_anchor WHERE id=1",
             [],|row|Ok((
@@ -338,14 +379,16 @@ impl RemoteAnchorLedger {
                 row.get::<_,Vec<u8>>(2)?,
                 row.get::<_,Vec<u8>>(3)?,
                 row.get::<_,Vec<u8>>(4)?,
-                row.get::<_,i64>(5)?,
-                row.get::<_,Vec<u8>>(6)?,
+                row.get::<_,Vec<u8>>(5)?,
+                row.get::<_,i64>(6)?,
+                row.get::<_,Vec<u8>>(7)?,
             )),
         ).optional()?;
-        let Some((reader,administrator,operator,authority,recovery_witness,rev,digest))=rec
+        let Some((reader,additional_readers,administrator,operator,authority,
+                  recovery_witness,rev,digest))=rec
         else {return Ok(None)};
-        if reader.len()!=32 || administrator.len()!=32
-            || operator.len()!=32 || authority.len()!=32
+        if reader.len()!=32 || additional_readers.len()!=EXTRA_READER_BYTES
+            || administrator.len()!=32 || operator.len()!=32 || authority.len()!=32
             || recovery_witness.len()!=32
             || recovery_witness.as_slice()==operator.as_slice()
             || authority.iter().all(|&b| b == 0)
@@ -354,8 +397,8 @@ impl RemoteAnchorLedger {
         }
         let mut d=[0u8;32];d.copy_from_slice(&digest);
         Ok(Some(StoredAnchorRow {
-            reader, administrator, operator, authority, recovery_witness,
-            checkpoint:PolicyCheckpoint {revision:rev as u64,digest:d},
+            reader, additional_readers, administrator, operator, authority,
+            recovery_witness, checkpoint:PolicyCheckpoint {revision:rev as u64,digest:d},
         }))
     }
     fn writer_fence(db:&Sqlite)->Result<Option<WriterFenceRow>,RemoteAnchorError>{
@@ -386,6 +429,7 @@ impl RemoteAnchorLedger {
         policy:AnchorServicePolicy,stored:&StoredAnchorRow,
     )->Result<(),RemoteAnchorError>{
         if stored.reader.as_slice()!=policy.reader.as_bytes()
+            || stored.additional_readers.as_slice()!=additional_reader_bytes(policy)
             || stored.administrator.as_slice()!=policy.administrator.as_bytes()
             || stored.operator.as_slice()!=policy.operator.as_bytes()
             || stored.authority.as_slice()!=policy.authority.as_bytes()
@@ -445,8 +489,9 @@ impl RemoteAnchorLedger {
         operator_signature:&[u8],witness_signature:&[u8],
     )->Result<PolicyCheckpoint,RemoteAnchorError>{
         if order.authority!=self.policy.authority
-            || order.previous_reader!=self.policy.reader
+            || !is_writer(self.policy,order.previous_reader)
             || order.replacement_reader==order.previous_reader
+            || is_writer(self.policy,order.replacement_reader)
             || order.replacement_reader==self.policy.administrator
             || order.replacement_reader.as_bytes()==self.policy.operator.as_bytes()
             || order.replacement_reader.as_bytes()==self.policy.recovery_witness.as_bytes()
@@ -501,15 +546,31 @@ impl RemoteAnchorLedger {
                 operator_signature,witness_signature,
             ],
         )?;
+        // Rotate ONLY the exact credential holding the fence; other
+        // independent writers keep their pinned identities unchanged.
+        let mut updated=self.policy;
+        if order.previous_reader==updated.reader {
+            updated.reader=order.replacement_reader;
+        } else {
+            let Some(slot)=updated.additional_readers.iter_mut()
+                .find(|s|**s==Some(order.previous_reader))
+            else {return Err(RemoteAnchorError::ConfigurationMismatch)};
+            *slot=Some(order.replacement_reader);
+        }
         tx.execute(
-            "UPDATE w6_external_anchor SET reader=?1 WHERE id=1",
-            params![order.replacement_reader.as_bytes().as_slice()],
+            "UPDATE w6_external_anchor SET reader=?1,additional_readers=?2
+             WHERE id=1",
+            params![
+                updated.reader.as_bytes().as_slice(),
+                additional_reader_bytes(updated).as_slice(),
+            ],
         )?;
         tx.execute("DELETE FROM w6_writer_fence WHERE singleton=1",[])?;
         tx.commit()?;
         // In-memory server authorization must switch only after COMMIT.
-        // On restart, externally protected config must pin the new reader.
-        self.policy.reader=order.replacement_reader;
+        // Protected deployment configuration must independently pin the new
+        // writer set before restart; other writers remain authorized.
+        self.policy=updated;
         Ok(order.checkpoint)
     }
 
@@ -520,7 +581,7 @@ impl RemoteAnchorLedger {
     pub fn begin_write_for(
         &mut self,peer:EndpointId,expected:PolicyCheckpoint,nonce:[u8;32],
     )->Result<PolicyCheckpoint,RemoteAnchorError>{
-        if peer!=self.policy.reader {return Err(RemoteAnchorError::UntrustedPeer);}
+        if !is_writer(self.policy,peer) {return Err(RemoteAnchorError::UntrustedPeer);}
         if nonce==[0;32] {return Err(RemoteAnchorError::Protocol);}
         let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current=Self::record(&tx)?.ok_or(RemoteAnchorError::NotProvisioned)?;
@@ -553,7 +614,7 @@ impl RemoteAnchorLedger {
     pub fn finish_write_for(
         &mut self,peer:EndpointId,expected:PolicyCheckpoint,nonce:[u8;32],
     )->Result<PolicyCheckpoint,RemoteAnchorError>{
-        if peer!=self.policy.reader {return Err(RemoteAnchorError::UntrustedPeer);}
+        if !is_writer(self.policy,peer) {return Err(RemoteAnchorError::UntrustedPeer);}
         let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current=Self::record(&tx)?.ok_or(RemoteAnchorError::NotProvisioned)?;
         Self::require_pinned_policy(self.policy,&current)?;
@@ -573,7 +634,7 @@ impl RemoteAnchorLedger {
     pub fn current_for(
         &self,peer:EndpointId,
     )->Result<PolicyCheckpoint,RemoteAnchorError>{
-        if peer!=self.policy.reader && peer!=self.policy.administrator {
+        if !is_writer(self.policy,peer) && peer!=self.policy.administrator {
             return Err(RemoteAnchorError::UntrustedPeer);
         }
         let record=Self::record(&self.sql)?

@@ -26,7 +26,7 @@ fn cp(n:u64,v:u8)->PolicyCheckpoint{PolicyCheckpoint{revision:n,digest:[v;32]}}
 fn authority(n:u8)->AuthorityDomainId{AuthorityDomainId::new([n;32]).unwrap()}
 fn policy()->AnchorServicePolicy{
     AnchorServicePolicy {
-        reader:endpoint(41),administrator:endpoint(42),
+        reader:endpoint(41),additional_readers:[None;4],administrator:endpoint(42),
         operator:root().verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:authority(90),
