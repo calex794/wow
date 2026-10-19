@@ -24,7 +24,7 @@ fn linux_rss_kib() -> Option<u64> {
     {
         let s = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = s.lines().find(|line| line.starts_with("VmRSS:"))?;
-        return line.split_whitespace().nth(1)?.parse().ok();
+        line.split_whitespace().nth(1)?.parse().ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -44,7 +44,7 @@ fn linux_cpu_ticks() -> Option<u64> {
         let mut fields = fields.split_whitespace();
         let user: u64 = fields.nth(11)?.parse().ok()?; // field 14, utime
         let system: u64 = fields.next()?.parse().ok()?; // field 15, stime
-        return user.checked_add(system);
+        user.checked_add(system)
     }
     #[cfg(not(target_os = "linux"))]
     {
