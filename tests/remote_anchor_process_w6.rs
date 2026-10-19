@@ -15,7 +15,8 @@ use akula_wire_lab::peer_enrollment_w6::{
 };
 use akula_wire_lab::remote_anchor_w6::{
     serve_one_anchor_connection, AnchorServicePolicy, RemoteAnchorClient,
-    RemoteAnchorLedger, ANCHOR_ALPN,
+    RemoteAnchorLedger, OrphanFenceRecoveryOrder, ANCHOR_ALPN,
+    sign_orphan_recovery_operator, sign_orphan_recovery_witness,
 };
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
@@ -34,6 +35,7 @@ use tempfile::tempdir;
 const CHILD_ROOT: &str = "STAYA_W6_REMOTE_ANCHOR_CHILD_ROOT";
 const READY_FILE: &str = "anchor-ready.addr";
 const STOP_FILE: &str = "anchor-stop";
+const ROTATED_READER_FILE: &str = "authority-reader-rotated.flag";
 
 fn key(v:u8)->SecretKey {SecretKey::from_bytes(&[v;32])}
 fn id(v:u8)->[u8;16] {[v;16]}
@@ -46,6 +48,15 @@ fn policy()->AnchorServicePolicy {
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:authority(),
     }
+}
+fn child_policy(root:&Path)->AnchorServicePolicy {
+    // A separate, out-of-band deployment change is mandatory after the
+    // privileged offline recovery. No reader identity is chosen from QUIC.
+    let mut provisioned=policy();
+    if root.join(ROTATED_READER_FILE).exists() {
+        provisioned.reader=key(49).public();
+    }
+    provisioned
 }
 fn cp(revision:u64,byte:u8)->PolicyCheckpoint {
     PolicyCheckpoint {revision,digest:[byte;32]}
@@ -87,7 +98,9 @@ fn flush(path:&Path) {
 async fn child_remote_anchor_service_process() {
     let Some(root)=std::env::var_os(CHILD_ROOT) else {return};
     let root=PathBuf::from(root);
-    let ledger=RemoteAnchorLedger::open(&root.join("anchor.sqlite"),policy()).unwrap();
+    let ledger=RemoteAnchorLedger::open(
+        &root.join("anchor.sqlite"),child_policy(&root)
+    ).unwrap();
     let ledger=Arc::new(Mutex::new(ledger));
     let endpoint=Endpoint::builder(presets::Minimal)
         .clear_ip_transports()
@@ -618,4 +631,77 @@ fn callback_failure_retains_remote_fence_across_authority_process_restart() {
     // No auto-expiry and no unsafe fabricated "recovery success".
     assert_eq!(new_admin.current().unwrap(),old);
     restarted.finish(false);
+}
+
+#[test]
+fn witness_signed_orphan_recovery_rotates_real_quic_writer_after_authority_restart() {
+    let dir=tempdir().unwrap();
+    let db=dir.path().join("anchor.sqlite");
+    let old=cp(1,1);
+    let next=cp(2,2);
+    provision(&db,old);
+    let old_server=ChildAuthority::start(dir.path());
+    let old_reader=client(41,old_server.address());
+    let admin=client(42,old_server.address());
+    old_reader.begin_write_fence(old,[166;32]).unwrap();
+    assert_eq!(admin.current().unwrap(),old);
+    assert_eq!(
+        authorized_cas(&admin,old,next).unwrap_err(),
+        AnchorError::Conflict
+    );
+    drop(old_reader);
+    drop(admin);
+
+    // In this lab, stop the server process and explicitly attest to
+    // isolation using pinned offline test keys. These signatures are
+    // NOT evidence of real-world OS death: physical custody of the old
+    // writer is a separate production trust requirement.
+    old_server.finish(true);
+    let mut maintenance=RemoteAnchorLedger::open(&db,policy()).unwrap();
+    let pending=maintenance.inspect_orphan_fence().unwrap().unwrap();
+    assert_eq!(pending.reader,key(41).public());
+    let order=OrphanFenceRecoveryOrder {
+        authority:pending.authority,
+        previous_reader:pending.reader,
+        replacement_reader:key(49).public(),
+        checkpoint:pending.checkpoint,
+        nonce:pending.nonce,
+        generation:pending.next_generation,
+    };
+    let op=sign_orphan_recovery_operator(&root(),&order);
+    let witness=sign_orphan_recovery_witness(
+        &SigningKey::from_bytes(&[234;32]),&order
+    );
+    maintenance.recover_orphan_after_external_isolation(
+        &order,&op,&witness,
+    ).unwrap();
+    drop(maintenance);
+
+    assert!(RemoteAnchorLedger::open(&db,policy()).is_err());
+    let mut pinned_new=policy();
+    pinned_new.reader=key(49).public();
+    assert!(RemoteAnchorLedger::open(&db,pinned_new).is_ok());
+
+    // Restart with independently updated and pinned trusted config, NOT
+    // a value copied from the remote SQLite or a network response.
+    fs::write(dir.path().join(ROTATED_READER_FILE),b"new-reader:49").unwrap();
+    let server=ChildAuthority::start(dir.path());
+    let old_client=client(41,server.address());
+    let new_client=client(49,server.address());
+    let admin=client(42,server.address());
+    assert_eq!(old_client.current().unwrap_err(),AnchorError::InvalidAttestation);
+    assert_eq!(
+        old_client.begin_write_fence(old,[168;32]).unwrap_err(),
+        AnchorError::InvalidAttestation
+    );
+    assert_eq!(new_client.current().unwrap(),old);
+    new_client.begin_write_fence(old,[169;32]).unwrap();
+    assert_eq!(
+        authorized_cas(&admin,old,next).unwrap_err(),
+        AnchorError::Conflict
+    );
+    new_client.finish_write_fence(old,[169;32]).unwrap();
+    authorized_cas(&admin,old,next).unwrap();
+    assert_eq!(admin.current().unwrap(),next);
+    server.finish(false);
 }
