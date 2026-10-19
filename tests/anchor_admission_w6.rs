@@ -135,6 +135,10 @@ async fn one_pending_transport_incoming_blocks_a_second_quic_initial_until_relea
     ).await.is_err());
 
     second_task.abort();
+    // Stop the refused peer completely before freeing the one pending
+    // slot, otherwise its QUIC Initial retransmissions can race the next
+    // distinct TLS peer and falsely consume the freshly released slot.
+    second_client.close().await;
     drop(first);
     // After releasing the unaccepted transport slot a distinct peer
     // can create a new incoming request, rather than leaving a false
@@ -145,8 +149,14 @@ async fn one_pending_transport_incoming_blocks_a_second_quic_initial_until_relea
         .secret_key(key(50))
         .bind().await.unwrap();
     let third_ep=third_client.clone();
+    let (release_tx,release_rx)=tokio::sync::oneshot::channel::<()>();
     let third_task=tokio::spawn(async move {
-        let _=third_ep.connect(addr,ANCHOR_ALPN).await;
+        // Keep the client connection alive THROUGH the server's TLS
+        // handshake. Dropping the successful connect return value here
+        // would abort the incoming peer before its acceptance completes.
+        let conn=third_ep.connect(addr,ANCHOR_ALPN).await;
+        let _=release_rx.await;
+        drop(conn);
     });
     let third=tokio::time::timeout(
         Duration::from_secs(5),server.accept()
@@ -156,10 +166,10 @@ async fn one_pending_transport_incoming_blocks_a_second_quic_initial_until_relea
     ).await.unwrap().unwrap();
     assert_eq!(connected.remote_id(),key(50).public());
     drop(connected);
+    let _=release_tx.send(());
+    let _=third_task.await;
     first_task.abort();
-    third_task.abort();
     first_client.close().await;
-    second_client.close().await;
     third_client.close().await;
     server.close().await;
 }
