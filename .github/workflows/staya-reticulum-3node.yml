@@ -1,0 +1,29 @@
+name: Staya Reticulum three-node transport laboratory
+on:
+  push:
+    branches: [experiment/staya-reticulum-3node]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-rns-transport:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare isolated Reticulum runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 iputils-ping
+          python -m venv .venv
+          .venv/bin/pip install -q cryptography pyserial
+          git clone --filter=blob:none https://github.com/markqvist/Reticulum.git external-rns
+          cd external-rns
+          git checkout --detach e40191b3d193b46b7f2d8a44424a594cd758839b
+          test "$(git rev-parse HEAD)" = e40191b3d193b46b7f2d8a44424a594cd758839b
+          cd ..
+          .venv/bin/pip install -q --no-deps ./external-rns
+      - name: Test forwarding via T only
+        run: |
+          source .venv/bin/activate
+          bash labs/reticulum-3node/run.sh
