@@ -132,3 +132,32 @@ fn old_authority_missing_durable_writer_table_fails_closed() {
     drop(sql);
     assert!(RemoteAnchorLedger::open(&path,config()).is_err());
 }
+
+#[test]
+fn duplicate_provision_never_changes_existing_legacy_authority_file() {
+    let dir=tempdir().unwrap();
+    let path=dir.path().join("legacy.sqlite");
+    // Simulates an existing v2 authority with NO writer-fence table.
+    let sql=Connection::open(&path).unwrap();
+    sql.execute_batch(
+        "CREATE TABLE w6_external_anchor(id INTEGER PRIMARY KEY);
+         INSERT INTO w6_external_anchor(id) VALUES(1);"
+    ).unwrap();
+    drop(sql);
+    assert!(matches!(
+        RemoteAnchorLedger::provision(&path,config(),cp(1,1)),
+        Err(RemoteAnchorError::AlreadyProvisioned)
+    ));
+    // Provision failed with ZERO schema changes, not a silent v2 -> v3
+    // mutation that could have re-enabled writes without migration review.
+    let sql=Connection::open(&path).unwrap();
+    let old_rows:i64=sql.query_row(
+        "SELECT COUNT(*) FROM w6_external_anchor",[],|r|r.get(0)
+    ).unwrap();
+    let unexpected_table:i64=sql.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+         AND name='w6_writer_fence'",[],|r|r.get(0)
+    ).unwrap();
+    assert_eq!(old_rows,1);
+    assert_eq!(unexpected_table,0);
+}
