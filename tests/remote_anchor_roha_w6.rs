@@ -10,7 +10,10 @@ use akula_wire_lab::peer_enrollment_w6::{
 };
 use akula_wire_lab::remote_anchor_w6::{
     ANCHOR_ALPN, AnchorServicePolicy, RemoteAnchorClient, RemoteAnchorError,
-    RemoteAnchorLedger, serve_one_anchor_connection,
+    RemoteAnchorLedger,
+};
+use akula_wire_lab::anchor_admission_w6::{
+    AnchorAdmission,AnchorAdmissionPolicy,anchor_transport_config,
 };
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
@@ -75,34 +78,21 @@ impl Server {
         let ledger=Arc::new(Mutex::new(ledger));
         let endpoint=Endpoint::builder(presets::Minimal)
             .clear_ip_transports().bind_addr("127.0.0.1:0").unwrap()
+            .transport_config(anchor_transport_config())
             .secret_key(sec(43))
             .alpns(vec![ANCHOR_ALPN.to_vec()])
             .bind().await.unwrap();
         let ep=endpoint.clone();
-        // Three independent TLS writer clients plus admin, repeated
-        // short-lived RPC connections and cleanup overlap. Keep admission
-        // BOUNDED but do not conflate honest burst saturation with an
-        // authorization failure. Production pre-TLS quotas are separate P0.
-        let slots=Arc::new(tokio::sync::Semaphore::new(16));
+        let admission=AnchorAdmission::new(
+            AnchorAdmissionPolicy::default(),
+        ).unwrap();
         let task=tokio::spawn(async move {
             loop {
                 let Some(incoming)=ep.accept().await else {return};
-                // Bounded worker admission, never serially wait for one
-                // client's RPC reply acknowledgement before accepting the
-                // next independently authenticated TLS identity.
-                let Ok(slot)=Arc::clone(&slots).try_acquire_owned() else {
-                    drop(incoming); // fail closed under overload
-                    continue;
-                };
-                let ledger=Arc::clone(&ledger);
-                tokio::spawn(async move {
-                    let _slot=slot;
-                    if let Ok(conn)=incoming.await {
-                        if let Err(error)=serve_one_anchor_connection(&conn,&ledger).await {
-                            eprintln!("W6 LAB anchor responder failure: {error:?}");
-                        }
-                    }
-                });
+                // Global permit + token gate BEFORE polling TLS. A single
+                // library path also enforces handshake and RPC deadlines.
+                // Overload must drop the incoming, not queue it.
+                let _accepted=admission.dispatch(incoming,Arc::clone(&ledger));
             }
         });
         Self{endpoint,task}

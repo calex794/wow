@@ -27,6 +27,8 @@ pub mod iroh_mailbox_w6;
 pub mod peer_enrollment_w6;
 #[cfg(feature = "iroh-transport")]
 pub mod remote_anchor_w6;
+#[cfg(feature = "iroh-transport")]
+pub mod anchor_admission_w6;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
