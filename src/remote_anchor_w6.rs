@@ -367,6 +367,139 @@ impl RemoteAnchorLedger {
         }))
     }
 
+    /// Compare the independently pinned configuration on EVERY access.
+    /// An old authority process that still has the old reader key in memory
+    /// must never process new writes after a different local maintenance
+    /// process rotated that key in shared SQLite.
+    fn require_pinned_policy(
+        policy:AnchorServicePolicy,stored:&StoredAnchorRow,
+    )->Result<(),RemoteAnchorError>{
+        if stored.reader.as_slice()!=policy.reader.as_bytes()
+            || stored.administrator.as_slice()!=policy.administrator.as_bytes()
+            || stored.operator.as_slice()!=policy.operator.as_bytes()
+            || stored.authority.as_slice()!=policy.authority.as_bytes()
+            || stored.recovery_witness.as_slice()!=policy.recovery_witness.as_bytes()
+        {
+            return Err(RemoteAnchorError::ConfigurationMismatch);
+        }
+        Ok(())
+    }
+    fn recovery_generation(db:&Sqlite)->Result<u64,RemoteAnchorError>{
+        let latest:i64=db.query_row(
+            "SELECT COALESCE(MAX(generation),0) FROM w6_writer_recovery",
+            [],|row|row.get(0),
+        )?;
+        let next=latest.checked_add(1).ok_or(RemoteAnchorError::CorruptStorage)?;
+        if next<=0 {return Err(RemoteAnchorError::CorruptStorage);}
+        Ok(next as u64)
+    }
+
+    /// PRIVILEGED LOCAL ONLY: returns sensitive nonce bytes. Never expose
+    /// this method through QUIC, logs, user-visible diagnostics, or untrusted
+    /// callers. The operator must obtain independent evidence that the
+    /// original writer is PHYSICALLY isolated before signing a recovery.
+    pub fn inspect_orphan_fence(
+        &self,
+    )->Result<Option<OrphanFenceInspection>,RemoteAnchorError>{
+        let current=Self::record(&self.sql)?
+            .ok_or(RemoteAnchorError::NotProvisioned)?;
+        Self::require_pinned_policy(self.policy,&current)?;
+        let Some(held)=Self::writer_fence(&self.sql)? else {return Ok(None)};
+        if held.checkpoint!=current.checkpoint {
+            return Err(RemoteAnchorError::CorruptStorage);
+        }
+        let reader:[u8;32]=held.peer.try_into()
+            .map_err(|_|RemoteAnchorError::CorruptStorage)?;
+        let nonce:[u8;32]=held.nonce.try_into()
+            .map_err(|_|RemoteAnchorError::CorruptStorage)?;
+        let reader=EndpointId::from_bytes(&reader)
+            .map_err(|_|RemoteAnchorError::CorruptStorage)?;
+        Ok(Some(OrphanFenceInspection {
+            authority:self.policy.authority,
+            reader,nonce,checkpoint:held.checkpoint,
+            next_generation:Self::recovery_generation(&self.sql)?,
+        }))
+    }
+
+    /// ONLY for a physically fenced old writer, after out-of-band witness
+    /// attestation. A cryptographic witness signature is an assertion of
+    /// isolation, NOT an OS liveness oracle. If this assertion is false,
+    /// a paused old writer could still durably commit after the recovery.
+    ///
+    /// No online QUIC RPC exposes this operation. Releasing the old fence,
+    /// installing a fresh reader TLS identity and writing the audit evidence
+    /// is one FULL-synchronous SQLite IMMEDIATE transaction.
+    pub fn recover_orphan_after_external_isolation(
+        &mut self,order:&OrphanFenceRecoveryOrder,
+        operator_signature:&[u8],witness_signature:&[u8],
+    )->Result<PolicyCheckpoint,RemoteAnchorError>{
+        if order.authority!=self.policy.authority
+            || order.previous_reader!=self.policy.reader
+            || order.replacement_reader==order.previous_reader
+            || order.replacement_reader==self.policy.administrator
+            || order.nonce==[0;32]
+            || order.generation==0
+        {
+            return Err(RemoteAnchorError::UntrustedRecovery);
+        }
+        // Each signature has a DIFFERENT domain separator and DIFFERENT
+        // independently pinned root; neither the TLS admin nor a single
+        // operator key can authorize an orphan release.
+        verify_recovery_proof(
+            &self.policy.operator,OPERATOR_RECOVERY_DOMAIN,
+            order,operator_signature,
+        )?;
+        verify_recovery_proof(
+            &self.policy.recovery_witness,WITNESS_RECOVERY_DOMAIN,
+            order,witness_signature,
+        )?;
+        let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current=Self::record(&tx)?.ok_or(RemoteAnchorError::NotProvisioned)?;
+        Self::require_pinned_policy(self.policy,&current)?;
+        if current.checkpoint!=order.checkpoint
+            || Self::recovery_generation(&tx)?!=order.generation
+        {
+            return Err(RemoteAnchorError::Conflict);
+        }
+        let held=Self::writer_fence(&tx)?.ok_or(RemoteAnchorError::Conflict)?;
+        if held.peer.as_slice()!=order.previous_reader.as_bytes()
+            || held.nonce.as_slice()!=order.nonce
+            || held.checkpoint!=order.checkpoint
+        {
+            return Err(RemoteAnchorError::Conflict);
+        }
+        // The signature binds exact old reader, replacement reader,
+        // authority, checkpoint, secret token and monotonic sequence.
+        // Record a hash rather than leaking the WRITE-FINISH capability.
+        let nonce_hash=blake3::hash(&order.nonce);
+        tx.execute(
+            "INSERT INTO w6_writer_recovery (
+                generation,authority,previous_reader,replacement_reader,
+                nonce_hash,revision,digest,operator_signature,witness_signature
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                to_int(order.generation)?,
+                order.authority.as_bytes().as_slice(),
+                order.previous_reader.as_bytes().as_slice(),
+                order.replacement_reader.as_bytes().as_slice(),
+                nonce_hash.as_bytes().as_slice(),
+                to_int(order.checkpoint.revision)?,
+                order.checkpoint.digest.as_slice(),
+                operator_signature,witness_signature,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE w6_external_anchor SET reader=?1 WHERE id=1",
+            params![order.replacement_reader.as_bytes().as_slice()],
+        )?;
+        tx.execute("DELETE FROM w6_writer_fence WHERE singleton=1",[])?;
+        tx.commit()?;
+        // In-memory server authorization must switch only after COMMIT.
+        // On restart, externally protected config must pin the new reader.
+        self.policy.reader=order.replacement_reader;
+        Ok(order.checkpoint)
+    }
+
     /// Reserve one global Mailbox-commit slot, linearized against signed CAS
     /// in the SAME authority SQLite IMMEDIATE transaction. A client must
     /// already have a valid local enrollment for the identical checkpoint.
@@ -378,6 +511,7 @@ impl RemoteAnchorLedger {
         if nonce==[0;32] {return Err(RemoteAnchorError::Protocol);}
         let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current=Self::record(&tx)?.ok_or(RemoteAnchorError::NotProvisioned)?;
+        Self::require_pinned_policy(self.policy,&current)?;
         if current.checkpoint!=expected {return Err(RemoteAnchorError::Conflict);}
         if let Some(held)=Self::writer_fence(&tx)? {
             // Retried acquisition after an ambiguous QUIC response must be
@@ -409,6 +543,7 @@ impl RemoteAnchorLedger {
         if peer!=self.policy.reader {return Err(RemoteAnchorError::UntrustedPeer);}
         let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current=Self::record(&tx)?.ok_or(RemoteAnchorError::NotProvisioned)?;
+        Self::require_pinned_policy(self.policy,&current)?;
         if current.checkpoint!=expected {return Err(RemoteAnchorError::Conflict);}
         let held=Self::writer_fence(&tx)?.ok_or(RemoteAnchorError::Conflict)?;
         if held.peer.as_slice()!=peer.as_bytes()
@@ -430,6 +565,7 @@ impl RemoteAnchorLedger {
         }
         let record=Self::record(&self.sql)?
             .ok_or(RemoteAnchorError::NotProvisioned)?;
+        Self::require_pinned_policy(self.policy,&record)?;
         Ok(record.checkpoint)
     }
     /// Strictly monotonic, FULL-synchronous SQLite BEGIN IMMEDIATE CAS.
@@ -451,6 +587,7 @@ impl RemoteAnchorLedger {
         let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record=Self::record(&tx)?
             .ok_or(RemoteAnchorError::NotProvisioned)?;
+        Self::require_pinned_policy(self.policy,&record)?;
         if record.checkpoint!=expected {return Err(RemoteAnchorError::Conflict);}
         // IMPORTANT: no signed revoke (or allow) is published while an
         // independent host still has an in-flight Mailbox COMMIT. The
