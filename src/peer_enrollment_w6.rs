@@ -891,8 +891,12 @@ impl PeerEnrollmentDb {
     /// write. The callback must complete the Mailbox COMMIT before returning.
     /// An error rolls back this read-only policy transaction on drop.
     ///
-    /// No network I/O/await under this lock. A busy/locked policy DB fails
-    /// closed; lock starvation is an availability threat and not resolved here.
+    /// The anchored cross-host variant deliberately makes bounded,
+    /// SYNCHRONOUS QUIC authority BEGIN/FINISH RPCs while the SQLite
+    /// IMMEDIATE lock is held. It NEVER awaits a Tokio future here, but
+    /// it can stall this lock on network failure. This conservative global
+    /// serialization trades throughput and availability for a real
+    /// revocation-versus-COMMIT barrier. A busy or locked DB fails closed.
     /// This does NOT fix physical DB-snapshot rollback or replicate policies
     /// across *different* policy SQLite files/hosts.
     pub fn with_authorized_write<T, E, F>(
