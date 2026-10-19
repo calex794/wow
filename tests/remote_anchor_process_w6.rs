@@ -43,6 +43,7 @@ fn policy()->AnchorServicePolicy {
         reader:key(41).public(),
         administrator:key(42).public(),
         operator:root().verifying_key(),
+        recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:authority(),
     }
 }
