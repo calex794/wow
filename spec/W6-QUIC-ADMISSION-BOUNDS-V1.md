@@ -29,6 +29,12 @@ authority endpoint, not recreated for every connection. It enforces:
   and burst 64, with finite caps (rate <=256/sec, burst <=512).
   No queued jobs, no blocking waiter list: exhausted arrivals are
   dropped before polling their TLS Future.
+- QUIC Retry for any Incoming without a validated transport address,
+  before starting any TLS/QUIC handshake Future. Retry is the pinned
+  Roha/noq stateless address-validation mechanism; the client must prove
+  reachability by returning a valid transport token. Initial and retried
+  attempts each consume admission rate budget; a spoofed source address
+  does not get to reserve a long-lived TLS application worker.
 - A separate handshake completion deadline (default 2 seconds, max 10)
   and whole per-connection service deadline (default 8 seconds, max 10).
   A single semaphore permit spans handshake, request parse, response,
