@@ -1,0 +1,38 @@
+name: Staya Yggdrasil 3-node Roha/noq laboratory
+on:
+  push:
+    branches: [experiment/staya-yggdrasil-3node]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  yggdrasil-roha-multihop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      ROHA_SHA: c6fba1b1423aa22d827cf54e73495e53fdc29275
+      YGG_RELEASE: https://github.com/yggdrasil-network/yggdrasil-go/releases/download/v0.5.14/yggdrasil-0.5.14-amd64.deb
+      YGG_SHA256: 72745496b09baa1c3f5a6741e1257a704cfdb9d00cdf3ddbef025987b239699d
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 iputils-ping jq curl ca-certificates
+          test -c /dev/net/tun
+          rustup toolchain install 1.91.0 --profile minimal
+          rustup default 1.91.0
+      - name: Checkout pinned Roha
+        run: |
+          git clone --filter=blob:none https://github.com/calex794/roha.git roha
+          cd roha
+          git checkout --detach "$ROHA_SHA"
+          test "$(git rev-parse HEAD)" = "$ROHA_SHA"
+          cp ../labs/yggdrasil-roha-3node/mesh_probe.rs iroh/examples/mesh_probe.rs
+          grep -q 'name = "noq"' Cargo.lock
+      - name: Build real Roha/noq QUIC probe
+        run: |
+          cd roha
+          cargo build --release --locked -p iroh --example mesh_probe
+      - name: Test three-node Yggdrasil and Roha QUIC
+        run: bash labs/yggdrasil-roha-3node/run.sh
