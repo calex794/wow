@@ -1,0 +1,68 @@
+name: NOQ ACK parser baseline and 512-cap compatibility boundary
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/noq-fork-ack-boundaries.yml"
+      - "research/noq-forks/tests/frame_ack_boundary_injected.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-source-ack-range:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PINNED_NOQ: "2eabf9895d40c263aa3369afd66efcf4a5d95056"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check out only the exact tested calex794/noq revision
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git pinned-noq
+          git -C pinned-noq checkout --detach "$PINNED_NOQ"
+          test "$(git -C pinned-noq rev-parse HEAD)" = "$PINNED_NOQ"
+          test -z "$(git -C pinned-noq status --porcelain)"
+      - name: Inject research-only tests into the pinned parser
+        run: |
+          set -euo pipefail
+          cat research/noq-forks/tests/frame_ack_boundary_injected.rs >> pinned-noq/noq-proto/src/frame.rs
+          git -C pinned-noq diff --check
+      - name: Verify the actual pinned parser on absent and 513 ACK range payloads
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib fork_audit_ack_range_boundary -- --nocapture
+      - name: Show the proposed fixed 512 bound changes previously accepted input
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("noq-proto/src/frame.rs")
+          src = p.read_text()
+          before = "    let num_blocks = buf.get_var()?;\n\n    let mut out = ArrayRangeSet::new();"
+          after = (
+              "    let num_blocks = buf.get_var()?;\n"
+              "    if num_blocks > 512 {\n"
+              "        return Err(IterErr::Malformed);\n"
+              "    }\n\n"
+              "    let mut out = ArrayRangeSet::new();"
+          )
+          assert src.count(before) == 1, "baseline parser unexpectedly changed"
+          p.write_text(src.replace(before, after, 1))
+          PY
+          set +e
+          cargo test --locked -p noq-proto --lib             fork_audit_ack_range_boundary::valid_513_extra_ranges_are_accepted_by_pinned_parser             -- --nocapture > /tmp/ack-512-cap-negative.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/ack-512-cap-negative.log
+          test "$status" -ne 0
+          grep -F "pinned parser rejected 513 extra ranges" /tmp/ack-512-cap-negative.log
+          printf '%s\n'             'Baseline parser accepts 513 additional ranges; hard-coded 512 cap rejected those bytes.'             'This is a compatibility boundary, NOT proof of a remotely exploitable denial of service.'             >> "$GITHUB_STEP_SUMMARY"
