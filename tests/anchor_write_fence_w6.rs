@@ -186,9 +186,9 @@ fn signed_recovery(
 fn orphan_release_requires_two_distinct_roles_and_rotates_writer_atomically() {
     let dir=tempdir().unwrap();
     let path=dir.path().join("anchor.sqlite");
-    let cp=cp(8,9);
-    let mut anchor=RemoteAnchorLedger::provision(&path,config(),cp).unwrap();
-    anchor.begin_write_for(key(41),cp,[72;32]).unwrap();
+    let baseline=cp(8,9);
+    let mut anchor=RemoteAnchorLedger::provision(&path,config(),baseline).unwrap();
+    anchor.begin_write_for(key(41),baseline,[72;32]).unwrap();
     let evidence=anchor.inspect_orphan_fence().unwrap().unwrap();
     assert_eq!(evidence.nonce,[72;32]);
     assert_eq!(evidence.reader,key(41));
@@ -238,9 +238,9 @@ fn orphan_release_requires_two_distinct_roles_and_rotates_writer_atomically() {
     ));
     // Without both exact valid roles the fence remains, and CAS still fails.
     assert!(anchor.inspect_orphan_fence().unwrap().is_some());
-    let (command,proof)=signed_revoke(cp,cp(9,10));
+    let (command,proof)=signed_revoke(baseline,cp(9,10));
     assert!(matches!(
-        anchor.advance_for(key(42),cp,cp(9,10),&command,&proof),
+        anchor.advance_for(key(42),baseline,cp(9,10),&command,&proof),
         Err(RemoteAnchorError::Conflict)
     ));
 
@@ -249,17 +249,17 @@ fn orphan_release_requires_two_distinct_roles_and_rotates_writer_atomically() {
     ).unwrap();
     assert!(anchor.inspect_orphan_fence().unwrap().is_none());
     assert!(matches!(
-        anchor.begin_write_for(key(41),cp,[74;32]),
+        anchor.begin_write_for(key(41),baseline,[74;32]),
         Err(RemoteAnchorError::UntrustedPeer)
     ));
     assert!(matches!(
         anchor.current_for(key(41)),
         Err(RemoteAnchorError::UntrustedPeer)
     ));
-    assert_eq!(anchor.current_for(key(49)).unwrap(),cp);
-    anchor.begin_write_for(key(49),cp,[75;32]).unwrap();
-    anchor.finish_write_for(key(49),cp,[75;32]).unwrap();
-    anchor.advance_for(key(42),cp,cp(9,10),&command,&proof).unwrap();
+    assert_eq!(anchor.current_for(key(49)).unwrap(),baseline);
+    anchor.begin_write_for(key(49),baseline,[75;32]).unwrap();
+    anchor.finish_write_for(key(49),baseline,[75;32]).unwrap();
+    anchor.advance_for(key(42),baseline,cp(9,10),&command,&proof).unwrap();
     assert!(anchor.recover_orphan_after_external_isolation(
         &order,&operator,&witness,
     ).is_err());
@@ -290,9 +290,9 @@ fn orphan_release_requires_two_distinct_roles_and_rotates_writer_atomically() {
 fn stale_authority_process_cannot_serve_or_clear_old_fence_after_rotation() {
     let dir=tempdir().unwrap();
     let path=dir.path().join("anchor.sqlite");
-    let cp=cp(1,1);
-    let mut old_process=RemoteAnchorLedger::provision(&path,config(),cp).unwrap();
-    old_process.begin_write_for(key(41),cp,[121;32]).unwrap();
+    let baseline=cp(1,1);
+    let mut old_process=RemoteAnchorLedger::provision(&path,config(),baseline).unwrap();
+    old_process.begin_write_for(key(41),baseline,[121;32]).unwrap();
     let mut maintenance=RemoteAnchorLedger::open(&path,config()).unwrap();
     let observation=maintenance.inspect_orphan_fence().unwrap().unwrap();
     let (order,operator,witness)=signed_recovery(observation,key(49));
@@ -307,20 +307,20 @@ fn stale_authority_process_cannot_serve_or_clear_old_fence_after_rotation() {
         Err(RemoteAnchorError::ConfigurationMismatch)
     ));
     assert!(matches!(
-        old_process.begin_write_for(key(41),cp,[123;32]),
+        old_process.begin_write_for(key(41),baseline,[123;32]),
         Err(RemoteAnchorError::ConfigurationMismatch)
     ));
     assert!(matches!(
-        old_process.finish_write_for(key(41),cp,[121;32]),
+        old_process.finish_write_for(key(41),baseline,[121;32]),
         Err(RemoteAnchorError::ConfigurationMismatch)
     ));
-    let (change,proof)=signed_revoke(cp,cp(2,2));
+    let (change,proof)=signed_revoke(baseline,cp(2,2));
     assert!(matches!(
-        old_process.advance_for(key(42),cp,cp(2,2),&change,&proof),
+        old_process.advance_for(key(42),baseline,cp(2,2),&change,&proof),
         Err(RemoteAnchorError::ConfigurationMismatch)
     ));
-    maintenance.begin_write_for(key(49),cp,[124;32]).unwrap();
-    maintenance.finish_write_for(key(49),cp,[124;32]).unwrap();
+    maintenance.begin_write_for(key(49),baseline,[124;32]).unwrap();
+    maintenance.finish_write_for(key(49),baseline,[124;32]).unwrap();
 }
 
 #[test]
