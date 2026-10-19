@@ -1,0 +1,98 @@
+name: NOQ combined #9 — exact-SHA integration gate
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/noq-combined-gate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  combined-proto:
+    name: NOQ #9 — combined protocol lib, regressions and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PIN: "538346e8fb300598991de560566289121e9528e9"
+      PARENT: "13b93f70aec5cd0155fff794204fc256523db799"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Check out exact combined noq revision and invariant diff
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git integrated
+          git -C integrated checkout --detach "$PIN"
+          test "$(git -C integrated rev-parse HEAD)" = "$PIN"
+          test -z "$(git -C integrated status --porcelain)"
+          git -C integrated diff --name-only "$PARENT" "$PIN" > /tmp/noq-files.txt
+          diff -u <(printf '%s\n'             noq-proto/src/connection/mod.rs             noq-proto/src/connection/paths.rs             noq-proto/src/tests/multipath.rs) /tmp/noq-files.txt
+          git -C integrated show "$PIN:noq-proto/src/tests/multipath.rs" |
+            grep -q 'backup_path_keepalive_not_suppressed_by_incoming_ping'
+          git -C integrated show "$PIN:noq-proto/src/tests/multipath.rs" |
+            grep -q 'regression_locally_abandoned_unseen_path_discarded'
+          git -C integrated show "$PIN:noq-proto/src/connection/paths.rs" | grep -q 'self_drain_armed'
+          git -C integrated show "$PIN:noq-proto/src/connection/mod.rs" | grep -q 'reset_conn_keep_alive'
+      - name: Rustfmt — no new drift vs precise upstream parent
+        working-directory: integrated
+        run: |
+          set -euo pipefail
+          git worktree add --detach ../upstream-parent "$PARENT"
+          set +e
+          (cd ../upstream-parent && cargo fmt --all -- --check) >/tmp/parent-fmt.log 2>&1
+          parent_code=$?
+          cargo fmt --all -- --check >/tmp/combined-fmt.log 2>&1
+          combined_code=$?
+          set -e
+          export PARENT_FMT_STATUS="$parent_code" COMBINED_FMT_STATUS="$combined_code"
+          python3 - <<'PY'
+          import os, pathlib, re
+          def changed(file, path_prefix):
+              log = pathlib.Path(file).read_text()
+              paths = set()
+              for m in re.finditer(r"Diff in ([^:]+):\d+:", log):
+                  p = m.group(1)
+                  if path_prefix not in p:
+                      raise RuntimeError(f"unexpected rustfmt path: {p}")
+                  paths.add(p.split(path_prefix, 1)[1])
+              return paths
+          if os.environ["PARENT_FMT_STATUS"] not in {"0", "1"} or os.environ["COMBINED_FMT_STATUS"] not in {"0", "1"}:
+              raise RuntimeError("rustfmt reported non-diff failure")
+          before = changed("/tmp/parent-fmt.log", "upstream-parent/")
+          after = changed("/tmp/combined-fmt.log", "integrated/")
+          touched = {"noq-proto/src/connection/mod.rs","noq-proto/src/connection/paths.rs","noq-proto/src/tests/multipath.rs"}
+          assert not after & touched, f"modified files fail rustfmt: {after & touched}"
+          assert not after - before, f"new formatting drift: {after-before}"
+          print("Only baseline rustfmt differences remain:", sorted(after))
+          PY
+          test -z "$(git status --porcelain)"
+      - name: Run exact combined regression tests
+        working-directory: integrated
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib backup_path_keepalive_not_suppressed_by_incoming_ping -- --nocapture
+          cargo test --locked -p noq-proto --lib regression_locally_abandoned_unseen_path_discarded -- --nocapture
+          cargo test --locked -p noq-proto --lib stopped_reset_flow_control -- --nocapture
+          cargo test --locked -p noq-proto --lib reset_stopped_flow_control -- --nocapture
+      - name: Run complete combined protocol library
+        working-directory: integrated
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib
+      - name: Clippy exact combined revision
+        working-directory: integrated
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p noq-proto --lib -- -D warnings
+      - name: Summarize scope of success
+        run: |
+          printf '%s\n'             "NOQ #9 combined SHA $PIN: specific regressions, full noq-proto lib, Clippy passed."             "No merged changes in main; Windows, Android, multipath soak and Roha/Akula custody remain pending."             >> "$GITHUB_STEP_SUMMARY"
