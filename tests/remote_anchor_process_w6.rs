@@ -43,6 +43,7 @@ fn authority()->AuthorityDomainId {AuthorityDomainId::new([90;32]).unwrap()}
 fn policy()->AnchorServicePolicy {
     AnchorServicePolicy {
         reader:key(41).public(),
+        additional_readers:[None;4],
         administrator:key(42).public(),
         operator:root().verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
