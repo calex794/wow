@@ -210,6 +210,9 @@ impl RemoteAnchorLedger {
         path:&Path, policy:AnchorServicePolicy, initial:PolicyCheckpoint,
     )->Result<Self,RemoteAnchorError>{
         let _=to_int(initial.revision)?;
+        if policy.operator==policy.recovery_witness {
+            return Err(RemoteAnchorError::ConfigurationMismatch);
+        }
         // IMPORTANT: never run CREATE TABLE/ALTER on any existing authority
         // file. Earlier logic made an old v2 database look v3-compatible
         // even though reprovision ultimately returned AlreadyProvisioned.
@@ -232,13 +235,14 @@ impl RemoteAnchorLedger {
         if existing!=0 {return Err(RemoteAnchorError::AlreadyProvisioned);}
         tx.execute(
             "INSERT INTO w6_external_anchor
-             (id,reader,administrator,operator,authority,revision,digest)
-             VALUES(1,?1,?2,?3,?4,?5,?6)",
+             (id,reader,administrator,operator,authority,recovery_witness,revision,digest)
+             VALUES(1,?1,?2,?3,?4,?5,?6,?7)",
             params![
                 policy.reader.as_bytes().as_slice(),
                 policy.administrator.as_bytes().as_slice(),
                 policy.operator.as_bytes().as_slice(),
                 policy.authority.as_bytes().as_slice(),
+                policy.recovery_witness.as_bytes().as_slice(),
                 to_int(initial.revision)?, initial.digest.as_slice(),
             ],
         )?;
@@ -251,8 +255,16 @@ impl RemoteAnchorLedger {
         let sql=Sqlite::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         sql.busy_timeout(Duration::from_secs(2))?;
         sql.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL;")?;
+        if policy.operator==policy.recovery_witness {
+            return Err(RemoteAnchorError::ConfigurationMismatch);
+        }
         let found=Self::record(&sql)?;
         let trusted=found.ok_or(RemoteAnchorError::NotProvisioned)?;
+        // The recovery journal is mandatory. No implicit legacy schema
+        // repair and no trust-root adoption from an old/rolled-back file.
+        let _:i64=sql.query_row(
+            "SELECT COUNT(*) FROM w6_writer_recovery",[],|row|row.get(0),
+        )?;
         // A pre-v3 authority without the durable fence table MUST refuse to
         // start. Merely bumping ALPN without this table would re-open the
         // cross-host CAS versus Mailbox COMMIT race.
@@ -261,6 +273,7 @@ impl RemoteAnchorLedger {
             || trusted.administrator.as_slice()!=policy.administrator.as_bytes()
             || trusted.operator.as_slice()!=policy.operator.as_bytes()
             || trusted.authority.as_slice()!=policy.authority.as_bytes()
+            || trusted.recovery_witness.as_slice()!=policy.recovery_witness.as_bytes()
         {
             return Err(RemoteAnchorError::ConfigurationMismatch);
         }
@@ -277,6 +290,7 @@ impl RemoteAnchorLedger {
                administrator BLOB NOT NULL CHECK(length(administrator)=32),
                operator BLOB NOT NULL CHECK(length(operator)=32),
                authority BLOB NOT NULL CHECK(length(authority)=32),
+               recovery_witness BLOB NOT NULL CHECK(length(recovery_witness)=32),
                revision INTEGER NOT NULL CHECK(revision>=0),
                digest BLOB NOT NULL CHECK(length(digest)=32)
              );
@@ -286,6 +300,17 @@ impl RemoteAnchorLedger {
                nonce BLOB NOT NULL CHECK(length(nonce)=32),
                revision INTEGER NOT NULL CHECK(revision>=0),
                digest BLOB NOT NULL CHECK(length(digest)=32)
+             );
+             CREATE TABLE IF NOT EXISTS w6_writer_recovery (
+               generation INTEGER PRIMARY KEY CHECK(generation>0),
+               authority BLOB NOT NULL CHECK(length(authority)=32),
+               previous_reader BLOB NOT NULL CHECK(length(previous_reader)=32),
+               replacement_reader BLOB NOT NULL CHECK(length(replacement_reader)=32),
+               nonce_hash BLOB NOT NULL CHECK(length(nonce_hash)=32),
+               revision INTEGER NOT NULL CHECK(revision>=0),
+               digest BLOB NOT NULL CHECK(length(digest)=32),
+               operator_signature BLOB NOT NULL CHECK(length(operator_signature)=64),
+               witness_signature BLOB NOT NULL CHECK(length(witness_signature)=64)
              );"
         )?;
         Ok(())
@@ -293,28 +318,32 @@ impl RemoteAnchorLedger {
     fn record(db:&Sqlite)->Result<Option<StoredAnchorRow>,RemoteAnchorError>{
         use rusqlite::OptionalExtension;
         let rec=db.query_row(
-            "SELECT reader,administrator,operator,authority,revision,digest
+            "SELECT reader,administrator,operator,authority,
+                    recovery_witness,revision,digest
              FROM w6_external_anchor WHERE id=1",
             [],|row|Ok((
                 row.get::<_,Vec<u8>>(0)?,
                 row.get::<_,Vec<u8>>(1)?,
                 row.get::<_,Vec<u8>>(2)?,
                 row.get::<_,Vec<u8>>(3)?,
-                row.get::<_,i64>(4)?,
-                row.get::<_,Vec<u8>>(5)?,
+                row.get::<_,Vec<u8>>(4)?,
+                row.get::<_,i64>(5)?,
+                row.get::<_,Vec<u8>>(6)?,
             )),
         ).optional()?;
-        let Some((reader,administrator,operator,authority,rev,digest))=rec
+        let Some((reader,administrator,operator,authority,recovery_witness,rev,digest))=rec
         else {return Ok(None)};
         if reader.len()!=32 || administrator.len()!=32
             || operator.len()!=32 || authority.len()!=32
+            || recovery_witness.len()!=32
+            || recovery_witness.as_slice()==operator.as_slice()
             || authority.iter().all(|&b| b == 0)
             || digest.len()!=32 || rev<0 {
             return Err(RemoteAnchorError::CorruptStorage);
         }
         let mut d=[0u8;32];d.copy_from_slice(&digest);
         Ok(Some(StoredAnchorRow {
-            reader, administrator, operator, authority,
+            reader, administrator, operator, authority, recovery_witness,
             checkpoint:PolicyCheckpoint {revision:rev as u64,digest:d},
         }))
     }
