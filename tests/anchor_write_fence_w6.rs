@@ -7,7 +7,8 @@ use akula_wire_lab::peer_enrollment_w6::{
     EndpointRouteBinding, OperatorChange, PolicyCheckpoint, PolicyOperation,
 };
 use akula_wire_lab::remote_anchor_w6::{
-    AnchorServicePolicy, RemoteAnchorError, RemoteAnchorLedger,
+    AnchorServicePolicy, OrphanFenceRecoveryOrder, RemoteAnchorError, RemoteAnchorLedger,
+    sign_orphan_recovery_operator, sign_orphan_recovery_witness,
 };
 use ed25519_dalek::SigningKey;
 use iroh::{EndpointId, SecretKey};
@@ -161,4 +162,174 @@ fn duplicate_provision_never_changes_existing_legacy_authority_file() {
     ).unwrap();
     assert_eq!(old_rows,1);
     assert_eq!(unexpected_table,0);
+}
+
+fn recovery_witness()->SigningKey{SigningKey::from_bytes(&[234;32])}
+fn signed_recovery(
+    snapshot:akula_wire_lab::remote_anchor_w6::OrphanFenceInspection,
+    new_reader:EndpointId,
+)->(OrphanFenceRecoveryOrder,[u8;64],[u8;64]){
+    let order=OrphanFenceRecoveryOrder{
+        authority:snapshot.authority,
+        previous_reader:snapshot.reader,
+        replacement_reader:new_reader,
+        checkpoint:snapshot.checkpoint,
+        nonce:snapshot.nonce,
+        generation:snapshot.next_generation,
+    };
+    let op=sign_orphan_recovery_operator(&root(),&order);
+    let witness=sign_orphan_recovery_witness(&recovery_witness(),&order);
+    (order,op,witness)
+}
+
+#[test]
+fn orphan_release_requires_two_distinct_roles_and_rotates_writer_atomically() {
+    let dir=tempdir().unwrap();
+    let path=dir.path().join("anchor.sqlite");
+    let cp=cp(8,9);
+    let mut anchor=RemoteAnchorLedger::provision(&path,config(),cp).unwrap();
+    anchor.begin_write_for(key(41),cp,[72;32]).unwrap();
+    let evidence=anchor.inspect_orphan_fence().unwrap().unwrap();
+    assert_eq!(evidence.nonce,[72;32]);
+    assert_eq!(evidence.reader,key(41));
+    assert_eq!(evidence.next_generation,1);
+    let (order,operator,witness)=signed_recovery(evidence,key(49));
+    let wrong=sign_orphan_recovery_witness(&root(),&order);
+    assert!(matches!(
+        anchor.recover_orphan_after_external_isolation(&order,&operator,&wrong),
+        Err(RemoteAnchorError::UntrustedRecovery)
+    ));
+    assert!(matches!(
+        anchor.recover_orphan_after_external_isolation(&order,&operator,&operator),
+        Err(RemoteAnchorError::UntrustedRecovery)
+    ));
+    let forged=sign_orphan_recovery_operator(&recovery_witness(),&order);
+    assert!(matches!(
+        anchor.recover_orphan_after_external_isolation(&order,&forged,&witness),
+        Err(RemoteAnchorError::UntrustedRecovery)
+    ));
+    let altered=OrphanFenceRecoveryOrder {
+        nonce:[73;32], ..order
+    };
+    assert!(matches!(
+        anchor.recover_orphan_after_external_isolation(&altered,&operator,&witness),
+        Err(RemoteAnchorError::UntrustedRecovery)
+    ));
+    let foreign=OrphanFenceRecoveryOrder {
+        authority:AuthorityDomainId::new([91;32]).unwrap(),..order
+    };
+    assert!(matches!(
+        anchor.recover_orphan_after_external_isolation(&foreign,&operator,&witness),
+        Err(RemoteAnchorError::UntrustedRecovery)
+    ));
+    let stale=OrphanFenceRecoveryOrder{generation:order.generation+1,..order};
+    assert!(matches!(
+        anchor.recover_orphan_after_external_isolation(&stale,&operator,&witness),
+        Err(RemoteAnchorError::UntrustedRecovery)
+    ));
+    let dangerous=OrphanFenceRecoveryOrder{replacement_reader:key(42),..order};
+    let dangerous_op=sign_orphan_recovery_operator(&root(),&dangerous);
+    let dangerous_witness=sign_orphan_recovery_witness(&recovery_witness(),&dangerous);
+    assert!(matches!(
+        anchor.recover_orphan_after_external_isolation(
+            &dangerous,&dangerous_op,&dangerous_witness,
+        ),
+        Err(RemoteAnchorError::UntrustedRecovery)
+    ));
+    // Without both exact valid roles the fence remains, and CAS still fails.
+    assert!(anchor.inspect_orphan_fence().unwrap().is_some());
+    let (command,proof)=signed_revoke(cp,cp(9,10));
+    assert!(matches!(
+        anchor.advance_for(key(42),cp,cp(9,10),&command,&proof),
+        Err(RemoteAnchorError::Conflict)
+    ));
+
+    anchor.recover_orphan_after_external_isolation(
+        &order,&operator,&witness,
+    ).unwrap();
+    assert!(anchor.inspect_orphan_fence().unwrap().is_none());
+    assert!(matches!(
+        anchor.begin_write_for(key(41),cp,[74;32]),
+        Err(RemoteAnchorError::UntrustedPeer)
+    ));
+    assert!(matches!(
+        anchor.current_for(key(41)),
+        Err(RemoteAnchorError::UntrustedPeer)
+    ));
+    assert_eq!(anchor.current_for(key(49)).unwrap(),cp);
+    anchor.begin_write_for(key(49),cp,[75;32]).unwrap();
+    anchor.finish_write_for(key(49),cp,[75;32]).unwrap();
+    anchor.advance_for(key(42),cp,cp(9,10),&command,&proof).unwrap();
+    assert!(anchor.recover_orphan_after_external_isolation(
+        &order,&operator,&witness,
+    ).is_err());
+
+    // Same transaction stores a NONCE HASH, never the raw WRITE-FINISH
+    // capability. Losing just the process after commit is recoverable by
+    // opening with a newly provisioned reader identity.
+    drop(anchor);
+    let mut replacement=config();
+    replacement.reader=key(49);
+    assert!(matches!(
+        RemoteAnchorLedger::open(&path,config()),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
+    let reopened=RemoteAnchorLedger::open(&path,replacement).unwrap();
+    assert_eq!(reopened.current_for(key(49)).unwrap(),cp(9,10));
+    let db=Connection::open(&path).unwrap();
+    let (generation,nonce_hash):(i64,Vec<u8>)=db.query_row(
+        "SELECT generation,nonce_hash FROM w6_writer_recovery",
+        [],|r|Ok((r.get(0)?,r.get(1)?)),
+    ).unwrap();
+    assert_eq!(generation,1);
+    assert_eq!(nonce_hash,blake3::hash(&[72;32]).as_bytes());
+    assert_ne!(nonce_hash.as_slice(),&[72;32]);
+}
+
+#[test]
+fn stale_authority_process_cannot_serve_or_clear_old_fence_after_rotation() {
+    let dir=tempdir().unwrap();
+    let path=dir.path().join("anchor.sqlite");
+    let cp=cp(1,1);
+    let mut old_process=RemoteAnchorLedger::provision(&path,config(),cp).unwrap();
+    old_process.begin_write_for(key(41),cp,[121;32]).unwrap();
+    let mut maintenance=RemoteAnchorLedger::open(&path,config()).unwrap();
+    let observation=maintenance.inspect_orphan_fence().unwrap().unwrap();
+    let (order,operator,witness)=signed_recovery(observation,key(49));
+    maintenance.recover_orphan_after_external_isolation(
+        &order,&operator,&witness,
+    ).unwrap();
+    // Even if an old authority service missed its configuration update,
+    // revalidating durable reader identity makes every old process fail
+    // closed on GET/BEGIN/FINISH and signed CAS.
+    assert!(matches!(
+        old_process.current_for(key(41)),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
+    assert!(matches!(
+        old_process.begin_write_for(key(41),cp,[123;32]),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
+    assert!(matches!(
+        old_process.finish_write_for(key(41),cp,[121;32]),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
+    let (change,proof)=signed_revoke(cp,cp(2,2));
+    assert!(matches!(
+        old_process.advance_for(key(42),cp,cp(2,2),&change,&proof),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
+    maintenance.begin_write_for(key(49),cp,[124;32]).unwrap();
+    maintenance.finish_write_for(key(49),cp,[124;32]).unwrap();
+}
+
+#[test]
+fn same_operator_and_witness_root_must_fail_at_provisioning() {
+    let dir=tempdir().unwrap();
+    let mut wrong=config();
+    wrong.recovery_witness=wrong.operator;
+    assert!(matches!(
+        RemoteAnchorLedger::provision(&dir.path().join("authority.sqlite"),wrong,cp(1,1)),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
 }
