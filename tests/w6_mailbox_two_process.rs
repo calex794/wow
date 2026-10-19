@@ -269,6 +269,9 @@ async fn child_w6_mailbox_receiver_process() {
             },
         };
         let result = receive_authenticated_iroh_mailbox(&connection, ctx).await;
+        // Keep the exact failing ingress variant visible from the separate
+        // OS child; an unexplained result must never be treated as success.
+        eprintln!("W6_CROSS_PROCESS_RESULT mode={mode} attempt={attempt} result={result:?}");
         match attempt {
             0 => assert!(
                 matches!(result, Err(IrohIngressError::Enrollment(_))),
@@ -279,14 +282,14 @@ async fn child_w6_mailbox_receiver_process() {
                     result,
                     Ok(IngressOutcome::MailboxStored(PutStatus::Stored))
                 ),
-                "authorized ciphertext must commit exactly once"
+                "authorized ciphertext must commit exactly once: {result:?}"
             ),
             _ => assert!(
                 matches!(
                     result,
                     Ok(IngressOutcome::MailboxStored(PutStatus::Duplicate))
                 ),
-                "same ID and exact sealed bytes must be idempotent"
+                "same ID and exact sealed bytes must be idempotent: {result:?}"
             ),
         }
         assert_eq!(
