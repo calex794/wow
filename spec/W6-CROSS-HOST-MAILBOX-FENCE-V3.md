@@ -17,7 +17,10 @@ ALPN: `akula-wow/w6-external-anchor-lab/3`. No v2 downgrade.
 
 * GET (op 1) and signed operator CAS (op 2) are otherwise unchanged.
 * Begin writer (op 3), finish writer (op 4): exactly
-  `opcode[1] || expected_revision+digest[40] || nonce[32]` (73 bytes).
+  `opcode[1] || pinned_authority_id[32] || expected_revision+digest[40] || nonce[32]`
+  (105 bytes). The server compares that ID against its own pinned
+  configuration **BEFORE** touching SQLite, returning DENIED on mismatch.
+  Echo-only verification after a state-changing RPC would be unsafe.
 * Success: `STATUS_OK[1] || pinned_authority_id[32] || checkpoint[40]` (73 bytes).
   Other statuses are one byte; CAS/GET/WRITE responses must match the
   client's independently pinned authority ID and the expected checkpoint.
