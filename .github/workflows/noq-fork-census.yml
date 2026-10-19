@@ -1,0 +1,63 @@
+name: NOQ fork census and 17-part branch audit
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-source:
+    name: Provenance / all candidate repositories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Verify GitHub source and direct parent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 research/noq-forks/audit.py inventory --out audit-output
+          test -s audit-output/inventory.json
+          test -s audit-output/inventory.md
+      - name: Archive provenance and incomplete-discovery count
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: noq-forks-source-verified
+          path: audit-output/
+          if-no-files-found: error
+
+  scan-branches:
+    name: "Branch and SHA audit part ${{ matrix.part }}/17"
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: verify-source
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Enumerate every public Git branch and compare prioritized SHA heads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 research/noq-forks/audit.py part --part ${{ matrix.part }} --out audit-output
+          test -s "audit-output/part-$(printf '%02d' ${{ matrix.part }}).json"
+      - name: Archive this part's branch census and comparison evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: noq-forks-part-${{ matrix.part }}
+          path: audit-output/
+          if-no-files-found: warn
