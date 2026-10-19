@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 
 UPSTREAM = "n0-computer/noq"
 PARTS = 17
-MAX_DIFFS = 12
+MAX_DIFFS = 8
 SPECIAL = [
     "HeikoBornholdt/noq", "mp0rta/noq", "rayfish/noq",
     "saronic-technologies/noq", "moq-dev/noq", "emrul/noq",
@@ -88,9 +88,11 @@ def sort_for_review(names):
     return head + [n for n in names if n not in head]
 
 def shard(names, part):
-    """Round robin priority order: every part gets at least one source."""
+    """Contiguous balanced shards: first parts hold priority fork families."""
     ordered = sort_for_review(names)
-    return [n for i, n in enumerate(ordered) if i % PARTS == (part - 1)]
+    left = ((part - 1) * len(ordered)) // PARTS
+    right = (part * len(ordered)) // PARTS
+    return ordered[left:right]
 
 def source_record(api, name):
     doc = api.get("/repos/" + name)
