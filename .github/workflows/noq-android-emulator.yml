@@ -1,0 +1,89 @@
+name: NOQ combined — Android emulator QUIC regressions
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/noq-android-emulator.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  emulator-regressions:
+    name: Android x86_64 emulator — exact combined QUIC tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      NOQ_SHA: "538346e8fb300598991de560566289121e9528e9"
+      ANDROID_TARGET: "x86_64-linux-android"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.91"
+          targets: x86_64-linux-android
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779
+        id: ndk
+        with:
+          ndk-version: r25c
+          add-to-path: true
+      - name: Install exact cargo-ndk helper
+        run: |
+          set -euo pipefail
+          cargo install --locked --version 4.1.2 cargo-ndk
+      - name: Checkout exact combined noq SHA
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git noq
+          git -C noq checkout --detach "$NOQ_SHA"
+          test "$(git -C noq rev-parse HEAD)" = "$NOQ_SHA"
+          test -z "$(git -C noq status --porcelain)"
+      - name: Cross-compile the actual noq-proto test executable for Android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        working-directory: noq
+        run: |
+          set -euo pipefail
+          cargo ndk --target "$ANDROID_TARGET" test --locked --no-run -p noq-proto --lib
+          test -z "$(git status --porcelain)"
+          find "target/$ANDROID_TARGET/debug/deps" -maxdepth 1 -type f -name 'noq_proto-*' -perm /111 -print
+      - name: Enable KVM acceleration for Android emulator if available
+        run: |
+          set -euo pipefail
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+      - name: Run 4 regression tests inside the emulator, not on Linux host
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -netfast -no-metrics
+          script: |
+            set -euo pipefail
+            adb wait-for-device
+            target="noq/target/x86_64-linux-android/debug/deps"
+            binary=$(find "$target" -maxdepth 1 -type f -name 'noq_proto-*' -perm /111 -print -quit)
+            test -n "$binary"
+            adb push "$binary" /data/local/tmp/noq_proto_gate
+            adb shell chmod 755 /data/local/tmp/noq_proto_gate
+            for case in               tests::multipath::backup_path_keepalive_not_suppressed_by_incoming_ping               tests::multipath::regression_locally_abandoned_unseen_path_discarded               connection::streams::state::tests::stopped_reset_flow_control               connection::streams::state::tests::reset_stopped_flow_control; do
+              echo "ANDROID EMULATOR RUN: $case"
+              adb shell "/data/local/tmp/noq_proto_gate $case --exact --nocapture" | tee /tmp/noq-android-case.log
+              grep -q 'test result: ok. 1 passed; 0 failed' /tmp/noq-android-case.log
+            done
+            adb shell rm -f /data/local/tmp/noq_proto_gate
+      - name: Record scope
+        run: |
+          printf '%s\n'             "PASS: 4 combined noq protocol regressions executed as native Android x86_64 test binary on API35 emulator."             "Does not prove arm64 handset network migration, real Android Akula app, or file custody."             >> "$GITHUB_STEP_SUMMARY"
