@@ -20,11 +20,16 @@ isolation.
 
 ## Privileged-only recovery protocol
 
-The authority service is brought into an operator-controlled maintenance
-window and all old writer processes are independently isolated. In the
-laboratory we can SIGKILL the authority child; in production that alone
-does NOT kill every writer on every other host. Network ACL removal is not
-sufficient if the writer already holds a local SQLite transaction.
+All authority service processes, **including earlier protocol binaries
+that do not enforce the new reader configuration checks**, are stopped
+and prevented from reopening the SQLite database. The authority enters
+an operator-controlled maintenance window. All old writer processes
+are independently isolated as well. In the laboratory we can SIGKILL
+the authority child; in production that alone does NOT kill every writer
+on every other host. Network ACL removal is not sufficient if the writer
+already holds a local SQLite transaction. A v3 binary still running with
+cached old reader credentials would undermine the rotation even if the
+new code rejects them; external process isolation is indispensable.
 
 The authority's *local privileged* `inspect_orphan_fence()` returns the
 canonical, durable pinned domain, authenticated old reader ID, checkpoint,
