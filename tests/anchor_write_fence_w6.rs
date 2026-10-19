@@ -21,6 +21,7 @@ fn config()->AnchorServicePolicy {
     AnchorServicePolicy {
         reader:key(41),administrator:key(42),
         operator:root().verifying_key(),authority:domain(),
+        recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
     }
 }
 fn cp(revision:u64,value:u8)->PolicyCheckpoint {
