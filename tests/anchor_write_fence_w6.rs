@@ -20,7 +20,7 @@ fn key(n:u8)->EndpointId { SecretKey::from_bytes(&[n;32]).public() }
 fn domain()->AuthorityDomainId { AuthorityDomainId::new([90;32]).unwrap() }
 fn config()->AnchorServicePolicy {
     AnchorServicePolicy {
-        reader:key(41),administrator:key(42),
+        reader:key(41),additional_readers:[None;4],administrator:key(42),
         operator:root().verifying_key(),authority:domain(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
     }
