@@ -171,6 +171,17 @@ def socket_patch(content: str) -> str:
     }""",
         "apply noq limits before bind",
     )
+    # The upstream Roha socket unit-test fixtures also construct
+    # StaticConfig directly; opt-in limits must default to None there.
+    fixture = "            transport_config: QuicTransportConfig::default(),\\n"
+    if content.count(fixture) != 2:
+        raise ValueError(
+            f"expected two Roha test fixtures, found {content.count(fixture)}"
+        )
+    content = content.replace(
+        fixture,
+        fixture + "            server_incoming_limits: None,\\n",
+    )
     return content
 
 
