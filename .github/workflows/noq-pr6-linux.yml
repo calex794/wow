@@ -1,0 +1,50 @@
+name: NOQ PR6 independent Linux source acceptance
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/noq-pr6-linux.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-pr-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PR_HEAD: "83e1f9ecbb58703271bff5c956c94855c3545dbe"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Checkout exact noq PR6 source revision, not a moving branch
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git pr-noq
+          git -C pr-noq checkout --detach "$PR_HEAD"
+          test "$(git -C pr-noq rev-parse HEAD)" = "$PR_HEAD"
+          test -z "$(git -C pr-noq status --porcelain)"
+      - name: Rustfmt — full noq workspace
+        working-directory: pr-noq
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt
+          cargo fmt --all -- --check
+      - name: All pinned noq-proto library tests (not just one regression)
+        working-directory: pr-noq
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib
+      - name: Clippy — noq-proto library
+        working-directory: pr-noq
+        run: |
+          set -euo pipefail
+          rustup component add clippy
+          cargo clippy --locked -p noq-proto --lib -- -D warnings
+      - name: Independent CI summary
+        run: |
+          printf '%s\n'             "Independent Linux rustfmt + full noq-proto lib tests + clippy passed on PR6 SHA $PR_HEAD."             "Roha locked integration and cross-platform checks are still pending."             >> "$GITHUB_STEP_SUMMARY"
