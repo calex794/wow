@@ -28,6 +28,7 @@ use ed25519_dalek::VerifyingKey;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::{Connection, presets}};
 use rusqlite::{params, Connection as Sqlite, OpenFlags, TransactionBehavior};
 use std::{
+    fs::OpenOptions,
     path::Path,
     sync::{Mutex, mpsc::{self, Receiver, SyncSender}},
     thread,
@@ -56,6 +57,7 @@ const IO_BUDGET: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub enum RemoteAnchorError {
     Db(rusqlite::Error),
+    Io(std::io::Error),
     AlreadyProvisioned,
     NotProvisioned,
     ConfigurationMismatch,
@@ -69,6 +71,9 @@ pub enum RemoteAnchorError {
 }
 impl From<rusqlite::Error> for RemoteAnchorError {
     fn from(e: rusqlite::Error) -> Self { Self::Db(e) }
+}
+impl From<std::io::Error> for RemoteAnchorError {
+    fn from(e: std::io::Error) -> Self { Self::Io(e) }
 }
 
 /// These TLS identities MUST originate from local protected operator config,
@@ -129,7 +134,19 @@ impl RemoteAnchorLedger {
         path:&Path, policy:AnchorServicePolicy, initial:PolicyCheckpoint,
     )->Result<Self,RemoteAnchorError>{
         let _=to_int(initial.revision)?;
-        let mut sql=Sqlite::open(path)?;
+        // IMPORTANT: never run CREATE TABLE/ALTER on any existing authority
+        // file. Earlier logic made an old v2 database look v3-compatible
+        // even though reprovision ultimately returned AlreadyProvisioned.
+        // create_new is OS-atomic; even an empty/partial former authority
+        // requires a separate reviewed operator recovery ceremony.
+        let reserved=match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file)=>file,
+            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists =>
+                return Err(RemoteAnchorError::AlreadyProvisioned),
+            Err(e)=>return Err(RemoteAnchorError::Io(e)),
+        };
+        drop(reserved);
+        let mut sql=Sqlite::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         Self::schema(&mut sql)?;
         let tx=sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing:i64=tx.query_row(
