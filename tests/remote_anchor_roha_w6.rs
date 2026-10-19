@@ -13,7 +13,7 @@ use akula_wire_lab::remote_anchor_w6::{
     RemoteAnchorLedger,
 };
 use akula_wire_lab::anchor_admission_w6::{
-    AnchorAdmission,AnchorAdmissionPolicy,anchor_transport_config,
+    AnchorAdmission,AnchorAdmissionPolicy,anchor_incoming_limits,anchor_transport_config,
 };
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
@@ -79,6 +79,7 @@ impl Server {
         let endpoint=Endpoint::builder(presets::Minimal)
             .clear_ip_transports().bind_addr("127.0.0.1:0").unwrap()
             .transport_config(anchor_transport_config())
+            .server_incoming_limits(anchor_incoming_limits())
             .secret_key(sec(43))
             .alpns(vec![ANCHOR_ALPN.to_vec()])
             .bind().await.unwrap();
