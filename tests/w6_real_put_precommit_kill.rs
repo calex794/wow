@@ -2,7 +2,7 @@
 //! The fault marker is emitted after INSERT but before tx.commit().
 #![cfg(all(target_os = "linux", feature = "mailbox-put-fault-test", debug_assertions))]
 use akula_wire_lab::mailbox_w5::{Mailbox, MailboxAdmission, MailboxLimits, MailError, PutStatus};
-use std::{fs,process::{Command,Child,Stdio},path::Path,time::{Duration,Instant},thread};
+use std::{process::{Command,Child,Stdio},path::Path,time::{Duration,Instant},thread};
 use tempfile::tempdir;
 const ENV:&str="STAYA_MAILBOX_PRECOMMIT_CHILD";
 fn id(x:u8)->[u8;16]{[x;16]}
