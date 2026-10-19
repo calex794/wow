@@ -9,6 +9,11 @@ license = "MIT"
 name = "akula_wire_lab"
 path = "src/lib.rs"
 
+[[bin]]
+name = "wow_two_host_probe"
+path = "src/bin/wow_two_host_probe.rs"
+required-features = ["iroh-transport"]
+
 [features]
 default = []
 iroh-transport = ["dep:iroh", "dep:tokio"]
