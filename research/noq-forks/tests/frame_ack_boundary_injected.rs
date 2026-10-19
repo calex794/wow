@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod fork_audit_ack_range_boundary {
     use super::{read_ack_blocks, Bytes};
+    use alloc::vec::Vec;
 
     #[test]
     fn huge_varint_count_with_no_ranges_returns_error() {
