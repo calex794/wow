@@ -11,7 +11,7 @@ import pathlib
 import sys
 import tomllib
 
-ROHA_REV = "a42ad5aef1626df80d39398e05dac6e362bf6e49"
+ROHA_REV = "396a6006b15e4c3a63e111a720b84416fe6220f1"
 NOQ_REV = "2eabf9895d40c263aa3369afd66efcf4a5d95056"
 EXPECTED = {
     "iroh": ("roha", "1.3.0", ROHA_REV),
