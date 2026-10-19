@@ -50,6 +50,7 @@ fn lookup<'a>(b:&'a EndpointRouteBinding)->EnrollmentLookup<'a>{
 fn policy_config()->AnchorServicePolicy{
     AnchorServicePolicy{
         reader:sec(41).public(),
+        additional_readers:[None;4],
         administrator:sec(42).public(),
         operator:root().verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
@@ -262,7 +263,7 @@ async fn provisioning_is_explicit_and_endpoint_keys_cannot_be_replaced_by_db(){
         Err(RemoteAnchorError::AlreadyProvisioned)
     ));
     let wrong=AnchorServicePolicy{
-        reader:sec(45).public(),administrator:sec(46).public(),
+        reader:sec(45).public(),additional_readers:[None;4],administrator:sec(46).public(),
         operator:root().verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:current_domain(),
@@ -360,7 +361,7 @@ async fn pinned_offline_operator_key_cannot_be_replaced_at_anchor_reopen() {
     let db=dir.path().join("remote.sqlite");
     provision(&db,cp(1,2));
     let wrong=AnchorServicePolicy {
-        reader:sec(41).public(),administrator:sec(42).public(),
+        reader:sec(41).public(),additional_readers:[None;4],administrator:sec(42).public(),
         operator:SigningKey::from_bytes(&[221;32]).verifying_key(),
         recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:current_domain(),
