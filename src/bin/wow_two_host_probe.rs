@@ -133,7 +133,7 @@ mod probe {
             .bind_addr(addr)?
             .secret_key(key)
             .alpns(vec![ALPN.to_vec()])
-            .server_incoming_limits(ServerIncomingLimits::new(1, 4096, 4096)?)
+            .server_incoming_limits(ServerIncomingLimits::new(1, 4096, 4096).map_err(|_| invalid("invalid incoming limits"))?)
             .bind()
             .await?;
         let actual = *server.bound_sockets().iter()
