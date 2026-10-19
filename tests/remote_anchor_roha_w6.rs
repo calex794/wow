@@ -467,3 +467,53 @@ async fn cross_authority_replay_rejected_over_real_quic_even_with_same_tls_key()
     first_service.stop().await;
     second_service.stop().await;
 }
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn real_quic_independent_writer_keys_share_global_fence_and_revoke() {
+    let dir=tempdir().unwrap();
+    let db=dir.path().join("multi-reader.sqlite");
+    let old=cp(1,33);
+    let next=cp(2,34);
+    let mut pinned=policy_config();
+    pinned.additional_readers[0]=Some(sec(49).public());
+    pinned.additional_readers[1]=Some(sec(50).public());
+    drop(RemoteAnchorLedger::provision(&db,pinned,old).unwrap());
+    let service=Server::start_with_policy(&db,pinned).await;
+    let a=client(41,service.addr());
+    let b=client(49,service.addr());
+    let c=client(50,service.addr());
+    let admin=client(42,service.addr());
+    let stranger=client(51,service.addr());
+    assert_eq!(a.current().unwrap(),old);
+    assert_eq!(b.current().unwrap(),old);
+    assert_eq!(c.current().unwrap(),old);
+    assert_anchor_error(stranger.current(),AnchorError::InvalidAttestation);
+    // Real, separate TLS/EndpointId keys for A, B and C. A's fence
+    // prevents B/C from entering even when they know the same checkpoint.
+    a.begin_write_fence(old,[201;32]).unwrap();
+    assert_anchor_error(
+        b.begin_write_fence(old,[202;32]),AnchorError::Conflict
+    );
+    assert_anchor_error(
+        c.finish_write_fence(old,[201;32]),AnchorError::Conflict
+    );
+    assert_anchor_error(
+        authorized_cas(&admin,old,next),AnchorError::Conflict
+    );
+    a.finish_write_fence(old,[201;32]).unwrap();
+    b.begin_write_fence(old,[203;32]).unwrap();
+    assert_anchor_error(
+        a.begin_write_fence(old,[204;32]),AnchorError::Conflict
+    );
+    b.finish_write_fence(old,[203;32]).unwrap();
+    c.begin_write_fence(old,[205;32]).unwrap();
+    c.finish_write_fence(old,[205;32]).unwrap();
+    authorized_cas(&admin,old,next).unwrap();
+    for reader in [&a,&b,&c] {
+        assert_anchor_error(
+            reader.begin_write_fence(old,[206;32]),AnchorError::Conflict
+        );
+        assert_eq!(reader.current().unwrap(),next);
+    }
+    service.stop().await;
+}
