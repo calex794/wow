@@ -95,7 +95,9 @@ impl AnchorAdmission {
     }
     pub fn available_slots(&self)->usize{self.slots.available_permits()}
     /// The permit covers TLS handshake, one request, response and ACK.
-    /// Returns false if incoming was dropped BEFORE its handshake is polled.
+    /// QUIC Retry (address validation) is requested before any TLS work.
+    /// Returns false for a rejected or retried incoming attempt; retried
+    /// attempts must come back with a valid transport validation token.
     pub fn dispatch(
         &self,incoming:Incoming,service:Arc<Mutex<RemoteAnchorLedger>>,
     )->bool{
@@ -103,6 +105,14 @@ impl AnchorAdmission {
             drop(incoming);
             return false;
         };
+        if !incoming.remote_addr_validated() {
+            // QUIC Retry is the fork's built-in stateless address
+            // validation mechanism; no user-controlled IP-based session
+            // state or heap allocation is introduced here. The retry
+            // packet is sent BEFORE any application TLS worker is spawned.
+            let _=incoming.retry();
+            return false;
+        }
         let policy=self.policy;
         tokio::spawn(async move {
             let _permit=permit;
