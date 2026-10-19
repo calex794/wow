@@ -397,3 +397,91 @@ async fn burst_of_genuine_quic_initials_obeys_pending_cap_then_recovers() {
     client.close().await;
     server.close().await;
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_authenticated_connects_preserve_capacity_and_report_latency() {
+    // Controlled local endurance regression: a single endpoint reconnects
+    // repeatedly over real Roha/noq QUIC. The test NEVER targets a WAN
+    // listener. Resource figures are observed, not universal DoS thresholds.
+    const ROUNDS: usize = 16;
+    let server = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .secret_key(key(43))
+        .alpns(vec![ANCHOR_ALPN.to_vec()])
+        .transport_config(anchor_transport_config())
+        .server_incoming_limits(ServerIncomingLimits::new(2, 4096, 8192).unwrap())
+        .bind()
+        .await
+        .unwrap();
+    let client = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .secret_key(key(92))
+        .bind()
+        .await
+        .unwrap();
+    assert!(
+        server.bound_sockets().iter().all(|addr| addr.ip().is_loopback())
+            && client.bound_sockets().iter().all(|addr| addr.ip().is_loopback()),
+        "W7 must only use loopback transports"
+    );
+
+    let server_addr = server.addr();
+    let rss_before = linux_rss_kib();
+    let cpu_before = linux_cpu_ticks();
+    let started = Instant::now();
+    let mut latency_ms = Vec::with_capacity(ROUNDS);
+
+    for _ in 0..ROUNDS {
+        // The JoinHandle owns the real authenticated client connection
+        // until after the server has accepted TLS, avoiding the false
+        // peer-abort test failure discovered in the original W6 lab.
+        let client_ep = client.clone();
+        let addr = server_addr.clone();
+        let round_start = Instant::now();
+        let connecting = tokio::spawn(async move {
+            client_ep.connect(addr, ANCHOR_ALPN).await
+        });
+        let pending = tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("server blocked a legitimate Initial")
+            .expect("server closed during reconnect test");
+        let accepted = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("server handshake exceeded deadline")
+            .expect("authenticated incoming handshake failed");
+        assert_eq!(accepted.remote_id(), key(92).public());
+        let connected = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .expect("client handshake exceeded deadline")
+            .expect("client connection task panicked")
+            .expect("client QUIC handshake failed");
+        assert_eq!(connected.remote_id(), key(43).public());
+
+        latency_ms.push(round_start.elapsed().as_millis());
+        drop(accepted);
+        drop(connected);
+    }
+
+    latency_ms.sort_unstable();
+    let p50 = latency_ms[(ROUNDS - 1) / 2];
+    let p95 = latency_ms[(ROUNDS * 95).div_ceil(100) - 1];
+    let wall_ms = started.elapsed().as_millis();
+    let rss_after = linux_rss_kib();
+    let cpu_delta = cpu_before
+        .zip(linux_cpu_ticks())
+        .map(|(before, after)| after.saturating_sub(before));
+    eprintln!(
+        "W7_AUTHENTICATED_RECONNECT iterations={ROUNDS} passed={ROUNDS} \
+         p50_ms={p50} p95_ms={p95} wall_ms={wall_ms} \
+         cpu_ticks_delta={cpu_delta:?} rss_kib_before={rss_before:?} \
+         rss_kib_after={rss_after:?} bind=loopback"
+    );
+
+    client.close().await;
+    server.close().await;
+}
