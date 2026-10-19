@@ -25,7 +25,7 @@ use crate::peer_enrollment_w6::{
     AnchorError, AuthorityDomainId, PolicyCheckpoint, TrustedPolicyAnchor, SIGNED_ENROLLMENT_BYTES,
     SIGNED_TRANSITION_PROOF_BYTES, verify_signed_anchor_transition,
 };
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::{Connection, presets}};
 use rusqlite::{params, Connection as Sqlite, OpenFlags, TransactionBehavior};
 use std::{
@@ -65,6 +65,8 @@ pub enum RemoteAnchorError {
     AlreadyProvisioned,
     NotProvisioned,
     ConfigurationMismatch,
+    /// Recovery cannot proceed without two role-separated offline signatures.
+    UntrustedRecovery,
     UntrustedPeer,
     UntrustedOperatorTransition,
     Conflict,
@@ -93,6 +95,11 @@ pub struct AnchorServicePolicy {
     /// The corresponding private key must NEVER run on this anchor server,
     /// W6 relay, or the TLS-administrator client.
     pub operator: VerifyingKey,
+    /// Independent protected offline infrastructure-fencing witness.
+    /// A signature is an operator-controlled attestation of physical
+    /// isolation, NOT proof that the OS has stopped a remote process.
+    /// Never store its private key on the authority service.
+    pub recovery_witness: VerifyingKey,
 }
 fn to_int(revision:u64) -> Result<i64,RemoteAnchorError> {
     if revision>i64::MAX as u64 {return Err(RemoteAnchorError::Protocol);}
@@ -121,12 +128,77 @@ struct StoredAnchorRow {
     administrator: Vec<u8>,
     operator: Vec<u8>,
     authority: Vec<u8>,
+    recovery_witness: Vec<u8>,
     checkpoint: PolicyCheckpoint,
 }
 struct WriterFenceRow {
     peer: Vec<u8>,
     nonce: Vec<u8>,
     checkpoint: PolicyCheckpoint,
+}
+
+/// PRIVILEGED LOCAL-ONLY recovery envelope: must never be exposed as an
+/// unauthenticated network RPC or logged with its raw nonce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrphanFenceRecoveryOrder {
+    pub authority: AuthorityDomainId,
+    pub previous_reader: EndpointId,
+    pub replacement_reader: EndpointId,
+    pub checkpoint: PolicyCheckpoint,
+    pub nonce: [u8;32],
+    pub generation: u64,
+}
+
+/// The observed orphan information is read only from the authority's
+/// independently trusted SQLite ledger, not from a network-supplied digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrphanFenceInspection {
+    pub authority: AuthorityDomainId,
+    pub reader: EndpointId,
+    pub checkpoint: PolicyCheckpoint,
+    /// Treat as secret. Copy only into an operator-controlled recovery order.
+    pub nonce: [u8;32],
+    pub next_generation: u64,
+}
+
+const OPERATOR_RECOVERY_DOMAIN: &[u8] =
+    b"Akula/WOW/W6/orphan-fence/rotate-operator/v1\0";
+const WITNESS_RECOVERY_DOMAIN: &[u8] =
+    b"Akula/WOW/W6/orphan-fence/physical-isolation-witness/v1\0";
+
+fn recovery_message(domain:&[u8],order:&OrphanFenceRecoveryOrder)->Vec<u8>{
+    let mut bytes=Vec::with_capacity(domain.len()+32+32+32+40+32+8);
+    bytes.extend_from_slice(domain);
+    bytes.extend_from_slice(order.authority.as_bytes());
+    bytes.extend_from_slice(order.previous_reader.as_bytes());
+    bytes.extend_from_slice(order.replacement_reader.as_bytes());
+    bytes.extend_from_slice(&checkpoint_bytes(order.checkpoint));
+    bytes.extend_from_slice(&order.nonce);
+    bytes.extend_from_slice(&order.generation.to_be_bytes());
+    bytes
+}
+fn verify_recovery_proof(
+    signer:&VerifyingKey, domain:&[u8], order:&OrphanFenceRecoveryOrder,
+    signature:&[u8],
+)->Result<(),RemoteAnchorError>{
+    let signature=Signature::from_slice(signature)
+        .map_err(|_|RemoteAnchorError::UntrustedRecovery)?;
+    signer.verify(&recovery_message(domain,order),&signature)
+        .map_err(|_|RemoteAnchorError::UntrustedRecovery)
+}
+/// Call ONLY in the offline operator's signing environment. The signing
+/// key must not be deployed to the authority or the writer.
+pub fn sign_orphan_recovery_operator(
+    key:&SigningKey,order:&OrphanFenceRecoveryOrder,
+)->[u8;64]{
+    key.sign(&recovery_message(OPERATOR_RECOVERY_DOMAIN,order)).to_bytes()
+}
+/// Call ONLY in the separately trusted physical isolation witness, after
+/// independently verifying the old writer and authority are fenced/stopped.
+pub fn sign_orphan_recovery_witness(
+    key:&SigningKey,order:&OrphanFenceRecoveryOrder,
+)->[u8;64]{
+    key.sign(&recovery_message(WITNESS_RECOVERY_DOMAIN,order)).to_bytes()
 }
 
 pub struct RemoteAnchorLedger {
