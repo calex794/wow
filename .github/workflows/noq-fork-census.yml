@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - "audit/noq-forks-17parts-*"
+    paths:
+      - "research/noq-forks/audit.py"
+      - "research/noq-forks/deep_git.py"
+      - "research/noq-forks/candidates.json"
+      - ".github/workflows/noq-fork-census.yml"
   workflow_dispatch:
 
 concurrency:
