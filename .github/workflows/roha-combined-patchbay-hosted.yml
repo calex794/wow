@@ -1,0 +1,71 @@
+name: Roha #12 — hosted virtual-network switch acceptance
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/roha-combined-patchbay-hosted.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-wan-and-switch:
+    name: Roha #12 — simulated peers, no-WAN and v4 path switch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      ROHA_SHA: "554d5202b63e32b8a79156f7da2807d0f4859e4b"
+      NOQ_SHA: "538346e8fb300598991de560566289121e9528e9"
+      PATCHBAY_LOG: "debug"
+      RUST_LOG: "info"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.91"
+      - name: Ensure source and no-WAN test scope are exact
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/roha.git roha
+          git -C roha checkout --detach "$ROHA_SHA"
+          test "$(git -C roha rev-parse HEAD)" = "$ROHA_SHA"
+          grep -F -q 'name = "noq"' roha/Cargo.lock
+          grep -F -q "$NOQ_SHA" roha/Cargo.lock
+          test -z "$(git -C roha status --porcelain)"
+      - name: Enable virtual-network user namespaces if supported by host
+        run: |
+          set -euo pipefail
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
+          unshare -Ur true
+      - name: Compile Patchbay test binary from locked source
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          cargo test --locked -p iroh --test patchbay --no-run
+          test -z "$(git status --porcelain)"
+      - name: Simulate two peers through repeated LAN switches without external WAN
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          cargo test --locked -p iroh --test patchbay network_switch_no_wan -- --nocapture --test-threads=1
+      - name: Simulate a client IPv4 uplink change with continuing transfer
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          cargo test --locked -p iroh --test patchbay switch_client_v4_to_v4 -- --nocapture --test-threads=1
+      - name: Keep dependency lock unchanged
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- Cargo.lock
+          test -z "$(git status --porcelain)"
+      - name: State exact evidence and limits
+        run: |
+          printf '%s\n'             "Roha #12 $ROHA_SHA + combined noq $NOQ_SHA passed hosted simulated network switches."             "This is not real Windows/Android or Akula data-custody acceptance."             >> "$GITHUB_STEP_SUMMARY"

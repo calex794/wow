@@ -1,0 +1,67 @@
+name: NOQ abandoned-unseen-path — pinned RED and candidate GREEN
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - "research/noq-forks/tests/multipath_abandon_injected.rs"
+      - ".github/workflows/noq-fork-abandon.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  abandoned-path-reclamation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PINNED_NOQ: "2eabf9895d40c263aa3369afd66efcf4a5d95056"
+      SOURCE_PATCH: "1acb3998df53a7ea28886f557368082fa7eb541f"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Checkout only exact pinned baseline
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git pinned-noq
+          git -C pinned-noq checkout --detach "$PINNED_NOQ"
+          test "$(git -C pinned-noq rev-parse HEAD)" = "$PINNED_NOQ"
+      - name: Inject regression into temporary baseline tests
+        run: |
+          set -euo pipefail
+          cat research/noq-forks/tests/multipath_abandon_injected.rs >> pinned-noq/noq-proto/src/tests/multipath.rs
+          git -C pinned-noq diff --check
+      - name: RED — verify local abandonment does not reclaim an unseen path
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked -p noq-proto --lib fork_audit_abandoned_unseen_path_must_be_discarded -- --nocapture > /tmp/noq-abandon-red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/noq-abandon-red.log
+          test "$status" -ne 0
+          grep -F "fork audit: locally abandoned unseen path was never discarded" /tmp/noq-abandon-red.log
+          echo "Original pinned source: independent regression RED observed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Isolate upstream-fork candidate source patch by its exact commit SHA
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          git restore --staged --worktree noq-proto/src/tests/multipath.rs
+          git fetch --no-tags --depth=2 https://github.com/HeikoBornholdt/noq.git "$SOURCE_PATCH"
+          test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_PATCH"
+          git cherry-pick --no-commit FETCH_HEAD
+          git diff --cached --check
+          cat ../research/noq-forks/tests/multipath_abandon_injected.rs >> noq-proto/src/tests/multipath.rs
+          git diff --check
+          grep -F "self_drain_armed" noq-proto/src/connection/paths.rs
+      - name: GREEN — local unseen path and existing discard regression
+        working-directory: pinned-noq
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib fork_audit_abandoned_unseen_path_must_be_discarded -- --nocapture
+          cargo test --locked -p noq-proto --lib regression_discarded_path_stats_are_up_to_date -- --nocapture
+          printf '%s\n'             'Local unseen-path RED then candidate GREEN on pinned version.'             'No change to calex794/noq main or to deployed Akula.'             >> "$GITHUB_STEP_SUMMARY"

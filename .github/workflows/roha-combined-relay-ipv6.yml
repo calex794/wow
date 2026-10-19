@@ -1,0 +1,88 @@
+name: Roha combined noq — relay and IPv6 regression matrix
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/roha-combined-relay-ipv6.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay-and-switch:
+    name: Pinned Roha — NAT, relay, IPv6 and restart
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ROHA_SHA: "554d5202b63e32b8a79156f7da2807d0f4859e4b"
+      NOQ_SHA: "538346e8fb300598991de560566289121e9528e9"
+      PATCHBAY_LOG: warn
+      RUST_LOG: warn
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.91"
+      - name: Checkout exact combined Roha branch and verify source pin
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/roha.git roha
+          git -C roha checkout --detach "$ROHA_SHA"
+          test "$(git -C roha rev-parse HEAD)" = "$ROHA_SHA"
+          grep -F -q "$NOQ_SHA" roha/Cargo.lock
+          test -z "$(git -C roha status --porcelain)"
+      - name: Enable Linux unprivileged user namespaces
+        run: |
+          set -euo pipefail
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
+          unshare -Ur true
+      - name: Compile all Patchbay integration tests once
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          cargo test --locked -p iroh --test patchbay --no-run
+      - name: Exercise relay fallback, reconnect, IPv6 and lost uplinks
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/patchbay-testlogs"
+          failures=0
+          for name in               relay_connect_ipv4               relay_connect_ipv6               relay_udp_blocked_both               relay_reconnect_link_outage_client               relay_reconnect_relay_restart               switch_client_v4_to_v6               switch_server_v6_to_v4               link_outage_recovery_client               holepunch_simple; do
+            echo "=== $name ==="
+            logfile="$RUNNER_TEMP/patchbay-testlogs/$name.log"
+            if cargo test --locked -p iroh --test patchbay "$name" -- --test-threads=1 >"$logfile" 2>&1; then
+              if grep -q 'test result: ok. 1 passed; 0 failed' "$logfile"; then
+                echo "PASS $name"
+              else
+                echo "FAIL $name: zero/multiple/ignored tests instead of one successful case"
+                tail -n 50 "$logfile"
+                failures=$((failures + 1))
+              fi
+            else
+              echo "FAIL $name: test command failed"
+              tail -n 70 "$logfile"
+              failures=$((failures + 1))
+            fi
+          done
+          echo "Patchbay selected cases: 9, failed: $failures" >> "$GITHUB_STEP_SUMMARY"
+          test "$failures" -eq 0
+          git diff --exit-code -- Cargo.lock
+      - name: State acceptance scope
+        run: |
+          echo "Selected Patchbay relay/IPv6/uplink cases passed on Roha $ROHA_SHA with combined noq $NOQ_SHA." >> "$GITHUB_STEP_SUMMARY"
+          echo "This is virtual-network testing; real Android handover and Akula file custody remain separate gates." >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive per-case logs for failures
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: selected-patchbay-logs
+          path: ${{ runner.temp }}/patchbay-testlogs/*.log
+          retention-days: 7
+          if-no-files-found: ignore

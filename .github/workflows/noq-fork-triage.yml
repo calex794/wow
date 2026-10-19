@@ -1,0 +1,64 @@
+name: NOQ full-DAG deduplication and patch-review queue
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - "research/noq-forks/aggregate_deep.py"
+      - "research/noq-forks/tests/**"
+      - ".github/workflows/noq-fork-triage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  triage-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVIDENCE_RUN: "39256244357"
+      EVIDENCE_HEAD: "560ce5da5c89becb2bf77fcf7a84db1af1e9f605"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Validate triage code with synthetic full-coverage fixtures
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s research/noq-forks/tests -p 'test_*.py' -v
+      - name: Verify Rust ACK-delay arithmetic against unsafe checked_shl proposal
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --test research/noq-forks/tests/ack_delay_shift.rs -o /tmp/noq-ack-delay-arithmetic
+          /tmp/noq-ack-delay-arithmetic --nocapture
+      - name: Verify exact successful prior DAG evidence run and download all 17 parts
+        run: |
+          set -euo pipefail
+          observed="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${EVIDENCE_RUN}" --jq '.head_sha + "|" + .conclusion')"
+          test "$observed" = "${EVIDENCE_HEAD}|success" || {
+            echo "::error::Previous DAG run SHA/conclusion mismatch: $observed"
+            exit 1
+          }
+          mkdir -p evidence
+          gh run download "${EVIDENCE_RUN}" --repo "${GITHUB_REPOSITORY}" --dir evidence
+          test "$(find evidence -type f -name 'deep-part-*.json' | wc -l)" -eq 17
+      - name: Aggregate all foreign commits; deduplicate exact SHAs and classify unreviewed leads
+        run: |
+          set -euo pipefail
+          python3 research/noq-forks/aggregate_deep.py \
+            --evidence evidence --out triage-results \
+            --run "${EVIDENCE_RUN}" --expected-forks 75
+          test -s triage-results/deduplicated.json
+          test -s triage-results/triage-candidates.csv
+          test -s triage-results/TRIAGE.md
+          cat triage-results/TRIAGE.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload deterministic research artifacts for independent review
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: noq-forks-17part-deduplicated-review-queue
+          path: triage-results/
+          if-no-files-found: error

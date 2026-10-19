@@ -1,0 +1,55 @@
+name: NOQ+Roha combined — hosted Windows acceptance
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/roha-noq-combined-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native:
+    name: Windows MSVC — pinned noq proto and Roha library
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      NOQ_SHA: "538346e8fb300598991de560566289121e9528e9"
+      ROHA_SHA: "554d5202b63e32b8a79156f7da2807d0f4859e4b"
+      CARGO_TERM_COLOR: "always"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.91"
+      - name: Checkout exact combined noq and Roha revisions
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git selected-noq
+          git -C selected-noq checkout --detach "$NOQ_SHA"
+          test "$(git -C selected-noq rev-parse HEAD)" = "$NOQ_SHA"
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/roha.git selected-roha
+          git -C selected-roha checkout --detach "$ROHA_SHA"
+          test "$(git -C selected-roha rev-parse HEAD)" = "$ROHA_SHA"
+      - name: Windows MSVC — full combined noq-proto library suite
+        working-directory: selected-noq
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib
+      - name: Windows MSVC — Roha iroh must compile with locked combined noq
+        working-directory: selected-roha
+        run: |
+          set -euo pipefail
+          cargo check --locked -p iroh
+          test -z "$(git status --porcelain)"
+      - name: Record platform-specific scope
+        run: |
+          printf '%s\n'             "Native Windows MSVC Rust tests passed for combined noq $NOQ_SHA and locked Roha $ROHA_SHA."             "Akula GUI, Windows network transitions and real cross-device transfer not tested."             >> "$GITHUB_STEP_SUMMARY"

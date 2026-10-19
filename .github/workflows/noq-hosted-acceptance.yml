@@ -1,0 +1,101 @@
+name: NOQ fork acceptance — hosted PR8 and Roha11
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/noq-hosted-acceptance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  noq-pr8:
+    name: Own noq PR8 — full proto library and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      NOQ_SHA: "df5587e7e5f29acc0bbd69bd0e5e4865911d0338"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Fetch exact noq PR8 revision without moving refs
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git selected-noq
+          git -C selected-noq checkout --detach "$NOQ_SHA"
+          test "$(git -C selected-noq rev-parse HEAD)" = "$NOQ_SHA"
+          test -z "$(git -C selected-noq status --porcelain)"
+      - name: Run full noq-proto unit test suite (including unseen-path regression)
+        working-directory: selected-noq
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib
+      - name: Run Clippy against the exact tested source
+        working-directory: selected-noq
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p noq-proto --lib -- -D warnings
+      - name: Record passed evidence
+        run: |
+          printf '%s\n'             "Hosted Linux: full noq-proto library and Clippy passed for own PR8 SHA $NOQ_SHA."             "Windows, macOS, stress 1000 paths and Roha integration remain separate gates."             >> "$GITHUB_STEP_SUMMARY"
+
+  roha-pr11:
+    name: Roha11 — locked noq source and iroh unit suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      ROHA_SHA: "135bb9d0541c3d01691ac1a51a6f518d2cdd24d8"
+      NOQ_SHA: "13b93f70aec5cd0155fff794204fc256523db799"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.91"
+      - name: Fetch exact laboratory Roha PR11 SHA
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/roha.git selected-roha
+          git -C selected-roha checkout --detach "$ROHA_SHA"
+          test "$(git -C selected-roha rev-parse HEAD)" = "$ROHA_SHA"
+          test -z "$(git -C selected-roha status --porcelain)"
+      - name: Resolve cargo metadata without modifying the lockfile
+        working-directory: selected-roha
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /tmp/roha-noq-metadata.json
+          python3 - <<'PY'
+          import json, os
+          metadata = json.load(open("/tmp/roha-noq-metadata.json"))
+          wanted = {"noq", "noq-proto", "noq-udp"}
+          sha = os.environ["NOQ_SHA"]
+          matches = [p for p in metadata["packages"] if p["name"] in wanted]
+          assert len(matches) == 3, [(p["name"], p["source"]) for p in matches]
+          for p in matches:
+              assert p["version"] == "1.4.0", (p["name"], p["version"])
+              source = p["source"]
+              assert source is not None and source.startswith(
+                  "git+https://github.com/calex794/noq?rev=" + sha
+              ) and source.endswith("#" + sha), (p["name"], source)
+          print("PASS: one own-fork Git source at exact SHA for all three 1.4.0 crates")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write("Cargo metadata --locked: exact three noq 1.4.0 crates, no registry duplicates.\n")
+          PY
+          test -z "$(git status --porcelain)"
+      - name: Run Roha iroh library suite against locked fork
+        working-directory: selected-roha
+        run: |
+          set -euo pipefail
+          cargo test --locked -p iroh --lib
+      - name: Record passed evidence
+        run: |
+          printf '%s\n'             "Hosted Linux: locked Roha11 iroh library passed on SHA $ROHA_SHA with noq $NOQ_SHA."             "Patchbay/network/Windows and Akula integration remain separate gates."             >> "$GITHUB_STEP_SUMMARY"

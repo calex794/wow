@@ -1,0 +1,89 @@
+name: NOQ PR6 independent Linux source acceptance
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/noq-pr6-linux.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-pr-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PR_HEAD: "83e1f9ecbb58703271bff5c956c94855c3545dbe"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Checkout exact noq PR6 source revision, not a moving branch
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/noq.git pr-noq
+          git -C pr-noq checkout --detach "$PR_HEAD"
+          test "$(git -C pr-noq rev-parse HEAD)" = "$PR_HEAD"
+          test -z "$(git -C pr-noq status --porcelain)"
+      - name: Format delta versus the exact unmodified noq main baseline
+        working-directory: pr-noq
+        env:
+          BASE_SHA: "58869bfbb0d2f52432f3cc6337e3176fcf363717"
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt
+          git worktree add --detach ../baseline-noq "$BASE_SHA"
+          set +e
+          (cd ../baseline-noq && cargo fmt --all -- --check) > /tmp/noq-format-baseline.log 2>&1
+          baseline_status=$?
+          cargo fmt --all -- --check > /tmp/noq-format-pr.log 2>&1
+          pr_status=$?
+          set -e
+          export BASELINE_FMT_STATUS="$baseline_status"
+          export PR_FMT_STATUS="$pr_status"
+          python3 - <<'PY'
+          import os, pathlib, re
+          def changed_paths(filename, prefix):
+              output = pathlib.Path(filename).read_text()
+              files = []
+              for path in re.findall(r"Diff in ([^:]+):\d+:", output):
+                  if prefix not in path:
+                      raise SystemExit(f"unexpected rustfmt path: {path}")
+                  files.append(path.split(prefix, 1)[1])
+              return set(files)
+          baseline = changed_paths("/tmp/noq-format-baseline.log", "baseline-noq/")
+          current = changed_paths("/tmp/noq-format-pr.log", "pr-noq/")
+          if os.getenv("BASELINE_FMT_STATUS") not in {"0", "1"}:
+              raise SystemExit("baseline formatting error was not a normal diff")
+          if os.getenv("PR_FMT_STATUS") not in {"0", "1"}:
+              raise SystemExit("PR formatting error was not a normal diff")
+          if current != baseline:
+              raise SystemExit(f"PR added or removed rustfmt drift: new={sorted(current-baseline)} removed={sorted(baseline-current)}")
+          touched = {"noq-proto/src/connection/mod.rs", "noq-proto/src/tests/multipath.rs"}
+          if current & touched:
+              raise SystemExit(f"PR modified files fail rustfmt: {sorted(current & touched)}")
+          if os.getenv("PR_FMT_STATUS") == "1" and not current:
+              raise SystemExit("rustfmt failed for a non-formatting reason")
+          print("PR6 changes add no rustfmt drift relative to base", sorted(current))
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary, "a") as out:
+              out.write(f"Rustfmt baseline debt: {len(baseline)} existing files; PR6 touched files clean; no new drift.\n")
+          PY
+          test -z "$(git status --porcelain)"
+      - name: All pinned noq-proto library tests (not just one regression)
+        working-directory: pr-noq
+        run: |
+          set -euo pipefail
+          cargo test --locked -p noq-proto --lib
+      - name: Clippy — noq-proto library
+        working-directory: pr-noq
+        run: |
+          set -euo pipefail
+          rustup component add clippy
+          cargo clippy --locked -p noq-proto --lib -- -D warnings
+      - name: Independent CI summary
+        run: |
+          printf '%s\n'             "PR6 adds no rustfmt drift versus main, and noq-proto lib tests and clippy passed on SHA $PR_HEAD."             "Roha locked integration and cross-platform checks are still pending."             >> "$GITHUB_STEP_SUMMARY"
