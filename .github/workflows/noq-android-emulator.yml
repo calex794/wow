@@ -71,7 +71,7 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -netfast -no-metrics
           script: |
-            set -euo pipefail
+            set -eu
             adb wait-for-device
             target="noq/target/x86_64-linux-android/debug/deps"
             binary=$(find "$target" -maxdepth 1 -type f -name 'noq_proto-*' -perm /111 -print -quit)
