@@ -227,15 +227,21 @@ fn orphan_release_requires_two_distinct_roles_and_rotates_writer_atomically() {
         anchor.recover_orphan_after_external_isolation(&stale,&operator,&witness),
         Err(RemoteAnchorError::UntrustedRecovery)
     ));
-    let dangerous=OrphanFenceRecoveryOrder{replacement_reader:key(42),..order};
-    let dangerous_op=sign_orphan_recovery_operator(&root(),&dangerous);
-    let dangerous_witness=sign_orphan_recovery_witness(&recovery_witness(),&dangerous);
-    assert!(matches!(
-        anchor.recover_orphan_after_external_isolation(
-            &dangerous,&dangerous_op,&dangerous_witness,
-        ),
-        Err(RemoteAnchorError::UntrustedRecovery)
-    ));
+    for forbidden_reader in [key(42),key(234),key(220)] {
+        let dangerous=OrphanFenceRecoveryOrder {
+            replacement_reader:forbidden_reader,..order
+        };
+        let dangerous_op=sign_orphan_recovery_operator(&root(),&dangerous);
+        let dangerous_witness=sign_orphan_recovery_witness(
+            &recovery_witness(),&dangerous
+        );
+        assert!(matches!(
+            anchor.recover_orphan_after_external_isolation(
+                &dangerous,&dangerous_op,&dangerous_witness,
+            ),
+            Err(RemoteAnchorError::UntrustedRecovery)
+        ));
+    }
     // Without both exact valid roles the fence remains, and CAS still fails.
     assert!(anchor.inspect_orphan_fence().unwrap().is_some());
     let (command,proof)=signed_revoke(baseline,cp(9,10));
@@ -330,6 +336,24 @@ fn same_operator_and_witness_root_must_fail_at_provisioning() {
     wrong.recovery_witness=wrong.operator;
     assert!(matches!(
         RemoteAnchorLedger::provision(&dir.path().join("authority.sqlite"),wrong,cp(1,1)),
+        Err(RemoteAnchorError::ConfigurationMismatch)
+    ));
+    for duplicate in [key(234),key(220)] {
+        let mut bad=config();
+        bad.reader=duplicate;
+        assert!(matches!(
+            RemoteAnchorLedger::provision(
+                &dir.path().join("reader-overlap.sqlite"),bad,cp(1,1)
+            ),
+            Err(RemoteAnchorError::ConfigurationMismatch)
+        ));
+    }
+    let mut bad=config();
+    bad.administrator=key(234);
+    assert!(matches!(
+        RemoteAnchorLedger::provision(
+            &dir.path().join("admin-overlap.sqlite"),bad,cp(1,1)
+        ),
         Err(RemoteAnchorError::ConfigurationMismatch)
     ));
 }
