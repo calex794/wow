@@ -72,6 +72,14 @@ async fn prehandshake_capacity_denies_real_quic_without_reserving_more_workers()
     drop(held);
     assert_eq!(limiter.available_slots(),1);
     assert_eq!(reader.current().unwrap(),cp());
+    // The slot spans the receipt ACK and connection teardown, not only
+    // the GET response bytes. Wait for verified RAII release before testing
+    // a second independent TLS key with max_in_flight=1.
+    tokio::time::timeout(Duration::from_secs(4),async {
+        while limiter.available_slots()==0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     // A distinct pinned writer also succeeds after capacity returns.
     let second=RemoteAnchorClient::start(key(49),address,domain()).unwrap();
     assert_eq!(second.current().unwrap(),cp());
