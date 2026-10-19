@@ -416,17 +416,8 @@ async fn repeated_authenticated_connects_preserve_capacity_and_report_latency() 
         .bind()
         .await
         .unwrap();
-    let client = Endpoint::builder(presets::Minimal)
-        .clear_ip_transports()
-        .bind_addr("127.0.0.1:0")
-        .unwrap()
-        .secret_key(key(92))
-        .bind()
-        .await
-        .unwrap();
     assert!(
-        server.bound_sockets().iter().all(|addr| addr.ip().is_loopback())
-            && client.bound_sockets().iter().all(|addr| addr.ip().is_loopback()),
+        server.bound_sockets().iter().all(|addr| addr.ip().is_loopback()),
         "W7 must only use loopback transports"
     );
 
@@ -437,6 +428,17 @@ async fn repeated_authenticated_connects_preserve_capacity_and_report_latency() 
     let mut latency_ms = Vec::with_capacity(ROUNDS);
 
     for _ in 0..ROUNDS {
+        // A fresh Endpoint per round prevents connection reuse and ensures
+        // that each iteration genuinely exercises a new QUIC Initial.
+        let client = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .secret_key(key(92))
+            .bind()
+            .await
+            .unwrap();
+        assert!(client.bound_sockets().iter().all(|a| a.ip().is_loopback()));
         // The JoinHandle owns the real authenticated client connection
         // until after the server has accepted TLS, avoiding the false
         // peer-abort test failure discovered in the original W6 lab.
@@ -465,6 +467,7 @@ async fn repeated_authenticated_connects_preserve_capacity_and_report_latency() 
         latency_ms.push(round_start.elapsed().as_millis());
         drop(accepted);
         drop(connected);
+        client.close().await;
     }
 
     latency_ms.sort_unstable();
@@ -482,6 +485,5 @@ async fn repeated_authenticated_connects_preserve_capacity_and_report_latency() 
          rss_kib_after={rss_after:?} bind=loopback"
     );
 
-    client.close().await;
     server.close().await;
 }
