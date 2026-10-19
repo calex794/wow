@@ -410,7 +410,7 @@ fn receiver_address(root: &Path) -> EndpointAddr {
     EndpointAddr::new(key(43).public()).with_ip_addr(bound)
 }
 
-async fn send_as_authorized_sender(server: EndpointAddr, wire: &[u8]) {
+async fn send_as_authorized_sender(server: EndpointAddr, wire: &[u8]) -> (Endpoint, Connection) {
     let client = Endpoint::builder(presets::Minimal)
         .clear_ip_transports()
         .bind_addr("127.0.0.1:0")
@@ -433,8 +433,9 @@ async fn send_as_authorized_sender(server: EndpointAddr, wire: &[u8]) {
             .expect("bounded QUIC stream delivery timed out"),
         "trusted sender could not finish exact sealed envelope"
     );
-    drop(connection);
-    client.close().await;
+    // Keep transport alive until the independent receiver reports its
+    // committed result; otherwise QUIC stream may be reset before read_to_end.
+    (client, connection)
 }
 
 fn verify_stored_ciphertext(path: &Path, expected: &[u8]) {
@@ -458,8 +459,10 @@ async fn process_killed_after_commit_can_reopen_ciphertext_and_reject_identical_
     let (wire, sealed) = sealed_wire();
     let mut child = spawn_receiver_for_mode(root.path(), "store");
     wait_marker(root.path(), READY);
-    send_as_authorized_sender(receiver_address(root.path()), &wire).await;
+    let (sender, connection) = send_as_authorized_sender(receiver_address(root.path()), &wire).await;
     wait_marker(root.path(), "receiver-completed-store-1");
+    drop(connection);
+    sender.close().await;
 
     // The child is still alive in its intentional post-commit idle window.
     let process = child.0.as_mut().expect("receiver still running");
@@ -473,8 +476,10 @@ async fn process_killed_after_commit_can_reopen_ciphertext_and_reject_identical_
     // A duplicate exact message must be idempotent even across an OS crash.
     let mut restarted = spawn_receiver_for_mode(root.path(), "replay");
     wait_marker(root.path(), READY);
-    send_as_authorized_sender(receiver_address(root.path()), &wire).await;
+    let (sender, connection) = send_as_authorized_sender(receiver_address(root.path()), &wire).await;
     wait_marker(root.path(), "receiver-completed-replay-2");
+    drop(connection);
+    sender.close().await;
     restarted.wait_success();
     verify_stored_ciphertext(&root.path().join("mail.sqlite"), &sealed);
 }
