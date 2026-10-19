@@ -123,26 +123,15 @@ async fn child_remote_anchor_service_process() {
     fs::write(root.join("anchor-ready.tmp"),ip.to_string()).unwrap();
     fs::rename(root.join("anchor-ready.tmp"),root.join(READY_FILE)).unwrap();
 
-    let permits=Arc::new(tokio::sync::Semaphore::new(4));
+    let admission=AnchorAdmission::new(AnchorAdmissionPolicy::default()).unwrap();
     let deadline=Instant::now()+Duration::from_secs(20);
     while Instant::now()<deadline && !root.join(STOP_FILE).exists() {
         let incoming=tokio::time::timeout(
             Duration::from_millis(30),endpoint.accept(),
         ).await;
         let Ok(Some(incoming))=incoming else {continue};
-        let Ok(ticket)=Arc::clone(&permits).try_acquire_owned() else {
-            drop(incoming);
-            continue;
-        };
-        let ledger=Arc::clone(&ledger);
-        tokio::spawn(async move {
-            let _ticket=ticket;
-            if let Ok(Ok(conn))=tokio::time::timeout(
-                Duration::from_secs(3),incoming,
-            ).await {
-                let _=serve_one_anchor_connection(&conn,&ledger).await;
-            }
-        });
+        // Shared capacity and token rate gate before the TLS future.
+        let _accepted=admission.dispatch(incoming,Arc::clone(&ledger));
     }
     endpoint.close().await;
 }
