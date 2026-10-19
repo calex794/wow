@@ -14,10 +14,11 @@ use akula_wire_lab::peer_enrollment_w6::{
     PolicyOperation, TrustedPolicyAnchor, sign_anchor_transition,
 };
 use akula_wire_lab::remote_anchor_w6::{
-    serve_one_anchor_connection, AnchorServicePolicy, RemoteAnchorClient,
+    AnchorServicePolicy, RemoteAnchorClient,
     RemoteAnchorLedger, OrphanFenceRecoveryOrder, ANCHOR_ALPN,
     sign_orphan_recovery_operator, sign_orphan_recovery_witness,
 };
+use akula_wire_lab::anchor_admission_w6::{AnchorAdmission,AnchorAdmissionPolicy,anchor_transport_config};
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
 use rusqlite::Connection;
