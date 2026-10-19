@@ -49,7 +49,7 @@ jobs:
           def changed_paths(filename, prefix):
               output = pathlib.Path(filename).read_text()
               files = []
-              for path in re.findall(r"Diff in ([^:]+):\\d+:", output):
+              for path in re.findall(r"Diff in ([^:]+):\d+:", output):
                   if prefix not in path:
                       raise SystemExit(f"unexpected rustfmt path: {path}")
                   files.append(path.split(prefix, 1)[1])
@@ -70,7 +70,7 @@ jobs:
           print("PR6 changes add no rustfmt drift relative to base", sorted(current))
           summary = os.environ["GITHUB_STEP_SUMMARY"]
           with open(summary, "a") as out:
-              out.write(f"Rustfmt baseline debt: {len(baseline)} existing files; PR6 touched files clean; no new drift.\\n")
+              out.write(f"Rustfmt baseline debt: {len(baseline)} existing files; PR6 touched files clean; no new drift.\n")
           PY
           test -z "$(git status --porcelain)"
       - name: All pinned noq-proto library tests (not just one regression)
