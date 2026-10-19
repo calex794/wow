@@ -11,9 +11,11 @@
 //! create or change any checkpoint. No network bootstrap:
 //! provisioning is an explicit local service-owner operation.
 //!
-//! Protocol v1: exactly one bounded bidirectional QUIC stream per connection,
-//! 1-byte GET or fixed-size SIGNED CAS request. Responses are 41-byte checkpoint
-//! (status 0) or 1-byte refusal. No 0-RTT or custom signature handshake.
+//! Protocol v3: one bounded bidirectional QUIC stream per connection,
+//! GET, offline-signed CAS, and fixed-size WRITE-BEGIN/WRITE-FINISH. Successful
+//! responses echo the pinned domain and 40-byte checkpoint. No 0-RTT.
+//! A durable writer fence serializes revoke CAS with any Mailbox COMMIT; a
+//! crashed writer leaves HOLD, NEVER an automatically expiring lease.
 //! QUIC identity always comes from connection.remote_id(), never a frame.
 //!
 //! This is a bounded LAB service and synchronous client adapter, not a
@@ -32,9 +34,11 @@ use std::{
     time::Duration,
 };
 
-pub const ANCHOR_ALPN: &[u8] = b"akula-wow/w6-external-anchor-lab/2";
+pub const ANCHOR_ALPN: &[u8] = b"akula-wow/w6-external-anchor-lab/3";
 const OP_GET: u8 = 1;
 const OP_CAS: u8 = 2;
+const OP_WRITE_BEGIN: u8 = 3;
+const OP_WRITE_FINISH: u8 = 4;
 const STATUS_OK: u8 = 0;
 const STATUS_DENIED: u8 = 3;
 const STATUS_CONFLICT: u8 = 4;
@@ -43,6 +47,7 @@ const STATUS_MALFORMED: u8 = 6;
 const CLIENT_RESPONSE_RECEIVED: u8 = 0x71;
 const CHECKPOINT_BYTES: usize = 40;
 const GET_BYTES: usize = 1;
+const WRITE_FENCE_BYTES: usize = 1 + CHECKPOINT_BYTES + 32;
 const CAS_BYTES: usize = 1 + 2 * CHECKPOINT_BYTES
     + SIGNED_ENROLLMENT_BYTES + SIGNED_TRANSITION_PROOF_BYTES;
 const RESPONSE_BYTES: usize = 1 + 32 + CHECKPOINT_BYTES;
@@ -109,6 +114,11 @@ struct StoredAnchorRow {
     authority: Vec<u8>,
     checkpoint: PolicyCheckpoint,
 }
+struct WriterFenceRow {
+    peer: Vec<u8>,
+    nonce: Vec<u8>,
+    checkpoint: PolicyCheckpoint,
+}
 
 pub struct RemoteAnchorLedger {
     sql: Sqlite,
@@ -150,6 +160,10 @@ impl RemoteAnchorLedger {
         sql.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL;")?;
         let found=Self::record(&sql)?;
         let trusted=found.ok_or(RemoteAnchorError::NotProvisioned)?;
+        // A pre-v3 authority without the durable fence table MUST refuse to
+        // start. Merely bumping ALPN without this table would re-open the
+        // cross-host CAS versus Mailbox COMMIT race.
+        let _ = Self::writer_fence(&sql)?;
         if trusted.reader.as_slice()!=policy.reader.as_bytes()
             || trusted.administrator.as_slice()!=policy.administrator.as_bytes()
             || trusted.operator.as_slice()!=policy.operator.as_bytes()
@@ -170,6 +184,13 @@ impl RemoteAnchorLedger {
                administrator BLOB NOT NULL CHECK(length(administrator)=32),
                operator BLOB NOT NULL CHECK(length(operator)=32),
                authority BLOB NOT NULL CHECK(length(authority)=32),
+               revision INTEGER NOT NULL CHECK(revision>=0),
+               digest BLOB NOT NULL CHECK(length(digest)=32)
+             );
+             CREATE TABLE IF NOT EXISTS w6_writer_fence (
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               peer BLOB NOT NULL CHECK(length(peer)=32),
+               nonce BLOB NOT NULL CHECK(length(nonce)=32),
                revision INTEGER NOT NULL CHECK(revision>=0),
                digest BLOB NOT NULL CHECK(length(digest)=32)
              );"
@@ -204,6 +225,80 @@ impl RemoteAnchorLedger {
             checkpoint:PolicyCheckpoint {revision:rev as u64,digest:d},
         }))
     }
+    fn writer_fence(db:&Sqlite)->Result<Option<WriterFenceRow>,RemoteAnchorError>{
+        use rusqlite::OptionalExtension;
+        let row=db.query_row(
+            "SELECT peer,nonce,revision,digest FROM w6_writer_fence WHERE singleton=1",
+            [],|r|Ok((
+                r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?,
+                r.get::<_,i64>(2)?,r.get::<_,Vec<u8>>(3)?,
+            )),
+        ).optional()?;
+        let Some((peer,nonce,revision,digest))=row else {return Ok(None)};
+        if peer.len()!=32 || nonce.len()!=32 || nonce.iter().all(|&n|n==0)
+            || revision<0 || digest.len()!=32 {
+            return Err(RemoteAnchorError::CorruptStorage);
+        }
+        let mut hash=[0u8;32];hash.copy_from_slice(&digest);
+        Ok(Some(WriterFenceRow {
+            peer,nonce,checkpoint:PolicyCheckpoint{revision:revision as u64,digest:hash},
+        }))
+    }
+
+    /// Reserve one global Mailbox-commit slot, linearized against signed CAS
+    /// in the SAME authority SQLite IMMEDIATE transaction. A client must
+    /// already have a valid local enrollment for the identical checkpoint.
+    /// The token is a fresh CSPRNG-generated secret scoped to this operation.
+    pub fn begin_write_for(
+        &mut self,peer:EndpointId,expected:PolicyCheckpoint,nonce:[u8;32],
+    )->Result<PolicyCheckpoint,RemoteAnchorError>{
+        if peer!=self.policy.reader {return Err(RemoteAnchorError::UntrustedPeer);}
+        if nonce==[0;32] {return Err(RemoteAnchorError::Protocol);}
+        let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current=Self::record(&tx)?.ok_or(RemoteAnchorError::NotProvisioned)?;
+        if current.checkpoint!=expected {return Err(RemoteAnchorError::Conflict);}
+        if let Some(held)=Self::writer_fence(&tx)? {
+            // Retried acquisition after an ambiguous QUIC response must be
+            // idempotent ONLY for the original writer and exact token.
+            if held.peer.as_slice()!=peer.as_bytes()
+                || held.nonce.as_slice()!=nonce
+                || held.checkpoint!=expected
+            {
+                return Err(RemoteAnchorError::Conflict);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO w6_writer_fence
+                 (singleton,peer,nonce,revision,digest) VALUES(1,?1,?2,?3,?4)",
+                params![peer.as_bytes().as_slice(),nonce.as_slice(),
+                    to_int(expected.revision)?,expected.digest.as_slice()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(expected)
+    }
+
+    /// Never release a fence based on elapsed time or connection teardown:
+    /// the writer may still be committing on another host. The exact reader
+    /// credential and nonce must finish AFTER its durable callback outcome.
+    pub fn finish_write_for(
+        &mut self,peer:EndpointId,expected:PolicyCheckpoint,nonce:[u8;32],
+    )->Result<PolicyCheckpoint,RemoteAnchorError>{
+        if peer!=self.policy.reader {return Err(RemoteAnchorError::UntrustedPeer);}
+        let tx=self.sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current=Self::record(&tx)?.ok_or(RemoteAnchorError::NotProvisioned)?;
+        if current.checkpoint!=expected {return Err(RemoteAnchorError::Conflict);}
+        let held=Self::writer_fence(&tx)?.ok_or(RemoteAnchorError::Conflict)?;
+        if held.peer.as_slice()!=peer.as_bytes()
+            || held.nonce.as_slice()!=nonce || held.checkpoint!=expected
+        {
+            return Err(RemoteAnchorError::Conflict);
+        }
+        tx.execute("DELETE FROM w6_writer_fence WHERE singleton=1",[])?;
+        tx.commit()?;
+        Ok(expected)
+    }
+
     /// Only the two pinned QUIC identities may query current state.
     pub fn current_for(
         &self,peer:EndpointId,
@@ -235,6 +330,12 @@ impl RemoteAnchorLedger {
         let record=Self::record(&tx)?
             .ok_or(RemoteAnchorError::NotProvisioned)?;
         if record.checkpoint!=expected {return Err(RemoteAnchorError::Conflict);}
+        // IMPORTANT: no signed revoke (or allow) is published while an
+        // independent host still has an in-flight Mailbox COMMIT. The
+        // durable slot survives authority process SIGKILL/restart.
+        if Self::writer_fence(&tx)?.is_some() {
+            return Err(RemoteAnchorError::Conflict);
+        }
         tx.execute(
             "UPDATE w6_external_anchor SET revision=?1,digest=?2 WHERE id=1",
             params![to_int(next.revision)?,next.digest.as_slice()],
@@ -283,6 +384,22 @@ pub async fn serve_one_anchor_connection(
         let mut service=service.lock().map_err(|_|RemoteAnchorError::CorruptStorage)?;
         if wire.len()==GET_BYTES && wire[0]==OP_GET {
             encode_reply(service.current_for(remote),service.policy.authority)
+        } else if wire.len()==WRITE_FENCE_BYTES
+            && (wire[0]==OP_WRITE_BEGIN || wire[0]==OP_WRITE_FINISH)
+        {
+            let cp=decode_checkpoint(&wire[1..1+CHECKPOINT_BYTES]);
+            let nonce:Result<[u8;32],_>=wire[1+CHECKPOINT_BYTES..].try_into();
+            match (cp,nonce) {
+                (Ok(expected),Ok(nonce))=>{
+                    let response=if wire[0]==OP_WRITE_BEGIN {
+                        service.begin_write_for(remote,expected,nonce)
+                    } else {
+                        service.finish_write_for(remote,expected,nonce)
+                    };
+                    encode_reply(response,service.policy.authority)
+                },
+                _=>vec![STATUS_MALFORMED],
+            }
         } else if wire.len()==CAS_BYTES && wire[0]==OP_CAS {
             let first=decode_checkpoint(&wire[1..1+CHECKPOINT_BYTES]);
             // Signed operator change follows two *exactly 40-byte* checkpoint
@@ -398,7 +515,9 @@ impl RemoteAnchorClient {
         local:&Endpoint,remote:EndpointAddr,
         authority:AuthorityDomainId,request:Vec<u8>,
     )->Result<PolicyCheckpoint,AnchorError>{
-        if request.len()!=GET_BYTES && request.len()!=CAS_BYTES {
+        if request.len()!=GET_BYTES && request.len()!=CAS_BYTES
+            && request.len()!=WRITE_FENCE_BYTES
+        {
             return Err(AnchorError::InvalidAttestation);
         }
         let response=tokio::time::timeout(IO_BUDGET,async {
@@ -477,6 +596,26 @@ impl TrustedPolicyAnchor for RemoteAnchorClient {
         // SECURITY: Disable unauthenticated legacy CAS. TLS admin identity
         // alone may NOT choose any new revision or BLAKE3 digest.
         Err(AnchorError::InvalidAttestation)
+    }
+    fn begin_write_fence(
+        &self,checkpoint:PolicyCheckpoint,nonce:[u8;32],
+    )->Result<(),AnchorError>{
+        let mut wire=Vec::with_capacity(WRITE_FENCE_BYTES);
+        wire.push(OP_WRITE_BEGIN);
+        wire.extend_from_slice(&checkpoint_bytes(checkpoint));
+        wire.extend_from_slice(&nonce);
+        if self.rpc(wire)?!=checkpoint {return Err(AnchorError::InvalidAttestation);}
+        Ok(())
+    }
+    fn finish_write_fence(
+        &self,checkpoint:PolicyCheckpoint,nonce:[u8;32],
+    )->Result<(),AnchorError>{
+        let mut wire=Vec::with_capacity(WRITE_FENCE_BYTES);
+        wire.push(OP_WRITE_FINISH);
+        wire.extend_from_slice(&checkpoint_bytes(checkpoint));
+        wire.extend_from_slice(&nonce);
+        if self.rpc(wire)?!=checkpoint {return Err(AnchorError::InvalidAttestation);}
+        Ok(())
     }
     fn advance_signed(
         &self,expected:PolicyCheckpoint,replacement:PolicyCheckpoint,
