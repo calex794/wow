@@ -4,7 +4,8 @@
 //! administered/rollback-isolated host. Tests run on loopback but that is NOT
 //! a production anti-rollback trust boundary.
 //!
-//! The relay is a READ-ONLY TLS identity. A separately pinned admin TLS
+//! The pinned reader TLS identity cannot change policy, but may BEGIN
+//! and FINISH an exclusive durable Mailbox write fence. A separate admin TLS
 //! identity may publish a strictly monotonic CAS ONLY when it carries TWO
 //! valid offline operator Ed25519 signatures binding the change, original
 //! checkpoint and exact replacement digest. Admin TLS key alone CANNOT
