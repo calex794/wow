@@ -18,7 +18,7 @@ use akula_wire_lab::remote_anchor_w6::{
     RemoteAnchorLedger, OrphanFenceRecoveryOrder, ANCHOR_ALPN,
     sign_orphan_recovery_operator, sign_orphan_recovery_witness,
 };
-use akula_wire_lab::anchor_admission_w6::{AnchorAdmission,AnchorAdmissionPolicy,anchor_transport_config};
+use akula_wire_lab::anchor_admission_w6::{AnchorAdmission,AnchorAdmissionPolicy,anchor_incoming_limits,anchor_transport_config};
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
 use rusqlite::Connection;
@@ -113,6 +113,7 @@ async fn child_remote_anchor_service_process() {
     let endpoint=Endpoint::builder(presets::Minimal)
         .clear_ip_transports()
         .transport_config(anchor_transport_config())
+            .server_incoming_limits(anchor_incoming_limits())
         .bind_addr("127.0.0.1:0").unwrap()
         .secret_key(key(43))
         .alpns(vec![ANCHOR_ALPN.to_vec()])
