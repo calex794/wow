@@ -435,11 +435,29 @@ async fn cross_authority_replay_rejected_over_real_quic_even_with_same_tls_key()
     // independently pinned domain MUST refuse even an innocent GET.
     let wrong_scope=client_with_domain(41,second_service.addr(),current_domain());
     assert_anchor_error(wrong_scope.current(),AnchorError::InvalidAttestation);
+    // A response-only domain check would be TOO LATE for mutating
+    // BEGIN/FINISH RPCs. Verify wrong-domain requests cause no side effects
+    // at authority B even though both servers share one TLS EndpointId.
+    assert_anchor_error(
+        wrong_scope.begin_write_fence(old,[77;32]),
+        AnchorError::InvalidAttestation,
+    );
+    let correct_b=client_with_domain(41,second_service.addr(),other);
+    correct_b.begin_write_fence(old,[78;32]).unwrap();
+    assert_anchor_error(
+        wrong_scope.finish_write_fence(old,[78;32]),
+        AnchorError::InvalidAttestation,
+    );
+    let proof_b=sign_anchor_transition(&root(),other,&change,old,new).unwrap();
+    assert_anchor_error(
+        admin_b.advance_signed(old,new,&change,&proof_b),
+        AnchorError::Conflict,
+    );
+    correct_b.finish_write_fence(old,[78;32]).unwrap();
     let admin_a=client(42,first_service.addr());
     admin_a.advance_signed(old,new,&change,&proof_a).unwrap();
     assert_eq!(admin_a.current().unwrap(),new);
     assert_eq!(admin_b.current().unwrap(),old);
-    let proof_b=sign_anchor_transition(&root(),other,&change,old,new).unwrap();
     admin_b.advance_signed(old,new,&change,&proof_b).unwrap();
     assert_eq!(admin_b.current().unwrap(),new);
     first_service.stop().await;

@@ -430,3 +430,191 @@ fn real_quic_signed_cas_lost_reply_recovers_after_authority_restart_and_policy_r
     );
     restarted.finish(false);
 }
+
+#[test]
+fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
+    use std::sync::mpsc;
+
+    let dir=tempdir().unwrap();
+    let a_path=dir.path().join("a-policy.sqlite");
+    let b_path=dir.path().join("b-policy.sqlite");
+    let mailbox_path=dir.path().join("b-mailbox.sqlite");
+    let anchor_path=dir.path().join("anchor.sqlite");
+    // Two physically separate SQLite files model two independent hosts.
+    // Both are first bootstrapped with the SAME operator-approved state.
+    let mut bootstrap=PeerEnrollmentDb::open(&a_path,root().verifying_key()).unwrap();
+    bootstrap.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
+    let initial=bootstrap.checkpoint().unwrap();
+    drop(bootstrap);
+    flush(&a_path);
+    fs::copy(&a_path,&b_path).unwrap();
+    provision(&anchor_path,initial);
+    let server=ChildAuthority::start(dir.path());
+    let admin=client(42,server.address());
+    let mut host_a=PeerEnrollmentDb::open_for_authority(
+        &a_path,root().verifying_key(),authority(),
+    ).unwrap();
+
+    let (entered_tx,entered_rx)=mpsc::sync_channel::<()>(1);
+    let (finish_tx,finish_rx)=mpsc::sync_channel::<()>(1);
+    let writer_addr=server.address();
+    let writer_mailbox_path=mailbox_path.clone();
+    let writer=thread::spawn(move || -> Result<(),EnrollmentError> {
+        let mut host_b=PeerEnrollmentDb::open_for_authority(
+            &b_path,root().verifying_key(),authority(),
+        )?;
+        let reader=client(41,writer_addr);
+        let local_binding=binding();
+        host_b.with_anchored_write(
+            &reader,lookup(&local_binding),|_|{
+                // The remote fence was granted BEFORE callback entry.
+                entered_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(7)).unwrap();
+                // Actual independently durable Mailbox SQLite COMMIT on
+                // host B, NOT merely an in-memory callback flag.
+                let mut mailbox=Connection::open(&writer_mailbox_path)?;
+                mailbox.execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA synchronous=FULL;
+                     CREATE TABLE IF NOT EXISTS received (
+                       id INTEGER PRIMARY KEY, body BLOB NOT NULL
+                     );"
+                )?;
+                let tx=mailbox.transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Immediate
+                )?;
+                tx.execute(
+                    "INSERT INTO received(id,body) VALUES(1,?1)",
+                    rusqlite::params![b"durable mailbox commit".as_slice()],
+                )?;
+                tx.commit()?;
+                Ok(())
+            },
+        )
+    });
+
+    entered_rx.recv_timeout(Duration::from_secs(7)).unwrap();
+    let change=signed(2,PolicyOperation::Revoke);
+    let (old,next)=host_a.preview_signed_update(&change).unwrap();
+    let proof=sign_anchor_transition(&root(),authority(),&change,old,next).unwrap();
+    assert_eq!(old,initial);
+    assert!(matches!(
+        host_a.apply_signed_anchored_with_proof(&change,&proof,&admin),
+        Err(EnrollmentError::Anchor(AnchorError::Conflict))
+    ));
+    // The submitted revoke is durably HELD locally at host A. Authority
+    // cannot claim the revocation is committed while host B is still writing.
+    assert_eq!(admin.current().unwrap(),old);
+    let mut invoked=false;
+    let held:Result<(),EnrollmentError>=host_a.with_anchored_write(
+        &admin,lookup(&binding()),|_|{invoked=true;Ok(())}
+    );
+    assert!(matches!(held,Err(EnrollmentError::PendingRecovery)));
+    assert!(!invoked);
+
+    finish_tx.send(()).unwrap();
+    writer.join().unwrap().unwrap(); // writer's durable callback completed
+    // Independent process/file reader verifies persisted Mailbox content.
+    let persisted:i64=Connection::open(&mailbox_path).unwrap().query_row(
+        "SELECT COUNT(*) FROM received WHERE id=1",[],|r|r.get(0)
+    ).unwrap();
+    assert_eq!(persisted,1);
+    assert_eq!(
+        host_a.recover_pending_signed_update(&admin).unwrap(),
+        akula_wire_lab::peer_enrollment_w6::SignedRecoveryOutcome::ForwardedPending
+    );
+    assert_eq!(admin.current().unwrap(),next);
+
+    // Host B's independent policy file STILL says "Allow", but can no
+    // longer obtain a write permit from the external authority at rev=1.
+    let mut host_b=PeerEnrollmentDb::open_for_authority(
+        &dir.path().join("b-policy.sqlite"),root().verifying_key(),authority(),
+    ).unwrap();
+    let reader=client(41,server.address());
+    let mut wrongly_committed=false;
+    let stale:Result<(),EnrollmentError>=host_b.with_anchored_write(
+        &reader,lookup(&binding()),|_|{wrongly_committed=true;Ok(())}
+    );
+    assert!(matches!(stale,Err(EnrollmentError::CheckpointMismatch)));
+    assert!(!wrongly_committed);
+    server.finish(false);
+}
+
+#[test]
+fn real_quic_writer_fence_survives_authority_sigkill_until_explicit_finish() {
+    let dir=tempdir().unwrap();
+    let remote=dir.path().join("anchor.sqlite");
+    let old=cp(1,1);
+    let next=cp(2,2);
+    provision(&remote,old);
+    let server=ChildAuthority::start(dir.path());
+    let reader=client(41,server.address());
+    let nonce=[179;32];
+    reader.begin_write_fence(old,nonce).unwrap();
+    assert_eq!(reader.current().unwrap(),old);
+    server.finish(true); // independent authority OS process SIGKILL
+
+    let restarted=ChildAuthority::start(dir.path());
+    let admin=client(42,restarted.address());
+    let reader=client(41,restarted.address());
+    assert!(matches!(
+        authorized_cas(&admin,old,next),
+        Err(AnchorError::Conflict)
+    ));
+    assert_eq!(reader.current().unwrap(),old);
+    // No implicit timeouts or cleanup on child startup.
+    assert!(matches!(
+        reader.finish_write_fence(old,[180;32]),
+        Err(AnchorError::Conflict)
+    ));
+    // Simulates explicit settlement only AFTER the writer has been stopped
+    // or has positively completed its durable write.
+    reader.finish_write_fence(old,nonce).unwrap();
+    authorized_cas(&admin,old,next).unwrap();
+    assert_eq!(reader.current().unwrap(),next);
+    restarted.finish(false);
+}
+
+#[test]
+fn callback_failure_retains_remote_fence_across_authority_process_restart() {
+    let dir=tempdir().unwrap();
+    let local_path=dir.path().join("policy.sqlite");
+    let remote_path=dir.path().join("anchor.sqlite");
+    let mut seed=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    seed.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
+    let old=seed.checkpoint().unwrap();
+    drop(seed);
+    provision(&remote_path,old);
+    let server=ChildAuthority::start(dir.path());
+    let reader=client(41,server.address());
+    let mut local=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),authority(),
+    ).unwrap();
+    let mut entered=false;
+    let result:Result<(),EnrollmentError>=local.with_anchored_write(
+        &reader,lookup(&binding()),|_|{
+            entered=true;
+            // The callback reports an unknown durable outcome: the system
+            // MUST NOT assume no bytes were committed or clear the fence.
+            Err(EnrollmentError::CorruptStorage)
+        }
+    );
+    assert!(entered);
+    assert!(matches!(result,Err(EnrollmentError::CorruptStorage)));
+    let admin=client(42,server.address());
+    assert_eq!(admin.current().unwrap(),old);
+    assert_eq!(
+        authorized_cas(&admin,old,cp(2,2)).unwrap_err(),
+        AnchorError::Conflict
+    );
+    server.finish(true);
+    let restarted=ChildAuthority::start(dir.path());
+    let new_admin=client(42,restarted.address());
+    assert_eq!(
+        authorized_cas(&new_admin,old,cp(2,2)).unwrap_err(),
+        AnchorError::Conflict
+    );
+    // No auto-expiry and no unsafe fabricated "recovery success".
+    assert_eq!(new_admin.current().unwrap(),old);
+    restarted.finish(false);
+}
