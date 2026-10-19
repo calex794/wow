@@ -574,3 +574,47 @@ fn real_quic_writer_fence_survives_authority_sigkill_until_explicit_finish() {
     assert_eq!(reader.current().unwrap(),next);
     restarted.finish(false);
 }
+
+#[test]
+fn callback_failure_retains_remote_fence_across_authority_process_restart() {
+    let dir=tempdir().unwrap();
+    let local_path=dir.path().join("policy.sqlite");
+    let remote_path=dir.path().join("anchor.sqlite");
+    let mut seed=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    seed.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
+    let old=seed.checkpoint().unwrap();
+    drop(seed);
+    provision(&remote_path,old);
+    let server=ChildAuthority::start(dir.path());
+    let reader=client(41,server.address());
+    let mut local=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),authority(),
+    ).unwrap();
+    let mut entered=false;
+    let result:Result<(),EnrollmentError>=local.with_anchored_write(
+        &reader,lookup(&binding()),|_|{
+            entered=true;
+            // The callback reports an unknown durable outcome: the system
+            // MUST NOT assume no bytes were committed or clear the fence.
+            Err(EnrollmentError::CorruptStorage)
+        }
+    );
+    assert!(entered);
+    assert!(matches!(result,Err(EnrollmentError::CorruptStorage)));
+    let admin=client(42,server.address());
+    assert_eq!(admin.current().unwrap(),old);
+    assert_eq!(
+        authorized_cas(&admin,old,cp(2,2)).unwrap_err(),
+        AnchorError::Conflict
+    );
+    server.finish(true);
+    let restarted=ChildAuthority::start(dir.path());
+    let new_admin=client(42,restarted.address());
+    assert_eq!(
+        authorized_cas(&new_admin,old,cp(2,2)).unwrap_err(),
+        AnchorError::Conflict
+    );
+    // No auto-expiry and no unsafe fabricated "recovery success".
+    assert_eq!(new_admin.current().unwrap(),old);
+    restarted.finish(false);
+}
