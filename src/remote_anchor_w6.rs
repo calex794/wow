@@ -49,7 +49,10 @@ const STATUS_MALFORMED: u8 = 6;
 const CLIENT_RESPONSE_RECEIVED: u8 = 0x71;
 const CHECKPOINT_BYTES: usize = 40;
 const GET_BYTES: usize = 1;
-const WRITE_FENCE_BYTES: usize = 1 + CHECKPOINT_BYTES + 32;
+// Both MUTATING RPCs carry their independently pinned authority ID INSIDE
+// the request. Echo-only response verification is too late: a misrouted
+// request may have mutated another same-TLS-key authority already.
+const WRITE_FENCE_BYTES: usize = 1 + 32 + CHECKPOINT_BYTES + 32;
 const CAS_BYTES: usize = 1 + 2 * CHECKPOINT_BYTES
     + SIGNED_ENROLLMENT_BYTES + SIGNED_TRANSITION_PROOF_BYTES;
 const RESPONSE_BYTES: usize = 1 + 32 + CHECKPOINT_BYTES;
@@ -405,18 +408,25 @@ pub async fn serve_one_anchor_connection(
         } else if wire.len()==WRITE_FENCE_BYTES
             && (wire[0]==OP_WRITE_BEGIN || wire[0]==OP_WRITE_FINISH)
         {
-            let cp=decode_checkpoint(&wire[1..1+CHECKPOINT_BYTES]);
-            let nonce:Result<[u8;32],_>=wire[1+CHECKPOINT_BYTES..].try_into();
-            match (cp,nonce) {
-                (Ok(expected),Ok(nonce))=>{
-                    let response=if wire[0]==OP_WRITE_BEGIN {
-                        service.begin_write_for(remote,expected,nonce)
-                    } else {
-                        service.finish_write_for(remote,expected,nonce)
-                    };
-                    encode_reply(response,service.policy.authority)
-                },
-                _=>vec![STATUS_MALFORMED],
+            if &wire[1..33] != service.policy.authority.as_bytes() {
+                // Reject BEFORE touching the SQLite permit row. Same TLS
+                // EndpointId is allowed to front distinct logical domains.
+                vec![STATUS_DENIED]
+            } else {
+                let cp=decode_checkpoint(&wire[33..33+CHECKPOINT_BYTES]);
+                let nonce:Result<[u8;32],_>=
+                    wire[33+CHECKPOINT_BYTES..].try_into();
+                match (cp,nonce) {
+                    (Ok(expected),Ok(nonce))=>{
+                        let response=if wire[0]==OP_WRITE_BEGIN {
+                            service.begin_write_for(remote,expected,nonce)
+                        } else {
+                            service.finish_write_for(remote,expected,nonce)
+                        };
+                        encode_reply(response,service.policy.authority)
+                    },
+                    _=>vec![STATUS_MALFORMED],
+                }
             }
         } else if wire.len()==CAS_BYTES && wire[0]==OP_CAS {
             let first=decode_checkpoint(&wire[1..1+CHECKPOINT_BYTES]);
@@ -620,6 +630,7 @@ impl TrustedPolicyAnchor for RemoteAnchorClient {
     )->Result<(),AnchorError>{
         let mut wire=Vec::with_capacity(WRITE_FENCE_BYTES);
         wire.push(OP_WRITE_BEGIN);
+        wire.extend_from_slice(self.authority.as_bytes());
         wire.extend_from_slice(&checkpoint_bytes(checkpoint));
         wire.extend_from_slice(&nonce);
         if self.rpc(wire)?!=checkpoint {return Err(AnchorError::InvalidAttestation);}
@@ -630,6 +641,7 @@ impl TrustedPolicyAnchor for RemoteAnchorClient {
     )->Result<(),AnchorError>{
         let mut wire=Vec::with_capacity(WRITE_FENCE_BYTES);
         wire.push(OP_WRITE_FINISH);
+        wire.extend_from_slice(self.authority.as_bytes());
         wire.extend_from_slice(&checkpoint_bytes(checkpoint));
         wire.extend_from_slice(&nonce);
         if self.rpc(wire)?!=checkpoint {return Err(AnchorError::InvalidAttestation);}
