@@ -105,8 +105,9 @@ async fn malformed_udp_initials_do_not_surface_incoming_and_valid_peer_recovers(
     let source = UdpSocket::bind("127.0.0.1:0").unwrap();
     source.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
 
-    // The sender's volume is strictly fixed and below 0.5 MiB. No unbounded
-    // or external traffic, no third-party addresses, no connection retries.
+    // Send only structurally impossible packets in this negative gate.
+    // A syntactically plausible (but cryptographically invalid) Initial can
+    // legitimately surface as Incoming; its rejection happens at handshake.
     const ROUNDS: usize = 96;
     let rss_before = linux_rss_kib();
     let cpu_before = linux_cpu_ticks();
@@ -124,32 +125,23 @@ async fn malformed_udp_initials_do_not_surface_incoming_and_valid_peer_recovers(
             assert_eq!(source.send_to(packet, addr).unwrap(), packet.len());
             sent += 1;
         }
-        // A small, fixed number of plausible-but-unauthenticated Initials
-        // also reaches the noq crypto/parser path.
-        if n % 3 == 0 {
-            let forged = forged_initial_without_valid_crypto(n as u8);
-            assert_eq!(source.send_to(&forged, addr).unwrap(), forged.len());
-            sent += 1;
-        }
         if n % 16 == 0 {
             tokio::task::yield_now().await;
         }
     }
 
-    // All injected packets are invalid. There must be no accepted Incoming
-    // before the positive control below; a closed endpoint is also a failure.
     assert!(
         tokio::time::timeout(Duration::from_millis(400), server.accept())
             .await
             .is_err(),
-        "malformed UDP was surfaced as a transport Incoming"
+        "structurally invalid UDP was surfaced as a transport Incoming"
     );
     let wall_ms = started.elapsed().as_millis();
     let rss_after = linux_rss_kib();
     let cpu_after = linux_cpu_ticks();
     let cpu_delta = cpu_before.zip(cpu_after).map(|(a, b)| b.saturating_sub(a));
     eprintln!(
-        "W7_UDP_INITIAL_PRESSURE packets={sent} wall_ms={wall_ms} cpu_ticks_delta={cpu_delta:?} rss_kib_before={rss_before:?} rss_kib_after={rss_after:?} bind=loopback verdict=negative_rejected"
+        "W7_UDP_INITIAL_PRESSURE packets={sent} wall_ms={wall_ms} cpu_ticks_delta={cpu_delta:?} rss_kib_before={rss_before:?} rss_kib_after={rss_after:?} bind=loopback verdict=structural_invalid_rejected"
     );
 
     // Positive control: reject-only or broken servers must NOT pass. Keep the
@@ -182,6 +174,83 @@ async fn malformed_udp_initials_do_not_surface_incoming_and_valid_peer_recovers(
     drop(connected);
     let _ = release_tx.send(());
     assert!(peer.await.unwrap().is_ok(), "valid QUIC client failed");
+    client.close().await;
+    server.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn syntactically_valid_but_unauthenticated_initial_is_not_an_authenticated_peer() {
+    // Security boundary: surfacing an Incoming is not TLS acceptance.
+    // The previous test falsely treated all Incoming as authenticated.
+    let server = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .secret_key(key(43))
+        .alpns(vec![ANCHOR_ALPN.to_vec()])
+        .transport_config(anchor_transport_config())
+        .server_incoming_limits(ServerIncomingLimits::new(1, 4096, 4096).unwrap())
+        .bind()
+        .await
+        .unwrap();
+    let addr = *server
+        .bound_sockets()
+        .iter()
+        .find(|addr| addr.is_ipv4() && addr.ip().is_loopback())
+        .expect("loopback only");
+    let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let invalid_crypto = forged_initial_without_valid_crypto(17);
+    assert_eq!(raw.send_to(&invalid_crypto, addr).unwrap(), invalid_crypto.len());
+
+    // Both results are allowed: parser-level drop, or a pending Incoming
+    // that can NEVER become a successfully authenticated TLS Connection.
+    // Keep this gate bounded even if an unauthenticated peer never responds.
+    let surfaced = match tokio::time::timeout(
+        Duration::from_millis(500),
+        server.accept(),
+    ).await {
+        Err(_) => false, // rejected before Incoming
+        Ok(Some(pending)) => {
+            let result = tokio::time::timeout(
+                Duration::from_millis(300), pending
+            ).await;
+            assert!(
+                !matches!(result, Ok(Ok(_))),
+                "forged unauthenticated Initial completed QUIC/TLS"
+            );
+            true
+        }
+        Ok(None) => panic!("server closed after one invalid Initial"),
+    };
+    eprintln!(
+        "W7_FORGED_INITIAL_AUTH invalid_initials=1 surfaced_pending={surfaced} authenticated=0 max_pending=1"
+    );
+
+    // One real independent endpoint must still succeed afterward.
+    let client = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .secret_key(key(51))
+        .bind()
+        .await
+        .unwrap();
+    let src = client.clone();
+    let server_addr = server.addr();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let peer = tokio::spawn(async move {
+        let outcome = src.connect(server_addr, ANCHOR_ALPN).await;
+        let _ = release_rx.await;
+        outcome.map(|_| ())
+    });
+    let pending = tokio::time::timeout(Duration::from_secs(5), server.accept())
+        .await.expect("genuine Initial not admitted").expect("closed");
+    let connection = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await.expect("genuine handshake timeout").expect("invalid genuine handshake");
+    assert_eq!(connection.remote_id(), key(51).public());
+    drop(connection);
+    let _ = release_tx.send(());
+    assert!(peer.await.unwrap().is_ok());
     client.close().await;
     server.close().await;
 }
