@@ -1,0 +1,68 @@
+name: Roha combined noq #9 — hosted locked acceptance
+
+on:
+  push:
+    branches:
+      - "audit/noq-forks-17parts-*"
+    paths:
+      - ".github/workflows/roha-combined-noq-gate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-iroh:
+    name: Roha #12 — exact Cargo.lock and 1.91 iroh library
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      ROHA_SHA: "554d5202b63e32b8a79156f7da2807d0f4859e4b"
+      NOQ_SHA: "538346e8fb300598991de560566289121e9528e9"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.91"
+      - name: Checkout exact combined Roha laboratory revision
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/calex794/roha.git roha
+          git -C roha checkout --detach "$ROHA_SHA"
+          test "$(git -C roha rev-parse HEAD)" = "$ROHA_SHA"
+          test -z "$(git -C roha status --porcelain)"
+      - name: Confirm exact three-crate fork provenance using Cargo's locked metadata
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /tmp/roha-combined-metadata.json
+          python3 - <<'PY'
+          import json, os, pathlib
+          data = json.loads(pathlib.Path("/tmp/roha-combined-metadata.json").read_text())
+          sha = os.environ["NOQ_SHA"]
+          for name in ("noq", "noq-proto", "noq-udp"):
+              matches = [p for p in data["packages"] if p["name"] == name]
+              if len(matches) != 1:
+                  raise SystemExit(f"{name}: expected one package, found {len(matches)}")
+              pkg = matches[0]
+              source = "git+https://github.com/calex794/noq?rev=" + sha + "#" + sha
+              if pkg["version"] != "1.4.0" or pkg["source"] != source:
+                  raise SystemExit(f"{name}: unexpected source/version: {pkg['source']} {pkg['version']}")
+          print("PASS: all 3 noq 1.4.0 crates resolved at one exact combined SHA; no duplicates")
+          PY
+          test -z "$(git status --porcelain)"
+      - name: Compile Roha iroh against combined fork with immutable lock
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          cargo check --locked -p iroh
+      - name: Run Roha iroh library tests against combined fork
+        working-directory: roha
+        run: |
+          set -euo pipefail
+          cargo test --locked -p iroh --lib
+      - name: Record scope and remaining rollout gates
+        run: |
+          printf '%s\n'             "Hosted Roha #12 $ROHA_SHA accepts combined noq #9 $NOQ_SHA on locked Linux iroh unit suite."             "Patchbay, Windows/macOS/Android, path churn and Akula file-integrity still unverified."             >> "$GITHUB_STEP_SUMMARY"
