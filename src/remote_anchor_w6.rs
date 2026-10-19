@@ -101,6 +101,21 @@ pub struct AnchorServicePolicy {
     /// Never store its private key on the authority service.
     pub recovery_witness: VerifyingKey,
 }
+fn validate_distinct_trust_roles(
+    policy:&AnchorServicePolicy,
+)->Result<(),RemoteAnchorError>{
+    let operator=policy.operator.as_bytes();
+    let witness=policy.recovery_witness.as_bytes();
+    let reader=policy.reader.as_bytes();
+    let administrator=policy.administrator.as_bytes();
+    if operator==witness || operator==reader || operator==administrator
+        || witness==reader || witness==administrator
+        || reader==administrator
+    {
+        return Err(RemoteAnchorError::ConfigurationMismatch);
+    }
+    Ok(())
+}
 fn to_int(revision:u64) -> Result<i64,RemoteAnchorError> {
     if revision>i64::MAX as u64 {return Err(RemoteAnchorError::Protocol);}
     Ok(revision as i64)
@@ -210,9 +225,7 @@ impl RemoteAnchorLedger {
         path:&Path, policy:AnchorServicePolicy, initial:PolicyCheckpoint,
     )->Result<Self,RemoteAnchorError>{
         let _=to_int(initial.revision)?;
-        if policy.operator==policy.recovery_witness {
-            return Err(RemoteAnchorError::ConfigurationMismatch);
-        }
+        validate_distinct_trust_roles(&policy)?;
         // IMPORTANT: never run CREATE TABLE/ALTER on any existing authority
         // file. Earlier logic made an old v2 database look v3-compatible
         // even though reprovision ultimately returned AlreadyProvisioned.
@@ -255,9 +268,7 @@ impl RemoteAnchorLedger {
         let sql=Sqlite::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         sql.busy_timeout(Duration::from_secs(2))?;
         sql.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL;")?;
-        if policy.operator==policy.recovery_witness {
-            return Err(RemoteAnchorError::ConfigurationMismatch);
-        }
+        validate_distinct_trust_roles(&policy)?;
         let found=Self::record(&sql)?;
         let trusted=found.ok_or(RemoteAnchorError::NotProvisioned)?;
         // The recovery journal is mandatory. No implicit legacy schema
@@ -437,6 +448,8 @@ impl RemoteAnchorLedger {
             || order.previous_reader!=self.policy.reader
             || order.replacement_reader==order.previous_reader
             || order.replacement_reader==self.policy.administrator
+            || order.replacement_reader.as_bytes()==self.policy.operator.as_bytes()
+            || order.replacement_reader.as_bytes()==self.policy.recovery_witness.as_bytes()
             || order.nonce==[0;32]
             || order.generation==0
         {
