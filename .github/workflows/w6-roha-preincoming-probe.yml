@@ -1,0 +1,63 @@
+name: W6 pinned Roha pre-Incoming limits lab
+
+on:
+  push:
+    branches:
+      - "fix/w6-roha-preincoming-patch-probe-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roha-noq-patch-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout wow patch and probe sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.91.0"
+      - name: Fetch exact public Roha Git tree in disposable sibling checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROHA="$GITHUB_WORKSPACE/../roha"
+          mkdir -p "$ROHA"
+          git -C "$ROHA" init -q
+          git -C "$ROHA" remote add origin https://github.com/calex794/roha.git
+          git -C "$ROHA" -c protocol.version=2 fetch -q --depth=1 origin a42ad5aef1626df80d39398e05dac6e362bf6e49
+          git -C "$ROHA" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$ROHA" rev-parse HEAD)" = a42ad5aef1626df80d39398e05dac6e362bf6e49
+      - name: Apply guarded Roha transport patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROHA="$GITHUB_WORKSPACE/../roha"
+          python3 tools/w6_roha_preincoming_patch.py "$ROHA"
+          git -C "$ROHA" diff --check
+          git -C "$ROHA" diff --binary -- iroh/src/endpoint.rs iroh/src/socket.rs > roha-preincoming.patch
+          test -s roha-preincoming.patch
+      - name: Verify pinned Roha/noq library and limit-constructor unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/../roha"
+          cargo check --locked -p iroh --features tls-ring
+          cargo test --locked -p iroh --lib --features tls-ring server_incoming_limits_tests
+      - name: Verify public endpoint builder API and ALPN TLS handshake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/roha_preincoming_probe/Cargo.toml -- --nocapture
+      - name: Upload exact pinned source patch for upstream review
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: w6-roha-preincoming-source-patch
+          path: roha-preincoming.patch
+          if-no-files-found: warn
