@@ -434,6 +434,18 @@ impl Mailbox {
                 digest.as_bytes().as_slice(), sealed, expires_at, now
             ],
         )?;
+        // Explicit test-only fault hook. No effect without BOTH debug build and
+        // the opt-in feature; never takes network input or a user-supplied path.
+        #[cfg(all(feature = "mailbox-put-fault-test", debug_assertions, target_os = "linux"))]
+        {
+            if std::env::var_os("STAYA_MAILBOX_PRECOMMIT_CHILD").is_some() {
+                let marker = self.path.with_extension("before-commit-marker");
+                std::fs::write(&marker, b"SQL_INSERTED_NOT_COMMITTED")?;
+                // Parent sends SIGKILL. Bounded wait fails closed if not killed.
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                panic!("test fault hook survived expected SIGKILL");
+            }
+        }
         tx.commit()?;
         Ok(PutStatus::Stored)
     }

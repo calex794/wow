@@ -29,6 +29,10 @@ jobs:
         run: cargo test --features iroh-transport --all-targets
       - name: Strict Clippy including real iroh adapter
         run: cargo clippy --features iroh-transport --all-targets -- -D warnings
+      - name: Opt-in real Mailbox precommit SIGKILL (Linux debug only)
+        run: cargo test --features mailbox-put-fault-test --test w6_real_put_precommit_kill -- --nocapture
+      - name: Strict Clippy for opt-in fault-injection test
+        run: cargo clippy --features mailbox-put-fault-test --test w6_real_put_precommit_kill -- -D warnings
 
   enospc:
     runs-on: ubuntu-latest

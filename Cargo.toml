@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [features]
 default = []
 iroh-transport = ["dep:iroh", "dep:tokio"]
+# Explicit opt-in TEST ONLY: pauses a real Mailbox::put_inner transaction
+# after SQL INSERT and before COMMIT so an independent process can SIGKILL it.
+# Never enable in user-facing or release builds.
+mailbox-put-fault-test = []
 
 [dependencies]
 # Project-pinned transport fork: same revisions as Akula/staya/roha-transport.
