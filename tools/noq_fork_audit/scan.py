@@ -86,7 +86,7 @@ def scan(api: Github, shard=0, max_forks=0, detail_limit=80, max_branch_pages=10
             "repo": full_name, "part": part_of(full_name),
             "default_branch": observed.get("default_branch"),
             "archived": bool(observed.get("archived", False)),
-            "lineage": "unverified", "branch_count": 0,
+            "lineage": "unverified", "branch_count": 0, "branches_truncated": False,
             "candidate_branches": 0,
         }
         inventory.append(entry)
@@ -101,6 +101,7 @@ def scan(api: Github, shard=0, max_forks=0, detail_limit=80, max_branch_pages=10
                 "/repos/" + full_name + "/branches", max_pages=max_branch_pages
             )
             entry["branch_count"] = len(branches)
+            entry["branches_truncated"] = too_many
             if too_many:
                 notes.append(full_name + ": branch listing truncated")
             for ref in branches:
@@ -188,6 +189,15 @@ def scan(api: Github, shard=0, max_forks=0, detail_limit=80, max_branch_pages=10
     if errors:
         notes.append(f"{len(errors)} upstream API/lineage/comparison errors")
     notes = list(dict.fromkeys(notes))
+    public_inventory_complete = (
+        len(selected) == len(all_selected)
+        and len(inventory) == len(selected)
+        and all(x["lineage"] == "verified" and not x["branches_truncated"]
+                for x in inventory)
+        and len(rows) == sum(x["branch_count"] for x in inventory)
+        and all(x["comparison"] == "upstream"
+                and not x["truncated_commits"] for x in rows)
+    )
     grouped = Counter(x["priority"] for x in candidates.values())
     return {
         "schema": "noq-fork-audit-v1",
@@ -206,6 +216,8 @@ def scan(api: Github, shard=0, max_forks=0, detail_limit=80, max_branch_pages=10
             "checked_commit_details": checked,
             "triage_priorities": dict(grouped),
             "api_calls": api.calls, "rate_remaining": api.remaining,
+            "public_branch_inventory_complete": public_inventory_complete,
+            "commit_details_complete": checked == len(candidates),
             "partial": bool(notes), "partial_reasons": notes[:100],
         },
         "forks": inventory, "branches": rows,
