@@ -6,7 +6,7 @@
 //! noq/iroh packet parser before Endpoint::accept() yields. Internet
 //! deployment still needs independent network-edge limits.
 use crate::remote_anchor_w6::{RemoteAnchorLedger,serve_one_anchor_connection};
-use iroh::endpoint::{Incoming,QuicTransportConfig,VarInt};
+use iroh::endpoint::{Incoming,QuicTransportConfig,ServerIncomingLimits,VarInt};
 use std::{sync::{Arc,Mutex},time::{Duration,Instant}};
 use tokio::sync::{OwnedSemaphorePermit,Semaphore};
 
@@ -129,6 +129,15 @@ impl AnchorAdmission {
     }
 }
 
+/// Noq transport pre-Incoming budgets. Applied at Endpoint::Builder before
+/// bind, NOT at accept() or during TLS. These cap transport pending queue
+/// objects and subsequently buffered packets; the first QUIC Initial packet
+/// and UDP parser/kernel buffers still require separate network safeguards.
+pub fn anchor_incoming_limits()->ServerIncomingLimits{
+    ServerIncomingLimits::new(32,4096,65536)
+        .expect("fixed nonzero Roha Incoming limits with adequate total budget")
+}
+
 /// QUIC state-machine memory bounds configured BEFORE endpoint binding.
 /// 1 bidirectional request-response stream and 1 unidirectional receipt;
 /// each request is <=339 bytes. Connection-wide receive cap 8 KiB.
@@ -202,6 +211,15 @@ mod tests {
         assert!(b.try_take(start+Duration::from_secs(5),p));
         assert!(b.try_take(start+Duration::from_secs(5),p));
         assert!(!b.try_take(start+Duration::from_secs(5),p));
+    }
+    #[test]
+    fn no_optional_preincoming_limits_are_unbounded_in_this_authority(){
+        // Explicitly require the dedicated fork's *transport* API rather
+        // than trusting the application-side semaphore as a substitute.
+        let q=anchor_incoming_limits();
+        assert_eq!(q.max_incoming(),32);
+        assert_eq!(q.per_incoming_bytes(),4096);
+        assert_eq!(q.total_incoming_bytes(),65536);
     }
     #[test]
     fn bounded_quic_transport_parameters_build(){
