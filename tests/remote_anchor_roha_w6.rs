@@ -79,7 +79,11 @@ impl Server {
             .alpns(vec![ANCHOR_ALPN.to_vec()])
             .bind().await.unwrap();
         let ep=endpoint.clone();
-        let slots=Arc::new(tokio::sync::Semaphore::new(4));
+        // Three independent TLS writer clients plus admin, repeated
+        // short-lived RPC connections and cleanup overlap. Keep admission
+        // BOUNDED but do not conflate honest burst saturation with an
+        // authorization failure. Production pre-TLS quotas are separate P0.
+        let slots=Arc::new(tokio::sync::Semaphore::new(16));
         let task=tokio::spawn(async move {
             loop {
                 let Some(incoming)=ep.accept().await else {return};
