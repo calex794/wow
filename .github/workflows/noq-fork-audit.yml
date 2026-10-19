@@ -1,0 +1,133 @@
+name: NOQ forks | 17-part automated audit
+
+on:
+  schedule:
+    # Rotate through one of 17 stable parts daily (UTC). Only active on main.
+    - cron: "27 4 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Scan entire fork network or one 17-part shard"
+        type: choice
+        required: true
+        default: full
+        options: [full, daily, part]
+      part:
+        description: "Part number 1..17 when mode=part"
+        type: number
+        required: false
+        default: 1
+  push:
+    branches:
+      - "feat/noq-fork-audit-actions-*"
+    paths:
+      - "tools/noq_fork_audit/**"
+      - ".github/workflows/noq-fork-audit.yml"
+  pull_request:
+    paths:
+      - "tools/noq_fork_audit/**"
+      - ".github/workflows/noq-fork-audit.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noq-fork-audit-index
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      AUDIT_MODE: ${{ inputs.mode || 'daily' }}
+      AUDIT_PART: ${{ inputs.part || '1' }}
+    steps:
+      - name: Checkout trusted auditor, never checkout external forks
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Verify Python and offline regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m compileall -q tools/noq_fork_audit
+          python3 -m unittest discover -s tools/noq_fork_audit/tests -v
+
+      - name: Enumerate source forks, branches, commit candidates and 17 parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            PART=-1
+            LIMIT=0
+            DETAILS=100
+            BUDGET=850
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            LIMIT=0
+            DETAILS=100
+            BUDGET=900
+            case "$AUDIT_MODE" in
+              full) PART=0 ;;
+              daily) PART=-1 ;;
+              part)
+                [[ "$AUDIT_PART" =~ ^[0-9]+$ ]] || exit 2
+                (( AUDIT_PART >= 1 && AUDIT_PART <= 17 )) || exit 2
+                PART="$AUDIT_PART"
+                ;;
+              *) exit 2 ;;
+            esac
+          else
+            # PR and branch pushes are read-only bounded smoke tests.
+            PART=0
+            LIMIT=5
+            DETAILS=12
+            BUDGET=170
+          fi
+          python3 -m tools.noq_fork_audit.cli scan \
+            --part "$PART" \
+            --max-forks "$LIMIT" \
+            --detail-limit "$DETAILS" \
+            --max-requests "$BUDGET" \
+            --out out/noq-forks
+
+      - name: Upload snapshot, CSV matrices and 17 reproducible part files
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: noq-fork-audit-${{ github.run_id }}
+          path: out/noq-forks
+          retention-days: 60
+          if-no-files-found: warn
+
+  publish:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    needs: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout trusted auditor on scheduled/manual default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Download THIS run's finished report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: noq-fork-audit-${{ github.run_id }}
+          path: out/noq-forks
+      - name: Upsert one durable 17-part GitHub issue index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m tools.noq_fork_audit.cli publish --out out/noq-forks
