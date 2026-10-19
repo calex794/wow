@@ -190,11 +190,14 @@ pub async fn receive_authenticated_iroh_mailbox(
     if tokio::time::Instant::now() >= end {
         return Err(IrohIngressError::DeadlineExceeded);
     }
-    // BEGIN IMMEDIATE on the *shared* policy SQLite file serializes policy
-    // changes from other OS processes with this final authorization+Mailbox
-    // COMMIT. Re-check external checkpoint under this same SQLite lock. The in-process mutex is still needed for the rusqlite handle.
-    // No network I/O or await under either lock. Admin revocation committed
-    // first will fail closed; Mailbox COMMIT first completes before revoke.
+    // BEGIN IMMEDIATE on this host's policy DB serializes local writers.
+    // Before invoking the actual durable Mailbox COMMIT, the cross-host
+    // policy method also obtains a durable remote WRITE-BEGIN fence,
+    // atomically serialized by authority SQLite against signed revoke CAS.
+    // WRITE-FINISH runs only after the Mailbox COMMIT and local transaction.
+    // This performs bounded synchronous QUIC RPCs while policy locks are
+    // held (NO Tokio .await here): latency or outage blocks locally, fail
+    // closed. A different host's signed revoke cannot publish mid-COMMIT.
     let mut enrollment = context.enrollments.lock()
         .map_err(|_| IrohIngressError::LockPoisoned)?;
     enrollment.with_anchored_write(
