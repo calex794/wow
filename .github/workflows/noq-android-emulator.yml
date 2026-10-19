@@ -6,6 +6,7 @@ on:
       - "audit/noq-forks-17parts-*"
     paths:
       - ".github/workflows/noq-android-emulator.yml"
+      - ".github/scripts/noq-android-regressions.sh"
   workflow_dispatch:
 
 permissions:
@@ -70,20 +71,7 @@ jobs:
           force-avd-creation: true
           disable-animations: true
           emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -netfast -no-metrics
-          script: |
-            set -eu
-            adb wait-for-device
-            target="noq/target/x86_64-linux-android/debug/deps"
-            binary=$(find "$target" -maxdepth 1 -type f -name 'noq_proto-*' -perm /111 -print -quit)
-            test -n "$binary"
-            adb push "$binary" /data/local/tmp/noq_proto_gate
-            adb shell chmod 755 /data/local/tmp/noq_proto_gate
-            for case in               tests::multipath::backup_path_keepalive_not_suppressed_by_incoming_ping               tests::multipath::regression_locally_abandoned_unseen_path_discarded               connection::streams::state::tests::stopped_reset_flow_control               connection::streams::state::tests::reset_stopped_flow_control; do
-              echo "ANDROID EMULATOR RUN: $case"
-              adb shell "/data/local/tmp/noq_proto_gate $case --exact --nocapture" | tee /tmp/noq-android-case.log
-              grep -q 'test result: ok. 1 passed; 0 failed' /tmp/noq-android-case.log
-            done
-            adb shell rm -f /data/local/tmp/noq_proto_gate
+          script: bash .github/scripts/noq-android-regressions.sh
       - name: Record scope
         run: |
           printf '%s\n'             "PASS: 4 combined noq protocol regressions executed as native Android x86_64 test binary on API35 emulator."             "Does not prove arm64 handset network migration, real Android Akula app, or file custody."             >> "$GITHUB_STEP_SUMMARY"
