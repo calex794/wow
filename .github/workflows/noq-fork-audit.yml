@@ -30,7 +30,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: noq-fork-audit-index
@@ -38,6 +37,8 @@ concurrency:
 
 jobs:
   audit:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 55
     env:
@@ -104,8 +105,28 @@ jobs:
           retention-days: 60
           if-no-files-found: warn
 
-      - name: Update ONE durable GitHub issue index (scheduled or manual only)
-        if: ${{ success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+  publish:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    needs: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout trusted auditor on scheduled/manual default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Download THIS run's finished report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: noq-fork-audit-${{ github.run_id }}
+          path: out/noq-forks
+      - name: Upsert one durable 17-part GitHub issue index
         shell: bash
         run: |
           set -euo pipefail
