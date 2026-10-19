@@ -254,3 +254,146 @@ async fn syntactically_valid_but_unauthenticated_initial_is_not_an_authenticated
     client.close().await;
     server.close().await;
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_of_genuine_quic_initials_obeys_pending_cap_then_recovers() {
+    // W7/F14 follow-up to W6's single-pending gate: multiple real client
+    // QUIC Initials, not forged UDP payloads. Every endpoint is loopback
+    // only, and the number of clients and test duration are fixed.
+    const MAX_PENDING: usize = 2;
+    const CONTENDERS: usize = 8;
+    let server = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .secret_key(key(43))
+        .alpns(vec![ANCHOR_ALPN.to_vec()])
+        .transport_config(anchor_transport_config())
+        .server_incoming_limits(
+            ServerIncomingLimits::new(MAX_PENDING, 4096, 8192).unwrap(),
+        )
+        .bind()
+        .await
+        .unwrap();
+    assert!(
+        server.bound_sockets().iter().all(|addr| addr.ip().is_loopback()),
+        "no public listener is permitted in the pressure lab"
+    );
+    let server_addr = server.addr();
+    let rss_before = linux_rss_kib();
+    let cpu_before = linux_cpu_ticks();
+    let started = Instant::now();
+
+    // Deliberately keep two real transport Incoming objects unaccepted.
+    // Neither one has passed TLS authentication yet.
+    let mut held = Vec::new();
+    let mut holders = Vec::new();
+    for n in 0..MAX_PENDING {
+        let client = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .secret_key(key(60 + n as u8))
+            .bind()
+            .await
+            .unwrap();
+        let client_ep = client.clone();
+        let addr = server_addr.clone();
+        let task = tokio::spawn(async move {
+            let _ = client_ep.connect(addr, ANCHOR_ALPN).await;
+        });
+        let incoming = tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("genuine QUIC Initial did not reach the server")
+            .expect("server stopped accepting");
+        held.push(incoming);
+        holders.push((client, task));
+    }
+    assert_eq!(held.len(), MAX_PENDING);
+
+    // Eight independent, valid Iroh clients now compete for capacity.
+    // None can surface another Pending Incoming while both slots are held.
+    let mut contenders = Vec::new();
+    for n in 0..CONTENDERS {
+        let client = Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .secret_key(key(70 + n as u8))
+            .bind()
+            .await
+            .unwrap();
+        let client_ep = client.clone();
+        let addr = server_addr.clone();
+        let task = tokio::spawn(async move {
+            let _ = client_ep.connect(addr, ANCHOR_ALPN).await;
+        });
+        contenders.push((client, task));
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), server.accept())
+            .await
+            .is_err(),
+        "a third Incoming bypassed max_incoming=2 during genuine Initial burst"
+    );
+
+    let wall_ms = started.elapsed().as_millis();
+    let rss_after = linux_rss_kib();
+    let cpu_after = linux_cpu_ticks();
+    let cpu_delta = cpu_before
+        .zip(cpu_after)
+        .map(|(before, after)| after.saturating_sub(before));
+    eprintln!(
+        "W7_VALID_INITIAL_PRESSURE held={MAX_PENDING} competing={CONTENDERS} \
+         wall_ms={wall_ms} cpu_ticks_delta={cpu_delta:?} \
+         rss_kib_before={rss_before:?} rss_kib_after={rss_after:?} \
+         listener=loopback verdict=pending_cap_observed"
+    );
+
+    // Close all refused peers BEFORE releasing the two pending slots.
+    // Otherwise their automatic QUIC retransmissions could legitimately
+    // grab newly freed capacity and make the recovery assertion race.
+    for (client, task) in contenders {
+        task.abort();
+        client.close().await;
+    }
+    for (client, task) in holders {
+        task.abort();
+        client.close().await;
+    }
+    drop(held);
+
+    // Independent positive control: a new, genuinely authenticated peer
+    // must still be able to connect after the pending slots are released.
+    let client = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .secret_key(key(90))
+        .bind()
+        .await
+        .unwrap();
+    let client_ep = client.clone();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let peer = tokio::spawn(async move {
+        let result = client_ep.connect(server_addr, ANCHOR_ALPN).await;
+        let _ = release_rx.await;
+        result.map(|_| ())
+    });
+    let pending = tokio::time::timeout(Duration::from_secs(5), server.accept())
+        .await
+        .expect("fresh Initial blocked after pending capacity was released")
+        .expect("server closed after pressure");
+    let connected = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("fresh TLS handshake timed out")
+        .expect("fresh TLS handshake failed");
+    assert_eq!(connected.remote_id(), key(90).public());
+    drop(connected);
+    let _ = release_tx.send(());
+    assert!(peer.await.unwrap().is_ok(), "recovery client failed");
+    client.close().await;
+    server.close().await;
+}
