@@ -123,6 +123,12 @@ def sender(args):
     storage = begin(args)
     router = LXMF.LXMRouter(storagepath=str(storage))
     src = router.register_delivery_identity(RNS.Identity(), display_name="lab-sender")
+    # Lab pairing: export only the public key and its derived LXMF destination.
+    # This simulates a user-verified device identity, never a secret key.
+    Path(args.sender_public).write_text(
+        src.hash.hex() + " " + src.identity.get_public_key().hex() + "\n"
+    )
+    emit("LXMF_SENDER_PUBLIC_IDENTITY_PINNED")
     next_announce = 0
 
     def announce():
@@ -171,12 +177,31 @@ def sync(args):
     router = LXMF.LXMRouter(storagepath=str(storage))
     dest = router.register_delivery_identity(ident, display_name="lab-recipient")
     assert dest.hash == read_hash(args.recipient_addr)
+    # After a relay SIGKILL, RNS may no longer know the sender announce.
+    # Load a pre-verified public identity, as Akula device pairing would.
+    source_hex, public_hex = wait_for(args.sender_public).split()
+    source_hash = bytes.fromhex(source_hex)
+    public_key = bytes.fromhex(public_hex)
+    assert len(public_key) == RNS.Identity.KEYSIZE // 8
+    source_identity = RNS.Identity(create_keys=False)
+    assert source_identity.load_public_key(public_key)
+    pinned_destination = RNS.Destination(
+        source_identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "lxmf", "delivery"
+    )
+    assert pinned_destination.hash == source_hash, "public key does not match sender hash"
+    RNS.Identity.remember(
+        RNS.Identity.full_hash(public_key), source_hash, public_key
+    )
+    assert RNS.Identity.recall(source_hash, _no_use=True) is not None
+    emit("LXMF_TRUSTED_SENDER_IDENTITY_RESTORED")
     count = [0]
 
     def on_delivery(msg):
         emit("LXMF_RECEIVER_CALLBACK signature=" + str(msg.signature_validated)
              + " text=" + str(msg.content_as_string()))
         assert msg.signature_validated, "invalid or unverified signature"
+        assert msg.source_hash == source_hash, "message from unpinned sender"
         assert msg.content_as_string() == MARKER, "wrong decoded payload"
         count[0] += 1
         if count[0] == 1:
@@ -220,6 +245,7 @@ if __name__ == "__main__":
     ap.add_argument("--recipient-offline")
     ap.add_argument("--sender-ready")
     ap.add_argument("--delivered")
+    ap.add_argument("--sender-public")
     ap.add_argument("--expect-recovered", type=int, default=0)
     a = ap.parse_args()
     try:
