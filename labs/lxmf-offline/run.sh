@@ -88,6 +88,21 @@ echo LXMF_RECIPIENT_STOPPED_BEFORE_SEND
 for i in $(seq 1 100); do test -s "$ROOT/p/stored" && break; sleep 1; done
 test -s "$ROOT/p/stored"
 echo LXMF_CIPHERTEXT_STORED_WHILE_B_OFFLINE
+STORE_DIR="$ROOT/p/lxmf/messagestore"
+test "$(find "$STORE_DIR" -type f | wc -l)" -eq 1
+SAVED_HASH="$(sha256sum "$STORE_DIR"/* | awk '{print $1}')"
+SAVED_NODE="$(cat "$ROOT/p/node.addr")"
+sudo ip netns pids lx-p | xargs -r sudo kill -9
+for i in $(seq 1 20); do test -z "$(sudo ip netns pids lx-p)" && break; sleep 1; done
+test -z "$(sudo ip netns pids lx-p)"
+echo LXMF_PROPAGATION_NODE_KILLED_AFTER_STORE
+rm -f "$ROOT/p/stored"
+sudo ip netns exec lx-p "$PYTHON" "$PROBE" node --config "$ROOT/p" --storage "$ROOT/p" --expect-recovered 1 > "$ROOT/node-restart.log" 2>&1 &
+for i in $(seq 1 30); do grep -q LXMF_RESTART_INDEX_RECOVERED "$ROOT/node-restart.log" && break; sleep 1; done
+grep -q LXMF_RESTART_INDEX_RECOVERED "$ROOT/node-restart.log"
+test "$SAVED_NODE" = "$(cat "$ROOT/p/node.addr")"
+test "$SAVED_HASH" = "$(sha256sum "$STORE_DIR"/* | awk '{print $1}')"
+echo LXMF_RESTART_CIPHERTEXT_AND_IDENTITY_OK
 sudo ip netns exec lx-b "$PYTHON" "$PROBE" sync --config "$ROOT/b" --storage "$ROOT/b" --node-addr "$ROOT/p/node.addr" --recipient-addr "$ROOT/b/recipient.addr" --delivered "$ROOT/b/delivered" > "$ROOT/sync.log" 2>&1 &
 for i in $(seq 1 105); do grep -q LXMF_SECOND_SYNC_NO_DUPLICATE_PASS "$ROOT/sync.log" && break; sleep 1; done
 grep -q LXMF_SECOND_SYNC_NO_DUPLICATE_PASS "$ROOT/sync.log"
