@@ -73,7 +73,7 @@ def node(args):
     storage = begin(args)
     identity = identity_file(storage / "node-identity")
     router = LXMF.LXMRouter(identity=identity, storagepath=str(storage),
-                            name="akula-lxmf-lab", autopeer=False)
+                            name="akula-lxmf-lab", autopeer=False, propagation_cost=13)
     router.set_message_storage_limit(megabytes=4)
     router.enable_propagation()
     (storage / "node.addr").write_text(router.propagation_destination.hash.hex())
@@ -141,7 +141,6 @@ def sender(args):
     msg = LXMF.LXMessage(destination, src, MARKER, "offline-lab",
                          desired_method=LXMF.LXMessage.PROPAGATED)
     msg.defer_stamp = False
-    msg.defer_propagation_stamp = False
     router.handle_outbound(msg)
     emit("LXMF_SENT_WHILE_RECIPIENT_OFFLINE")
     # Keep the sender online during subsequent sync, so B can learn A's
