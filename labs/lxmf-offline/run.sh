@@ -83,7 +83,7 @@ test -s "$ROOT/a/ready"
 sudo ip netns pids lx-b | xargs -r sudo kill
 sleep 3
 test -z "$(sudo ip netns pids lx-b)"
-touch "$ROOT/b/offline"
+printf "recipient is offline\n" > "$ROOT/b/offline"
 echo LXMF_RECIPIENT_STOPPED_BEFORE_SEND
 for i in $(seq 1 100); do test -s "$ROOT/p/stored" && break; sleep 1; done
 test -s "$ROOT/p/stored"
