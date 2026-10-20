@@ -1,0 +1,28 @@
+name: Staya LXMF offline store-and-forward laboratory
+on:
+  push:
+    branches: [experiment/staya-lxmf-offline]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-lxmf-offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned real Reticulum and LXMF
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 iputils-ping
+          python -m venv .venv
+          .venv/bin/pip install -q cryptography pyserial
+          git clone --filter=blob:none https://github.com/markqvist/Reticulum.git external-rns
+          (cd external-rns && git checkout --detach e40191b3d193b46b7f2d8a44424a594cd758839b)
+          .venv/bin/pip install -q --no-deps ./external-rns
+          git clone --filter=blob:none https://github.com/markqvist/LXMF.git external-lxmf
+          (cd external-lxmf && git checkout --detach c3ff2d6dc2f256daab896dadc044dd5a913ecbb7)
+          .venv/bin/pip install -q --no-deps ./external-lxmf
+          .venv/bin/python -c "import RNS,LXMF; print('REAL_RNS_LXMF_IMPORT_OK')"
+      - name: Verify recipient-offline ciphertext persistence and retrieval
+        run: bash labs/lxmf-offline/run.sh
