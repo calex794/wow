@@ -76,6 +76,14 @@ def node(args):
                             name="akula-lxmf-lab", autopeer=False, propagation_cost=13)
     router.set_message_storage_limit(megabytes=4)
     router.enable_propagation()
+    if args.expect_recovered:
+        assert len(router.propagation_entries) == args.expect_recovered, (
+            "reloaded message count mismatch: " + str(len(router.propagation_entries))
+        )
+        for entry in router.propagation_entries.values():
+            blob = Path(entry[1]).read_bytes()
+            assert blob and MARKER.encode() not in blob
+        emit("LXMF_RESTART_INDEX_RECOVERED count=" + str(len(router.propagation_entries)))
     (storage / "node.addr").write_text(router.propagation_destination.hash.hex())
     emit("LXMF_PROPAGATION_NODE_READY", router.propagation_destination.hash.hex())
     next_announce = 0
@@ -212,6 +220,7 @@ if __name__ == "__main__":
     ap.add_argument("--recipient-offline")
     ap.add_argument("--sender-ready")
     ap.add_argument("--delivered")
+    ap.add_argument("--expect-recovered", type=int, default=0)
     a = ap.parse_args()
     try:
         {"node": node, "advertise": advertise,
