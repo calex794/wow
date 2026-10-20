@@ -77,7 +77,7 @@ test -s "$ROOT/p/node.addr"
 sudo ip netns exec lx-b "$PYTHON" "$PROBE" advertise --config "$ROOT/b" --storage "$ROOT/b" > "$ROOT/advertise.log" 2>&1 &
 for i in $(seq 1 35); do test -s "$ROOT/b/recipient.addr" && break; sleep 1; done
 test -s "$ROOT/b/recipient.addr"
-sudo ip netns exec lx-a "$PYTHON" "$PROBE" sender --config "$ROOT/a" --storage "$ROOT/a" --node-addr "$ROOT/p/node.addr" --recipient-addr "$ROOT/b/recipient.addr" --recipient-offline "$ROOT/b/offline" --sender-ready "$ROOT/a/ready" --delivered "$ROOT/b/delivered" > "$ROOT/sender.log" 2>&1 &
+sudo ip netns exec lx-a "$PYTHON" "$PROBE" sender --config "$ROOT/a" --storage "$ROOT/a" --node-addr "$ROOT/p/node.addr" --recipient-addr "$ROOT/b/recipient.addr" --recipient-offline "$ROOT/b/offline" --sender-ready "$ROOT/a/ready" --sender-public "$ROOT/a/sender.pub" --delivered "$ROOT/b/delivered" > "$ROOT/sender.log" 2>&1 &
 for i in $(seq 1 90); do test -s "$ROOT/a/ready" && break; sleep 1; done
 test -s "$ROOT/a/ready"
 sudo ip netns pids lx-b | xargs -r sudo kill
@@ -103,7 +103,7 @@ grep -q LXMF_RESTART_INDEX_RECOVERED "$ROOT/node-restart.log"
 test "$SAVED_NODE" = "$(cat "$ROOT/p/node.addr")"
 test "$SAVED_HASH" = "$(sha256sum "$STORE_DIR"/* | awk '{print $1}')"
 echo LXMF_RESTART_CIPHERTEXT_AND_IDENTITY_OK
-sudo ip netns exec lx-b "$PYTHON" "$PROBE" sync --config "$ROOT/b" --storage "$ROOT/b" --node-addr "$ROOT/p/node.addr" --recipient-addr "$ROOT/b/recipient.addr" --delivered "$ROOT/b/delivered" > "$ROOT/sync.log" 2>&1 &
+sudo ip netns exec lx-b "$PYTHON" "$PROBE" sync --config "$ROOT/b" --storage "$ROOT/b" --node-addr "$ROOT/p/node.addr" --recipient-addr "$ROOT/b/recipient.addr" --sender-public "$ROOT/a/sender.pub" --delivered "$ROOT/b/delivered" > "$ROOT/sync.log" 2>&1 &
 for i in $(seq 1 105); do grep -q LXMF_SECOND_SYNC_NO_DUPLICATE_PASS "$ROOT/sync.log" && break; sleep 1; done
 grep -q LXMF_SECOND_SYNC_NO_DUPLICATE_PASS "$ROOT/sync.log"
 grep -q LXMF_OFFLINE_RECIPIENT_RECEIVED_VALIDATED "$ROOT/sync.log"
