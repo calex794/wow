@@ -20,6 +20,8 @@ iroh = { git = "https://github.com/calex794/roha", rev = "a42ad5aef1626df80d3939
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"], optional = true }
 coset = "0.4.2"
 ed25519-dalek = "2.2"
+# Shared transport-independent W3 v2 verifier, pinned to reviewed Blue SHA.
+akula-blue-w3 = { git = "https://github.com/calex794/blue", rev = "76675f9fbb7e86c67a24d20dae60b0ce8227b1c3" }
 hpke = "0.14.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1.5"
