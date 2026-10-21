@@ -7,7 +7,7 @@
 //! Deleted MessageIds are reserved for a bounded retention window only;
 //! this journal cannot guarantee lifetime-unique identifiers.
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const HARD_MAX_RECORDS: usize = 256;
 pub const HARD_MAX_TOTAL_BYTES: usize = 1024 * 1024;
@@ -55,6 +55,9 @@ impl MailboxLimits {
 pub enum MailError {
     Db(rusqlite::Error),
     InvalidLimits,
+    InvalidDiskLimit,
+    Io(std::io::Error),
+    WalCheckpointBusy,
     InvalidTime,
     ClockRollback,
     ReusedMessageId,
@@ -68,6 +71,9 @@ pub enum MailError {
 }
 impl From<rusqlite::Error> for MailError {
     fn from(value: rusqlite::Error) -> Self { Self::Db(value) }
+}
+impl From<std::io::Error> for MailError {
+    fn from(value: std::io::Error) -> Self { Self::Io(value) }
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PutStatus { Stored, Duplicate }
@@ -88,9 +94,26 @@ pub struct MailboxStats {
     pub tombstones: usize,
 }
 
+/// Filesystem observation only: not an atomic snapshot and not an enforced
+/// byte cap. WAL and SHM are distinct files and can grow independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MailboxDiskUsage {
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalCheckpointResult {
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
+}
+
 pub struct Mailbox {
     db: Connection,
     limits: MailboxLimits,
+    path: PathBuf,
 }
 impl Mailbox {
     pub fn open(path: &Path, limits: MailboxLimits) -> Result<Self, MailError> {
@@ -130,7 +153,73 @@ impl Mailbox {
              CREATE INDEX IF NOT EXISTS mailbox_tombstone_gc
                ON mailbox_tombstones(retained_until);",
         )?;
-        Ok(Self {db, limits})
+        Ok(Self {db, limits, path: path.to_path_buf()})
+    }
+
+    /// Explicit opt-in: apply a connection-scoped SQLite main-database page
+    /// bound on EVERY open (SQLite does not persist max_page_count reliably).
+    /// WAL/SHM growth is not controlled by this bound. A too-small bound
+    /// causes writes that require new main-database pages to fail safely.
+    pub fn open_with_main_page_limit(
+        path: &Path, limits: MailboxLimits, max_pages: u32,
+    ) -> Result<Self, MailError> {
+        let mailbox = Self::open(path, limits)?;
+        mailbox.configure_main_page_limit(max_pages)?;
+        Ok(mailbox)
+    }
+
+    fn configure_main_page_limit(&self, max_pages: u32) -> Result<(), MailError> {
+        let used: i64 = self.db.query_row(
+            "PRAGMA page_count", [], |row| row.get(0),
+        )?;
+        if max_pages == 0 || i64::from(max_pages) < used {
+            return Err(MailError::InvalidDiskLimit);
+        }
+        // Numeric input is strongly typed, not user-supplied SQL.
+        let pragma = format!("PRAGMA max_page_count={max_pages}");
+        let actual: i64 = self.db.query_row(&pragma, [], |row| row.get(0))?;
+        if actual != i64::from(max_pages) {
+            return Err(MailError::InvalidDiskLimit);
+        }
+        Ok(())
+    }
+
+    /// The current connection's maximum main-DB pages. This limit MUST be
+    /// reapplied after a restart; it does not cap WAL, SHM, or OS metadata.
+    pub fn main_page_limit(&self) -> Result<u64, MailError> {
+        let pages: i64 = self.db.query_row(
+            "PRAGMA max_page_count", [], |row| row.get(0),
+        )?;
+        u64::try_from(pages).map_err(|_| MailError::CorruptStorage)
+    }
+
+    /// Non-atomic observation of database, -wal and -shm file lengths.
+    /// The normal SQLite WAL lifecycle can create/remove sidecars between
+    /// metadata calls. This is telemetry, NOT disk-quota enforcement.
+    pub fn disk_usage(&self) -> Result<MailboxDiskUsage, MailError> {
+        let database_bytes = file_len_or_zero(&self.path)?;
+        let wal_bytes = file_len_or_zero(&sidecar_path(&self.path, "-wal"))?;
+        let shm_bytes = file_len_or_zero(&sidecar_path(&self.path, "-shm"))?;
+        let total_bytes = database_bytes
+            .checked_add(wal_bytes)
+            .and_then(|n| n.checked_add(shm_bytes))
+            .ok_or(MailError::CorruptStorage)?;
+        Ok(MailboxDiskUsage {
+            database_bytes, wal_bytes, shm_bytes, total_bytes,
+        })
+    }
+
+    /// Privileged, on-demand WAL checkpoint with truncation. No mailbox
+    /// row or receipt is deleted. A pinned reader may prevent truncation;
+    /// failure must not be presented to operators as a successful reclaim.
+    /// Checkpointing is not safe as a replacement for filesystem quotas.
+    pub fn checkpoint_wal_truncate(&self) -> Result<WalCheckpointResult, MailError> {
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 { return Err(MailError::WalCheckpointBusy); }
+        Ok(WalCheckpointResult { log_frames, checkpointed_frames })
     }
 
     /// Enqueue an opaque ciphertext under a recipient-issued routing token.
@@ -346,5 +435,19 @@ impl Mailbox {
         let payload_bytes=usize::try_from(bytes).map_err(|_|MailError::CorruptStorage)?;
         let tombstones=usize::try_from(tombstones).map_err(|_|MailError::CorruptStorage)?;
         Ok(MailboxStats {messages,payload_bytes,tombstones})
+    }
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn file_len_or_zero(path: &Path) -> Result<u64, MailError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(MailError::Io(err)),
     }
 }
