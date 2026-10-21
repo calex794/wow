@@ -8,6 +8,8 @@ pub const MAX_FRAME_BYTES: usize = MAX_MESSAGE_BYTES + 4;
 /// Fixed header (transfer id, 16-bit index, 16-bit count).
 pub const BLE_HEADER_BYTES: usize = 8;
 
+pub mod transport;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
     pub message_id: [u8; 16],
@@ -23,7 +25,7 @@ pub enum WireError {
     TooLarge, Truncated, InvalidEncoding, UnsupportedVersion,
     InvalidPriority, LengthMismatch, FragmentMismatch, FragmentCount,
     ConflictingDuplicate, Incomplete, UnsupportedCriticalExtension,
-    TooManyExtensions,
+    TooManyExtensions, ResourceLimit, NonMonotonicTime,
 }
 
 /// Minimal deterministic CBOR encoding subset: unsigned integers,
@@ -288,7 +290,7 @@ pub fn fragment(encoded: &[u8], transfer_id: u32, mtu: usize) -> Result<Vec<Vec<
     if mtu <= BLE_HEADER_BYTES { return Err(WireError::FragmentCount); }
     let chunk = mtu - BLE_HEADER_BYTES;
     let count = encoded.len().div_ceil(chunk);
-    if count > u16::MAX as usize { return Err(WireError::FragmentCount); }
+    if count > transport::HARD_MAX_PARTS_PER_TRANSFER { return Err(WireError::FragmentCount); }
     let mut out = Vec::with_capacity(count);
     for (index, bytes) in encoded.chunks(chunk).enumerate() {
         let mut f = Vec::with_capacity(BLE_HEADER_BYTES + bytes.len());
@@ -309,7 +311,7 @@ pub struct Reassembler {
 }
 impl Reassembler {
     pub fn new(transfer_id: u32, count: u16) -> Result<Self, WireError> {
-        if count == 0 || count as usize > MAX_MESSAGE_BYTES {
+        if count == 0 || count as usize > transport::HARD_MAX_PARTS_PER_TRANSFER {
             return Err(WireError::FragmentCount);
         }
         Ok(Self { transfer_id, parts: vec![None; count as usize], len: 0 })
