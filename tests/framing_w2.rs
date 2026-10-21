@@ -43,9 +43,10 @@ fn frame(id:u32,i:u16,count:u16,payload:&[u8])->Vec<u8>{
   else {assert_eq!(result,Some(source.clone()));}
  }
  assert_eq!(p.stats().transfers,0);
- let _=p.accept(peer(1),1000,&f[0]).unwrap();
- assert_eq!(p.accept(peer(1),1001,&f[0]),Ok(None));
- let mut changed=f[0].clone();*changed.last_mut().unwrap()^=1;
+ let mut fresh=f[0].clone();fresh[..4].copy_from_slice(&124u32.to_be_bytes());
+ let _=p.accept(peer(1),1000,&fresh).unwrap();
+ assert_eq!(p.accept(peer(1),1001,&fresh),Ok(None));
+ let mut changed=fresh.clone();*changed.last_mut().unwrap()^=1;
  assert_eq!(p.accept(peer(1),1002,&changed),Err(WireError::ConflictingDuplicate));
  assert_eq!(p.stats().transfers,0);
 }
