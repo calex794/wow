@@ -49,3 +49,45 @@ fn hdr()->SignedHeader{SignedHeader{message_id:[1;16],recipient_id:[2;16],
  assert!(matches!(open(&old,TrustedRecipient{secret:&secret,recipient_id:h.recipient_id,
  now:100,registry:&trust}),Err(CryptoError::UnknownSuite)));
 }
+
+#[test]
+fn verified_blue_boundary_keeps_exact_ciphertext_and_digest() {
+    use akula_wire_lab::crypto_identity_w3::open_authenticated;
+
+    let sender = sk(3);
+    let (secret, recipient) = new_recipient();
+    let header = hdr();
+    let mut trust = TrustRegistry::new();
+    trust
+        .enroll(header.sender_id, header.epoch, sender.verifying_key())
+        .unwrap();
+    let wire = seal(&sender, &recipient, header, b"shared Blue crypto").unwrap();
+    let verified = open_authenticated(
+        &wire,
+        TrustedRecipient {
+            secret: &secret,
+            recipient_id: header.recipient_id,
+            now: 100,
+            registry: &trust,
+        },
+    )
+    .unwrap();
+    assert_eq!(verified.original_packet(), wire.as_slice());
+    assert_eq!(verified.packet_digest(), *blake3::hash(&wire).as_bytes());
+    assert_eq!(verified.payload(), b"shared Blue crypto");
+    assert_eq!(verified.header().sender_id, header.sender_id);
+    assert_eq!(verified.header().epoch, header.epoch);
+
+    // Removing trusted enrollment must block the EXACT same signed packet.
+    let empty = TrustRegistry::new();
+    assert!(open_authenticated(
+        &wire,
+        TrustedRecipient {
+            secret: &secret,
+            recipient_id: header.recipient_id,
+            now: 100,
+            registry: &empty,
+        }
+    )
+    .is_err());
+}
