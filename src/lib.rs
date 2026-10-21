@@ -22,7 +22,8 @@ pub struct Envelope {
 pub enum WireError {
     TooLarge, Truncated, InvalidEncoding, UnsupportedVersion,
     InvalidPriority, LengthMismatch, FragmentMismatch, FragmentCount,
-    ConflictingDuplicate, Incomplete,
+    ConflictingDuplicate, Incomplete, UnsupportedCriticalExtension,
+    TooManyExtensions,
 }
 
 /// Minimal deterministic CBOR encoding subset: unsigned integers,
@@ -115,6 +116,153 @@ fn decode_inner(input: &[u8]) -> Result<Envelope, WireError> {
     let payload = d.bytes()?.to_vec();
     if d.offset != input.len() { return Err(WireError::LengthMismatch); }
     Ok(Envelope { message_id, route_token, expires_at, priority: priority as u8, payload })
+}
+
+/// A bounded, experimental version-evolution profile.
+/// Key 6 is an optional map of extension IDs to opaque byte strings.
+/// The lowest bit of an ID is the critical flag (odd = critical).
+/// IDs are assigned append-only: old clients know no critical extensions.
+/// This is NOT an authenticated Akula network envelope.
+pub const MAX_EXTENSIONS: usize = 16;
+pub const MAX_EXTENSION_BYTES: usize = 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Extension {
+    /// Stable numeric registry identifier. Even IDs are ancillary.
+    pub id: u16,
+    /// Opaque bytes, not a recursively decoded CBOR item.
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtendedEnvelope {
+    pub envelope: Envelope,
+    pub extensions: Vec<Extension>,
+}
+
+fn validate_extensions(extensions: &[Extension]) -> Result<(), WireError> {
+    if extensions.len() > MAX_EXTENSIONS {
+        return Err(WireError::TooManyExtensions);
+    }
+    let mut previous = 0;
+    for extension in extensions {
+        if extension.id <= previous {
+            return Err(WireError::InvalidEncoding);
+        }
+        // Unknown critical fields are not interpretable by this reader/writer.
+        if extension.id & 1 == 1 {
+            return Err(WireError::UnsupportedCriticalExtension);
+        }
+        if extension.value.len() > MAX_EXTENSION_BYTES {
+            return Err(WireError::TooLarge);
+        }
+        previous = extension.id;
+    }
+    Ok(())
+}
+
+/// Writes only an *experimental*, unsigned format, never an existing signed event.
+/// Do not use to rewrite an opaque message from another producer.
+pub fn encode_extended(e: &ExtendedEnvelope) -> Result<Vec<u8>, WireError> {
+    validate_extensions(&e.extensions)?;
+    let mut out = encode(&e.envelope)?;
+    if e.extensions.is_empty() {
+        return Ok(out);
+    }
+    // The base lab envelope is a definite map of exactly six pairs.
+    out[0] = 0xa7;
+    cbor_uint(&mut out, 0, 6);
+    cbor_uint(&mut out, 5, e.extensions.len() as u64);
+    for extension in &e.extensions {
+        cbor_uint(&mut out, 0, extension.id as u64);
+        cbor_bytes(&mut out, &extension.value);
+    }
+    if out.len() > MAX_MESSAGE_BYTES {
+        return Err(WireError::TooLarge);
+    }
+    Ok(out)
+}
+
+/// Parses a v0 lab message with optional ancillary extensions.
+/// Unknown critical extensions fail closed. Unknown ancillary byte strings
+/// remain opaque and are preserved exactly by this experimental model.
+/// Real relays must forward the ORIGINAL authenticated bytes, not re-encode.
+pub fn decode_extended(input: &[u8]) -> Result<ExtendedEnvelope, WireError> {
+    if input.len() > MAX_MESSAGE_BYTES {
+        return Err(WireError::TooLarge);
+    }
+    let mut d = Decoder { bytes: input, offset: 0 };
+    let count = d.head(5)?;
+    if count != 6 && count != 7 {
+        return Err(WireError::InvalidEncoding);
+    }
+    if d.head(0)? != 0 {
+        return Err(WireError::InvalidEncoding);
+    }
+    if d.head(0)? != 0 {
+        return Err(WireError::UnsupportedVersion);
+    }
+    if d.head(0)? != 1 {
+        return Err(WireError::InvalidEncoding);
+    }
+    let message_id = d.fixed16()?;
+    if d.head(0)? != 2 {
+        return Err(WireError::InvalidEncoding);
+    }
+    let route_token = d.fixed16()?;
+    if d.head(0)? != 3 {
+        return Err(WireError::InvalidEncoding);
+    }
+    let expires_at = d.head(0)?;
+    if d.head(0)? != 4 {
+        return Err(WireError::InvalidEncoding);
+    }
+    let priority = d.head(0)?;
+    if priority > 2 {
+        return Err(WireError::InvalidPriority);
+    }
+    if d.head(0)? != 5 {
+        return Err(WireError::InvalidEncoding);
+    }
+    let payload = d.bytes()?.to_vec();
+    let mut extensions = Vec::new();
+    if count == 7 {
+        if d.head(0)? != 6 {
+            return Err(WireError::InvalidEncoding);
+        }
+        let n = d.head(5)?;
+        if n == 0 {
+            // An empty extension map must use the six-field representation.
+            return Err(WireError::InvalidEncoding);
+        }
+        if n > MAX_EXTENSIONS as u64 {
+            return Err(WireError::TooManyExtensions);
+        }
+        let mut previous = 0;
+        for _ in 0..n {
+            let id = d.head(0)?;
+            if id > u16::MAX as u64 || id <= previous {
+                return Err(WireError::InvalidEncoding);
+            }
+            // No critical extensions are implemented by this lab profile.
+            if id & 1 == 1 {
+                return Err(WireError::UnsupportedCriticalExtension);
+            }
+            let value = d.bytes()?;
+            if value.len() > MAX_EXTENSION_BYTES {
+                return Err(WireError::TooLarge);
+            }
+            extensions.push(Extension { id: id as u16, value: value.to_vec() });
+            previous = id;
+        }
+    }
+    if d.offset != input.len() {
+        return Err(WireError::LengthMismatch);
+    }
+    Ok(ExtendedEnvelope {
+        envelope: Envelope { message_id, route_token, expires_at, priority: priority as u8, payload },
+        extensions,
+    })
 }
 
 /// Four-byte big-endian length prefix for byte streams (TCP / QUIC).
