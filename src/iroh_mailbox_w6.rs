@@ -179,28 +179,32 @@ pub async fn receive_authenticated_iroh_mailbox(
     if tokio::time::Instant::now() >= end {
         return Err(IrohIngressError::DeadlineExceeded);
     }
-    // Serialize in-process operator revocations with mailbox commits:
-    // the enrollment mutex is held THROUGH storage. No wait/await under
-    // the lock. Separate OS processes need a stronger shared transaction.
-    let enrollment = context.enrollments.lock()
+    // BEGIN IMMEDIATE on the *shared* policy SQLite file serializes policy
+    // changes from other OS processes with this final authorization+Mailbox
+    // COMMIT. The in-process mutex is still needed for the rusqlite handle.
+    // No network I/O or await under either lock. Admin revocation committed
+    // first will fail closed; Mailbox COMMIT first completes before revoke.
+    let mut enrollment = context.enrollments.lock()
         .map_err(|_| IrohIngressError::LockPoisoned)?;
-    let (device_again, epoch_again) = enrollment.authorize(
+    enrollment.with_authorized_write(
         &connection.remote_id(),
         &context.relay_policy.relay_id,
         &context.relay_policy.namespace,
         &context.relay_policy.route_token,
         &context.relay_policy.issuer_id,
-    )?;
-    if device != device_again || epoch != epoch_again {
-        return Err(IrohIngressError::RevokedOrStaleDevice);
-    }
-    context.devices.key_for(device_again, epoch_again)
-        .map_err(|_| IrohIngressError::RevokedOrStaleDevice)?;
-    let mut mailbox = context.mailbox.lock()
-        .map_err(|_| IrohIngressError::StorageLockPoisoned)?;
-    let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
-        &mut mailbox, signed_grant, context.relay_policy,
-        context.issuer_trust, context.clock.now_seconds, ciphertext,
-    )?;
-    Ok(IngressOutcome::MailboxStored(stored))
+        |(device_again, epoch_again)| {
+            if device != device_again || epoch != epoch_again {
+                return Err(IrohIngressError::RevokedOrStaleDevice);
+            }
+            context.devices.key_for(device_again, epoch_again)
+                .map_err(|_| IrohIngressError::RevokedOrStaleDevice)?;
+            let mut mailbox = context.mailbox.lock()
+                .map_err(|_| IrohIngressError::StorageLockPoisoned)?;
+            let stored = ingress_bridge_w5::store_authorized_mailbox_packet(
+                &mut mailbox, signed_grant, context.relay_policy,
+                context.issuer_trust, context.clock.now_seconds, ciphertext,
+            )?;
+            Ok(IngressOutcome::MailboxStored(stored))
+        },
+    )
 }
