@@ -101,6 +101,7 @@ fn failed_gateway_switch_and_dropped_ack_never_cause_false_delivery(){
 fn partitions_ttl_opt_in_and_resource_limits(){
  let mut sim=Simulation::new(7);
  sim.connect(Node::A,Node::B,true);
+ sim.relay_opt_in(Node::B,true);
  sim.submit_data(id(1),3,b"opaque").unwrap();
  sim.run(5).unwrap();
  assert!(sim.packet(Node::B,Flow::Data,id(1)).is_some());
