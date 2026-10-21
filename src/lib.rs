@@ -12,6 +12,7 @@ pub mod transport;
 pub mod crypto_w3;
 pub mod trust_w3;
 pub mod crypto_identity_w3;
+pub mod journal_w4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
