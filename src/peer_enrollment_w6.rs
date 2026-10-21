@@ -69,6 +69,10 @@ pub enum EnrollmentError {
     CorruptStorage,
     Anchor(AnchorError),
     CheckpointMismatch,
+    /// The supplied trusted authority identity conflicts with the pinned domain.
+    AuthorityMismatch,
+    /// An offline-signed transition was staged but not yet reconciled.
+    PendingRecovery,
 }
 impl From<rusqlite::Error> for EnrollmentError {
     fn from(value: rusqlite::Error) -> Self { Self::Db(value) }
@@ -83,6 +87,30 @@ const CHECKPOINT_DOMAIN: &[u8] = b"Akula/WOW/W6/policy-checkpoint/lab-v1\0";
 pub struct PolicyCheckpoint {
     pub revision: u64,
     pub digest: [u8; 32],
+}
+
+/// Unique, operator-provisioned W6 authority/cluster identifier. An all-zero
+/// value cannot identify a trust domain and must never be silently inferred
+/// from any peer-supplied network packet or SQLite record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorityDomainId([u8; 32]);
+impl AuthorityDomainId {
+    pub fn new(bytes: [u8; 32]) -> Result<Self, EnrollmentError> {
+        if bytes == [0; 32] { return Err(EnrollmentError::InvalidEncoding); }
+        Ok(Self(bytes))
+    }
+    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+}
+
+/// Only the exact signed pending transition may be reconciled after restart.
+/// This is not a generic authorization to reset the external high-water mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignedRecoveryOutcome {
+    NoPending,
+    /// This process submitted the previously signed CAS during recovery.
+    ForwardedPending,
+    AppliedAfterCas,
+    AlreadyApplied,
 }
 
 /// Errors from an EXTERNAL, non-rollbackable source. No untrusted local file
@@ -101,10 +129,25 @@ pub enum AnchorError {
 /// the same machine IS NOT SECURITY. An in-memory implementation is suitable
 /// for regression tests ONLY and is lost after reboot.
 pub trait TrustedPolicyAnchor: Send + Sync {
+    /// The domain comes from independently trusted local configuration, not
+    /// the SQLite policy or an unverified response field. Legacy test anchors
+    /// may opt out; real remote authorities MUST return a pinned identifier.
+    fn authority_domain(&self) -> Option<AuthorityDomainId> { None }
     fn current(&self) -> Result<PolicyCheckpoint, AnchorError>;
     fn advance(
         &self, expected: PolicyCheckpoint, replacement: PolicyCheckpoint,
     ) -> Result<(), AnchorError>;
+
+    /// Offline-authorized remote CAS. The remote authority MUST require the
+    /// signed operator change AND a distinct operator signature binding the
+    /// old checkpoint and exact NEW digest. Backends that do not implement
+    /// this fail closed. An admin TLS credential alone is not authorization.
+    fn advance_signed(
+        &self, _old: PolicyCheckpoint, _next: PolicyCheckpoint,
+        _change: &[u8], _proof: &[u8],
+    ) -> Result<(), AnchorError> {
+        Err(AnchorError::InvalidAttestation)
+    }
 }
 
 /// Scope from trusted W6 server config, NEVER network-provided fields.
@@ -117,9 +160,84 @@ pub struct EnrollmentLookup<'a> {
     pub issuer: &'a [u8;16],
 }
 
+struct PendingSignedTransition {
+    authority: AuthorityDomainId,
+    expected: PolicyCheckpoint,
+    replacement: PolicyCheckpoint,
+    change: Vec<u8>,
+    proof: Vec<u8>,
+}
+
+fn ensure_no_pending(db: &Connection) -> Result<(), EnrollmentError> {
+    let pending: i64 = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM w6_pending_transition)", [],
+        |row| row.get(0),
+    )?;
+    if pending != 0 {
+        return Err(EnrollmentError::PendingRecovery);
+    }
+    Ok(())
+}
+
+fn pending_signed_transition(
+    db: &Connection,
+) -> Result<Option<PendingSignedTransition>, EnrollmentError> {
+    let found = db.query_row(
+        "SELECT authority_id, expected_revision, expected_digest,
+                replacement_revision, replacement_digest, signed_change, signed_proof
+         FROM w6_pending_transition WHERE singleton=1",
+        [], |row| Ok((
+            row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?,
+            row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+        )),
+    ).optional()?;
+    let Some((authority,old_revision, old_digest, new_revision, new_digest, change, proof)) = found
+    else {
+        return Ok(None);
+    };
+    if old_revision < 0 || new_revision <= old_revision
+        || change.len() != SIGNED_ENROLLMENT_BYTES
+        || proof.len() != SIGNED_TRANSITION_PROOF_BYTES
+    {
+        return Err(EnrollmentError::CorruptStorage);
+    }
+    let authority: [u8; 32] = authority.try_into()
+        .map_err(|_| EnrollmentError::CorruptStorage)?;
+    let authority = AuthorityDomainId::new(authority)
+        .map_err(|_| EnrollmentError::CorruptStorage)?;
+    let old_digest: [u8; 32] = old_digest.try_into()
+        .map_err(|_| EnrollmentError::CorruptStorage)?;
+    let new_digest: [u8; 32] = new_digest.try_into()
+        .map_err(|_| EnrollmentError::CorruptStorage)?;
+    Ok(Some(PendingSignedTransition {
+        authority,
+        expected: PolicyCheckpoint {
+            revision: old_revision as u64, digest: old_digest,
+        },
+        replacement: PolicyCheckpoint {
+            revision: new_revision as u64, digest: new_digest,
+        },
+        change, proof,
+    }))
+}
+
+fn check_authority_domain(
+    expected: Option<AuthorityDomainId>, anchor: &dyn TrustedPolicyAnchor,
+) -> Result<(), EnrollmentError> {
+    match (expected, anchor.authority_domain()) {
+        (Some(pinned),Some(remote)) if pinned == remote => Ok(()),
+        (None,None) => Ok(()), // Unbound in-memory lab/legacy anchor only.
+        _ => Err(EnrollmentError::AuthorityMismatch),
+    }
+}
+
 fn ensure_anchor(
     anchor: &dyn TrustedPolicyAnchor, local: PolicyCheckpoint,
+    expected_domain: Option<AuthorityDomainId>,
 ) -> Result<(), EnrollmentError> {
+    check_authority_domain(expected_domain, anchor)?;
     let remote = anchor.current().map_err(EnrollmentError::Anchor)?;
     if remote != local { return Err(EnrollmentError::CheckpointMismatch); }
     Ok(())
@@ -257,6 +375,84 @@ fn decode(raw: &[u8]) -> Result<OperatorChange, EnrollmentError> {
     Ok(action)
 }
 
+
+const TRANSITION_DOMAIN: &[u8] = b"Akula/WOW/W6/operator-anchor-transition/authority-v2\0";
+pub const SIGNED_TRANSITION_PROOF_BYTES: usize = 64;
+
+/// A remote transition requires two distinct offline signatures.
+/// The first covers the original W6 operator change. The second binds the
+/// exact old and new checkpoint digests to those same signed-change bytes.
+/// TLS administrator possession alone cannot invent a new checkpoint.
+fn transition_message(
+    authority: AuthorityDomainId, change: &[u8],
+    expected: PolicyCheckpoint, replacement: PolicyCheckpoint,
+) -> Vec<u8> {
+    let mut bytes=Vec::with_capacity(
+        TRANSITION_DOMAIN.len()+32+SIGNED_ENROLLMENT_BYTES+80,
+    );
+    bytes.extend_from_slice(TRANSITION_DOMAIN);
+    bytes.extend_from_slice(authority.as_bytes());
+    bytes.extend_from_slice(&expected.revision.to_be_bytes());
+    bytes.extend_from_slice(&expected.digest);
+    bytes.extend_from_slice(&replacement.revision.to_be_bytes());
+    bytes.extend_from_slice(&replacement.digest);
+    bytes.extend_from_slice(change);
+    bytes
+}
+
+pub fn verify_operator_change(
+    bytes: &[u8], operator: &VerifyingKey,
+) -> Result<OperatorChange, EnrollmentError> {
+    let action=decode(bytes)?;
+    let signature=Signature::from_slice(&bytes[BODY_BYTES..])
+        .map_err(|_|EnrollmentError::InvalidSignature)?;
+    operator.verify_strict(
+        &signing_input(&bytes[..BODY_BYTES]), &signature,
+    ).map_err(|_|EnrollmentError::InvalidSignature)?;
+    Ok(action)
+}
+
+pub fn verify_signed_anchor_transition(
+    operator: &VerifyingKey, authority: AuthorityDomainId, change: &[u8],
+    expected: PolicyCheckpoint, replacement: PolicyCheckpoint,
+    proof: &[u8],
+) -> Result<OperatorChange, EnrollmentError> {
+    let action=verify_operator_change(change,operator)?;
+    if replacement.revision!=action.revision
+        || replacement.revision<=expected.revision
+        || replacement.revision>i64::MAX as u64
+    {
+        return Err(EnrollmentError::InvalidEncoding);
+    }
+    if proof.len()!=SIGNED_TRANSITION_PROOF_BYTES {
+        return Err(EnrollmentError::InvalidEncoding);
+    }
+    let signature=Signature::from_slice(proof)
+        .map_err(|_|EnrollmentError::InvalidSignature)?;
+    operator.verify_strict(
+        &transition_message(authority,change,expected,replacement),
+        &signature,
+    ).map_err(|_|EnrollmentError::InvalidSignature)?;
+    Ok(action)
+}
+
+/// PRIVILEGED OFFLINE helper; never place this SigningKey in a W6 relay or
+/// remote authority. A control plane must independently review the computed
+/// replacement checkpoint before authorizing it.
+pub fn sign_anchor_transition(
+    signer: &SigningKey, authority: AuthorityDomainId, change: &[u8],
+    expected: PolicyCheckpoint, replacement: PolicyCheckpoint,
+) -> Result<[u8;SIGNED_TRANSITION_PROOF_BYTES],EnrollmentError> {
+    let action=verify_operator_change(change,&signer.verifying_key())?;
+    if replacement.revision!=action.revision
+        || replacement.revision<=expected.revision
+        || replacement.revision>i64::MAX as u64
+    {
+        return Err(EnrollmentError::InvalidEncoding);
+    }
+    Ok(signer.sign(&transition_message(authority,change,expected,replacement)).to_bytes())
+}
+
 struct StoredBinding {
     device: Vec<u8>,
     epoch: i64,
@@ -307,11 +503,28 @@ fn stored_at(
 pub struct PeerEnrollmentDb {
     db: Connection,
     operator: VerifyingKey,
+    authority: Option<AuthorityDomainId>,
 }
 impl PeerEnrollmentDb {
-    /// Root key is an independently pinned local parameter. Reopening a DB
-    /// with a DIFFERENT root fails closed; DB content cannot choose the root.
+    /// Legacy/unbound laboratory DB. Once a DB is bound to an authority
+    /// domain, reopening via this weaker constructor fails closed.
     pub fn open(path: &Path, operator: VerifyingKey) -> Result<Self, EnrollmentError> {
+        Self::open_internal(path, operator, None)
+    }
+
+    /// A remote policy DB MUST pin its nonzero authority domain from protected
+    /// configuration. A different value on reopen is refused; the local SQLite
+    /// copy is an identity mismatch detector, NOT the source of trust.
+    pub fn open_for_authority(
+        path: &Path, operator: VerifyingKey, authority: AuthorityDomainId,
+    ) -> Result<Self, EnrollmentError> {
+        Self::open_internal(path, operator, Some(authority))
+    }
+
+    fn open_internal(
+        path: &Path, operator: VerifyingKey,
+        authority: Option<AuthorityDomainId>,
+    ) -> Result<Self, EnrollmentError> {
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         db.execute_batch(
@@ -331,6 +544,20 @@ impl PeerEnrollmentDb {
                token BLOB NOT NULL CHECK(length(token)=16),
                issuer BLOB NOT NULL CHECK(length(issuer)=16),
                revoked INTEGER NOT NULL CHECK(revoked IN (0,1))
+             );
+             CREATE TABLE IF NOT EXISTS w6_authority_binding (
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               authority_id BLOB NOT NULL CHECK(length(authority_id)=32)
+             );
+             CREATE TABLE IF NOT EXISTS w6_pending_transition (
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               authority_id BLOB NOT NULL CHECK(length(authority_id)=32),
+               expected_revision INTEGER NOT NULL CHECK(expected_revision>=0),
+               expected_digest BLOB NOT NULL CHECK(length(expected_digest)=32),
+               replacement_revision INTEGER NOT NULL CHECK(replacement_revision>0),
+               replacement_digest BLOB NOT NULL CHECK(length(replacement_digest)=32),
+               signed_change BLOB NOT NULL CHECK(length(signed_change)=194),
+               signed_proof BLOB NOT NULL CHECK(length(signed_proof)=64)
              );"
         )?;
         db.execute(
@@ -345,7 +572,26 @@ impl PeerEnrollmentDb {
         if persisted.as_slice() != operator.as_bytes() {
             return Err(EnrollmentError::UntrustedOperator);
         }
-        Ok(Self { db, operator })
+        // Do not let an already-bound remote-policy DB reopen in legacy mode,
+        // even if all the endpoint records still match. A bound SQLite value
+        // never overrides independently supplied trusted configuration.
+        let stored: Option<Vec<u8>> = db.query_row(
+            "SELECT authority_id FROM w6_authority_binding WHERE singleton=1",
+            [], |row| row.get(0),
+        ).optional()?;
+        match (authority, stored) {
+            (Some(pinned), Some(value)) if value.as_slice()==pinned.as_bytes() => {},
+            (Some(pinned), None) => {
+                db.execute(
+                    "INSERT INTO w6_authority_binding (singleton,authority_id)
+                     VALUES(1,?1)",
+                    params![pinned.as_bytes().as_slice()],
+                )?;
+            }
+            (None,None) => {},
+            _ => return Err(EnrollmentError::AuthorityMismatch),
+        }
+        Ok(Self { db, operator, authority })
     }
 
     /// Informational digest for external provisioning/test fixtures. It is
@@ -364,10 +610,28 @@ impl PeerEnrollmentDb {
         Ok(value as u64)
     }
 
+    /// Compute the complete candidate checkpoint inside an UNCOMMITTED
+    /// SQLite IMMEDIATE transaction. The transaction is rolled back on drop.
+    /// An OFFLINE operator must inspect/sign this (old,new) transition before
+    /// the relay can publish the digest to the remote authority. This preview
+    /// is NOT a durable or independent trust source by itself.
+    pub fn preview_signed_update(
+        &mut self, bytes: &[u8],
+    ) -> Result<(PolicyCheckpoint,PolicyCheckpoint),EnrollmentError> {
+        let action=verify_operator_change(bytes,&self.operator)?;
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_no_pending(&tx)?;
+        let old=policy_checkpoint(&tx,&self.operator)?;
+        apply_change_in_transaction(&tx,action)?;
+        let next=policy_checkpoint(&tx,&self.operator)?;
+        // tx is dropped here WITHOUT commit: PREVIEW ONLY.
+        Ok((old,next))
+    }
+
     /// Serialized, atomic signed update. No remote W6 handler can call this.
     /// Monotonic revision rejects stale/replayed changes across a restart.
     pub fn apply_signed(&mut self, bytes: &[u8]) -> Result<(), EnrollmentError> {
-        self.apply_signed_internal(bytes, None)
+        self.apply_signed_internal(bytes, None, None)
     }
 
     /// Anchored operator update. Publishes the new canonical checkpoint
@@ -378,97 +642,169 @@ impl PeerEnrollmentDb {
     pub fn apply_signed_anchored(
         &mut self, bytes: &[u8], anchor: &dyn TrustedPolicyAnchor,
     ) -> Result<(), EnrollmentError> {
-        self.apply_signed_internal(bytes, Some(anchor))
+        self.apply_signed_internal(bytes, Some(anchor), None)
+    }
+
+    /// REQUIRED for remote TLS-backed W6 authority: the offline signer has
+    /// reviewed and signed the *entire* expected/replacement checkpoint as
+    /// well as the original operator change. TLS-admin-only CAS is rejected.
+    pub fn apply_signed_anchored_with_proof(
+        &mut self, bytes: &[u8], proof: &[u8],
+        anchor: &dyn TrustedPolicyAnchor,
+    ) -> Result<(), EnrollmentError> {
+        self.apply_signed_internal(bytes, Some(anchor), Some(proof))
+    }
+
+    /// Persist the fully verified, offline-signed transition BEFORE sending
+    /// network CAS. The local policy remains unchanged until remote confirmation.
+    /// Any ambiguous CAS error leaves the durable intent in place, and ALL
+    /// authorization/write paths fail closed until explicit reconciliation.
+    fn apply_signed_with_signed_journal(
+        &mut self, bytes: &[u8], proof: &[u8],
+        anchor: &dyn TrustedPolicyAnchor,
+    ) -> Result<(), EnrollmentError> {
+        let authority = self.authority.ok_or(EnrollmentError::AuthorityMismatch)?;
+        check_authority_domain(Some(authority), anchor)?;
+        let action = verify_operator_change(bytes, &self.operator)?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_no_pending(&tx)?;
+        let expected = policy_checkpoint(&tx, &self.operator)?;
+        ensure_anchor(anchor, expected, Some(authority))?;
+
+        // The preview and the pending journal share one IMMEDIATE transaction.
+        // The SAVEPOINT undoes only the policy mutation, not the staged intent.
+        tx.execute_batch("SAVEPOINT w6_signed_candidate;")?;
+        apply_change_in_transaction(&tx, action)?;
+        let replacement = policy_checkpoint(&tx, &self.operator)?;
+        verify_signed_anchor_transition(
+            &self.operator, authority, bytes, expected, replacement, proof,
+        )?;
+        tx.execute_batch(
+            "ROLLBACK TO SAVEPOINT w6_signed_candidate;
+             RELEASE SAVEPOINT w6_signed_candidate;",
+        )?;
+        tx.execute(
+            "INSERT INTO w6_pending_transition
+             (singleton,authority_id,expected_revision,expected_digest,
+              replacement_revision,replacement_digest,signed_change,signed_proof)
+             VALUES(1,?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                authority.as_bytes().as_slice(), expected.revision as i64,
+                expected.digest.as_slice(), replacement.revision as i64,
+                replacement.digest.as_slice(), bytes, proof,
+            ],
+        )?;
+        tx.commit()?;
+
+        // The journal is now durable. An unavailable/ambiguous response MUST
+        // NOT erase it or retry with a newly computed digest.
+        anchor.advance_signed(expected, replacement, bytes, proof)
+            .map_err(EnrollmentError::Anchor)?;
+        match self.recover_pending_signed_update(anchor)? {
+            SignedRecoveryOutcome::AppliedAfterCas
+            | SignedRecoveryOutcome::ForwardedPending
+            | SignedRecoveryOutcome::AlreadyApplied => Ok(()),
+            _ => Err(EnrollmentError::CheckpointMismatch),
+        }
+    }
+
+    /// Explicit, fail-closed W6 recovery after process death or unknown CAS
+    /// outcome. Never roll back the remote authority: either abort an intent
+    /// not yet published, or reapply the exact offline-signed local mutation.
+    /// The pending journal is deleted atomically with any local COMMIT.
+    ///
+    /// An observed old remote checkpoint is NOT proof that a previously
+    /// submitted CAS cannot arrive later. Therefore we NEVER abandon a
+    /// staged intent on GET(expected): retry the SAME preapproved signed CAS.
+    /// A failed or ambiguous retry leaves the intent in HOLD until the
+    /// independently trusted authority confirms the replacement checkpoint.
+    ///
+    /// The remote authority remains a separate trust and rollback domain;
+    /// this does not solve cross-host fencing or a compromised offline signer.
+    pub fn recover_pending_signed_update(
+        &mut self, anchor: &dyn TrustedPolicyAnchor,
+    ) -> Result<SignedRecoveryOutcome, EnrollmentError> {
+        let authority = self.authority.ok_or(EnrollmentError::AuthorityMismatch)?;
+        check_authority_domain(Some(authority), anchor)?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(pending) = pending_signed_transition(&tx)? else {
+            return Ok(SignedRecoveryOutcome::NoPending);
+        };
+        if pending.authority != authority {
+            return Err(EnrollmentError::AuthorityMismatch);
+        }
+        let action = verify_signed_anchor_transition(
+            &self.operator, authority, &pending.change, pending.expected,
+            pending.replacement, &pending.proof,
+        )?;
+        let local = policy_checkpoint(&tx, &self.operator)?;
+        let mut remote = anchor.current().map_err(EnrollmentError::Anchor)?;
+        let mut forwarded = false;
+        if local == pending.expected && remote == pending.expected {
+            // A late CAS from the interrupted process can still arrive after
+            // this read. Never clear the journal just because GET saw old.
+            // Re-publish only the EXACT existing operator-signed transition.
+            // Even when RPC reports Conflict/Unavailable, GET may reveal that
+            // this or the original request already committed.
+            let publish = anchor.advance_signed(
+                pending.expected, pending.replacement,
+                &pending.change, &pending.proof,
+            );
+            remote = anchor.current().map_err(EnrollmentError::Anchor)?;
+            if remote == pending.expected {
+                return match publish {
+                    Err(error) => Err(EnrollmentError::Anchor(error)),
+                    Ok(()) => Err(EnrollmentError::CheckpointMismatch),
+                };
+            }
+            if remote == pending.replacement {
+                forwarded = true;
+            }
+        }
+        let outcome = if local == pending.expected && remote == pending.replacement {
+            apply_change_in_transaction(&tx, action)?;
+            if policy_checkpoint(&tx, &self.operator)? != pending.replacement {
+                return Err(EnrollmentError::CheckpointMismatch);
+            }
+            if forwarded {
+                SignedRecoveryOutcome::ForwardedPending
+            } else {
+                SignedRecoveryOutcome::AppliedAfterCas
+            }
+        } else if local == pending.replacement && remote == pending.replacement {
+            SignedRecoveryOutcome::AlreadyApplied
+        } else {
+            // Unknown remote high-water or locally modified/rolled-back DB:
+            // HOLD pending record; no policy write or compensating anchor CAS.
+            return Err(EnrollmentError::CheckpointMismatch);
+        };
+        tx.execute("DELETE FROM w6_pending_transition WHERE singleton=1", [])?;
+        tx.commit()?;
+        Ok(outcome)
     }
 
     fn apply_signed_internal(
         &mut self, bytes: &[u8], anchor: Option<&dyn TrustedPolicyAnchor>,
+        proof: Option<&[u8]>,
     ) -> Result<(), EnrollmentError> {
-        let action = decode(bytes)?;
-        let sig = Signature::from_slice(&bytes[BODY_BYTES..])
-            .map_err(|_| EnrollmentError::InvalidSignature)?;
-        self.operator.verify_strict(
-            &signing_input(&bytes[..BODY_BYTES]), &sig,
-        ).map_err(|_| EnrollmentError::InvalidSignature)?;
+        if let (Some(anchor), Some(proof)) = (anchor, proof) {
+            return self.apply_signed_with_signed_journal(bytes, proof, anchor);
+        }
+        if self.authority.is_some() {
+            // No legacy unsigned / unanchored mutation of a domain-bound DB.
+            return Err(EnrollmentError::AuthorityMismatch);
+        }
+        let action = verify_operator_change(bytes,&self.operator)?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_no_pending(&tx)?;
         let prior = if let Some(anchor) = anchor {
             let local = policy_checkpoint(&tx, &self.operator)?;
-            ensure_anchor(anchor, local)?;
+            ensure_anchor(anchor, local, self.authority)?;
             Some(local)
         } else {
             None
         };
-        let last: i64 = tx.query_row(
-            "SELECT last_revision FROM w6_policy_state WHERE singleton=1",
-            [], |row|row.get(0),
-        )?;
-        if last < 0 { return Err(EnrollmentError::CorruptStorage); }
-        if action.revision <= last as u64 {
-            return Err(EnrollmentError::RevisionRollback);
-        }
-        let existing = stored_at(&tx, &action.binding.endpoint_id)?;
-        match action.operation {
-            PolicyOperation::Allow => {
-                if let Some(old) = existing {
-                    if !old.valid() { return Err(EnrollmentError::CorruptStorage); }
-                    if old.revoked == 1 { return Err(EnrollmentError::Revoked); }
-                    if !old.scope_matches(&action.binding) {
-                        return Err(EnrollmentError::BindingConflict);
-                    }
-                    if action.binding.w3_epoch <= old.epoch as u64 {
-                        return Err(EnrollmentError::EpochRollback);
-                    }
-                    tx.execute(
-                        "UPDATE w6_peer_enrollments SET epoch=?2 WHERE endpoint=?1",
-                        params![
-                            action.binding.endpoint_id.as_bytes().as_slice(),
-                            action.binding.w3_epoch as i64,
-                        ],
-                    )?;
-                } else {
-                    let count: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM w6_peer_enrollments",
-                        [], |row|row.get(0),
-                    )?;
-                    if count >= MAX_ENROLLED_ENDPOINTS {
-                        return Err(EnrollmentError::TooManyPeers);
-                    }
-                    let b = action.binding;
-                    tx.execute(
-                        "INSERT INTO w6_peer_enrollments
-                         (endpoint,device,epoch,relay,namespace,token,issuer,revoked)
-                         VALUES(?1,?2,?3,?4,?5,?6,?7,0)",
-                        params![
-                            b.endpoint_id.as_bytes().as_slice(),
-                            b.w3_device_id.as_slice(),
-                            b.w3_epoch as i64,
-                            b.relay_id.as_slice(),
-                            b.namespace.as_slice(),
-                            b.route_token.as_slice(),
-                            b.issuer_id.as_slice(),
-                        ],
-                    )?;
-                }
-            }
-            PolicyOperation::Revoke => {
-                let old = existing.ok_or(EnrollmentError::UnknownEndpoint)?;
-                if !old.valid() { return Err(EnrollmentError::CorruptStorage); }
-                if old.revoked == 1 { return Err(EnrollmentError::Revoked); }
-                if !old.scope_matches(&action.binding)
-                    || old.epoch as u64 != action.binding.w3_epoch
-                {
-                    return Err(EnrollmentError::BindingConflict);
-                }
-                tx.execute(
-                    "UPDATE w6_peer_enrollments SET revoked=1 WHERE endpoint=?1",
-                    params![action.binding.endpoint_id.as_bytes().as_slice()],
-                )?;
-            }
-        }
-        tx.execute(
-            "UPDATE w6_policy_state SET last_revision=?1 WHERE singleton=1",
-            params![action.revision as i64],
-        )?;
+        apply_change_in_transaction(&tx,action)?;
         if let (Some(anchor), Some(previous)) = (anchor, prior) {
             let next = policy_checkpoint(&tx, &self.operator)?;
             if next.revision <= previous.revision {
@@ -477,7 +813,16 @@ impl PeerEnrollmentDb {
             // Critical order: external durable anchor BEFORE local SQLite
             // commit. Failure of the anchor means no local policy mutation.
             // If SQLite subsequently fails, the anchor is ahead: fail closed.
-            anchor.advance(previous, next).map_err(EnrollmentError::Anchor)?;
+            if let Some(proof)=proof {
+                verify_signed_anchor_transition(
+                    &self.operator, self.authority.ok_or(EnrollmentError::AuthorityMismatch)?,
+                    bytes,previous,next,proof,
+                )?;
+                anchor.advance_signed(previous,next,bytes,proof)
+                    .map_err(EnrollmentError::Anchor)?;
+            } else {
+                anchor.advance(previous,next).map_err(EnrollmentError::Anchor)?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -490,6 +835,10 @@ impl PeerEnrollmentDb {
         &self, remote: &EndpointId, relay: &[u8;16],
         namespace: &[u8;16], token: &[u8;16], issuer: &[u8;16],
     ) -> Result<([u8;16],u64), EnrollmentError> {
+        ensure_no_pending(&self.db)?;
+        if self.authority.is_some() {
+            return Err(EnrollmentError::AuthorityMismatch);
+        }
         authorize_from(&self.db, remote, relay, namespace, token, issuer)
     }
 
@@ -501,7 +850,8 @@ impl PeerEnrollmentDb {
         &mut self, anchor: &dyn TrustedPolicyAnchor, lookup: EnrollmentLookup<'_>,
     ) -> Result<([u8;16],u64), EnrollmentError> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_anchor(anchor, policy_checkpoint(&tx, &self.operator)?)?;
+        ensure_no_pending(&tx)?;
+        ensure_anchor(anchor, policy_checkpoint(&tx, &self.operator)?, self.authority)?;
         let identity = authorize_from(
             &tx, lookup.remote, lookup.relay, lookup.namespace,
             lookup.token, lookup.issuer,
@@ -565,9 +915,13 @@ impl PeerEnrollmentDb {
     {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(EnrollmentError::from).map_err(E::from)?;
+        ensure_no_pending(&tx).map_err(E::from)?;
+        if anchor.is_none() && self.authority.is_some() {
+            return Err(E::from(EnrollmentError::AuthorityMismatch));
+        }
         if let Some(anchor) = anchor {
             let snapshot=policy_checkpoint(&tx, &self.operator).map_err(E::from)?;
-            ensure_anchor(anchor, snapshot).map_err(E::from)?;
+            ensure_anchor(anchor, snapshot, self.authority).map_err(E::from)?;
         }
         let identity = authorize_from(
             &tx, lookup.remote, lookup.relay, lookup.namespace,
@@ -577,6 +931,87 @@ impl PeerEnrollmentDb {
         tx.commit().map_err(EnrollmentError::from).map_err(E::from)?;
         Ok(result)
     }
+}
+
+
+/// Exact W6 signed change semantics reused for preview and COMMIT. A single
+/// implementation prevents any mismatch between what offline operator signed
+/// and what the relay actually commits.
+fn apply_change_in_transaction(
+    tx: &rusqlite::Transaction<'_>, action: OperatorChange,
+) -> Result<(),EnrollmentError> {
+        let last: i64 = tx.query_row(
+            "SELECT last_revision FROM w6_policy_state WHERE singleton=1",
+            [], |row|row.get(0),
+        )?;
+        if last < 0 { return Err(EnrollmentError::CorruptStorage); }
+        if action.revision <= last as u64 {
+            return Err(EnrollmentError::RevisionRollback);
+        }
+        let existing = stored_at(tx, &action.binding.endpoint_id)?;
+        match action.operation {
+            PolicyOperation::Allow => {
+                if let Some(old) = existing {
+                    if !old.valid() { return Err(EnrollmentError::CorruptStorage); }
+                    if old.revoked == 1 { return Err(EnrollmentError::Revoked); }
+                    if !old.scope_matches(&action.binding) {
+                        return Err(EnrollmentError::BindingConflict);
+                    }
+                    if action.binding.w3_epoch <= old.epoch as u64 {
+                        return Err(EnrollmentError::EpochRollback);
+                    }
+                    tx.execute(
+                        "UPDATE w6_peer_enrollments SET epoch=?2 WHERE endpoint=?1",
+                        params![
+                            action.binding.endpoint_id.as_bytes().as_slice(),
+                            action.binding.w3_epoch as i64,
+                        ],
+                    )?;
+                } else {
+                    let count: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM w6_peer_enrollments",
+                        [], |row|row.get(0),
+                    )?;
+                    if count >= MAX_ENROLLED_ENDPOINTS {
+                        return Err(EnrollmentError::TooManyPeers);
+                    }
+                    let b = action.binding;
+                    tx.execute(
+                        "INSERT INTO w6_peer_enrollments
+                         (endpoint,device,epoch,relay,namespace,token,issuer,revoked)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,0)",
+                        params![
+                            b.endpoint_id.as_bytes().as_slice(),
+                            b.w3_device_id.as_slice(),
+                            b.w3_epoch as i64,
+                            b.relay_id.as_slice(),
+                            b.namespace.as_slice(),
+                            b.route_token.as_slice(),
+                            b.issuer_id.as_slice(),
+                        ],
+                    )?;
+                }
+            }
+            PolicyOperation::Revoke => {
+                let old = existing.ok_or(EnrollmentError::UnknownEndpoint)?;
+                if !old.valid() { return Err(EnrollmentError::CorruptStorage); }
+                if old.revoked == 1 { return Err(EnrollmentError::Revoked); }
+                if !old.scope_matches(&action.binding)
+                    || old.epoch as u64 != action.binding.w3_epoch
+                {
+                    return Err(EnrollmentError::BindingConflict);
+                }
+                tx.execute(
+                    "UPDATE w6_peer_enrollments SET revoked=1 WHERE endpoint=?1",
+                    params![action.binding.endpoint_id.as_bytes().as_slice()],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE w6_policy_state SET last_revision=?1 WHERE singleton=1",
+            params![action.revision as i64],
+        )?;
+    Ok(())
 }
 
 /// Internal shared verifier: the caller chooses either a snapshot Connection
