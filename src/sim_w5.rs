@@ -12,6 +12,9 @@ pub type MessageId = [u8; 16];
 const MAX_TICKS: u64 = 1024;
 const MAX_MESSAGES: usize = 16;
 const MAX_TRACE: usize = 4096;
+/// Laboratory safety bound against infinitely repeating poisoned packets.
+/// This is not a production retransmission schedule.
+const MAX_TERMINAL_REJECTIONS: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Node { A, B, V, W, Mailbox, G }
@@ -36,7 +39,8 @@ impl Flow {
 pub enum Fault { Drop, Duplicate, Corrupt, Delay(u64) }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SimError { InvalidOrigin, InvalidPayload, Expired, Conflict, ResourceLimit }
+pub enum SimError { InvalidOrigin, InvalidPayload, Expired, Conflict, ResourceLimit,
+    InvalidTerminal, MissingPacket }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Trace {
@@ -84,6 +88,8 @@ pub struct Simulation {
     known: BTreeSet<MessageId>,
     pending: Vec<Transit>,
     faults: Vec<InjectedFault>,
+    /// Bounded by the simulator's maximum 16 distinct message IDs and 2 sinks.
+    terminal_rejections: BTreeMap<(Node, Flow, MessageId), u8>,
     trace: Vec<Trace>,
 }
 
@@ -100,6 +106,7 @@ impl Simulation {
             known: BTreeSet::new(),
             pending: Vec::new(),
             faults: Vec::new(),
+            terminal_rejections: BTreeMap::new(),
             trace: Vec::new(),
         }
     }
@@ -190,6 +197,36 @@ impl Simulation {
         self.copies.get(&(node, flow, id)).map(|s| s.bytes.as_slice())
     }
 
+    /// Only a terminal endpoint can locally evict its rejected copy AFTER
+    /// independently checking a cryptographic failure (COSE/HPKE or signed ACK).
+    ///
+    /// This action does not authenticate data or allow a relay to modify other
+    /// nodes. A valid upstream copy may be resent unchanged next tick. Three
+    /// rejections quarantine this terminal message ID to bound hostile retries.
+    pub fn reject_terminal_copy(
+        &mut self, terminal: Node, flow: Flow, id: MessageId,
+    ) -> Result<(), SimError> {
+        if !matches!((terminal, flow),
+            (Node::G, Flow::Data) | (Node::A, Flow::Receipt)) {
+            return Err(SimError::InvalidTerminal);
+        }
+        let key=(terminal,flow,id);
+        if self.copies.remove(&key).is_none() {
+            return Err(SimError::MissingPacket);
+        }
+        let attempts=self.terminal_rejections.entry(key).or_insert(0);
+        if *attempts < MAX_TERMINAL_REJECTIONS { *attempts += 1; }
+        let quarantined=*attempts >= MAX_TERMINAL_REJECTIONS;
+        self.emit(terminal,terminal,flow,id,"rejected")?;
+        if quarantined { self.emit(terminal,terminal,flow,id,"quarantined")?; }
+        Ok(())
+    }
+
+    pub fn is_terminal_quarantined(&self, terminal: Node, flow: Flow, id: MessageId) -> bool {
+        self.terminal_rejections.get(&(terminal,flow,id)).copied().unwrap_or(0)
+            >= MAX_TERMINAL_REJECTIONS
+    }
+
     pub fn run(&mut self, ticks: u64) -> Result<(), SimError> {
         for _ in 0..ticks { self.step()?; }
         Ok(())
@@ -217,6 +254,7 @@ impl Simulation {
                 || !self.may_forward(from) { continue; }
             for &to in destinations(from, flow) {
                 if !self.available(from, to) { continue; }
+                if self.is_terminal_quarantined(to, flow, id) { continue; }
                 if self.copies.contains_key(&(to, flow, id)) { continue; }
                 if self.pending.iter().any(|p|
                     p.from == from && p.to == to && p.flow == flow && p.id == id) { continue; }
