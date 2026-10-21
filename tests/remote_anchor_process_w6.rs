@@ -15,7 +15,8 @@ use akula_wire_lab::peer_enrollment_w6::{
 };
 use akula_wire_lab::remote_anchor_w6::{
     serve_one_anchor_connection, AnchorServicePolicy, RemoteAnchorClient,
-    RemoteAnchorLedger, ANCHOR_ALPN,
+    RemoteAnchorLedger, OrphanFenceRecoveryOrder, ANCHOR_ALPN,
+    sign_orphan_recovery_operator, sign_orphan_recovery_witness,
 };
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
@@ -34,6 +35,8 @@ use tempfile::tempdir;
 const CHILD_ROOT: &str = "STAYA_W6_REMOTE_ANCHOR_CHILD_ROOT";
 const READY_FILE: &str = "anchor-ready.addr";
 const STOP_FILE: &str = "anchor-stop";
+const ROTATED_READER_FILE: &str = "authority-reader-rotated.flag";
+const SECOND_WRITER_FILE: &str = "authority-second-writer.flag";
 
 fn key(v:u8)->SecretKey {SecretKey::from_bytes(&[v;32])}
 fn id(v:u8)->[u8;16] {[v;16]}
@@ -41,10 +44,24 @@ fn authority()->AuthorityDomainId {AuthorityDomainId::new([90;32]).unwrap()}
 fn policy()->AnchorServicePolicy {
     AnchorServicePolicy {
         reader:key(41).public(),
+        additional_readers:[None;4],
         administrator:key(42).public(),
         operator:root().verifying_key(),
+        recovery_witness:SigningKey::from_bytes(&[234;32]).verifying_key(),
         authority:authority(),
     }
+}
+fn child_policy(root:&Path)->AnchorServicePolicy {
+    // A separate, out-of-band deployment change is mandatory after the
+    // privileged offline recovery. No reader identity is chosen from QUIC.
+    let mut provisioned=policy();
+    if root.join(ROTATED_READER_FILE).exists() {
+        provisioned.reader=key(49).public();
+    }
+    if root.join(SECOND_WRITER_FILE).exists() {
+        provisioned.additional_readers[0]=Some(key(49).public());
+    }
+    provisioned
 }
 fn cp(revision:u64,byte:u8)->PolicyCheckpoint {
     PolicyCheckpoint {revision,digest:[byte;32]}
@@ -72,7 +89,9 @@ fn lookup<'a>(b:&'a EndpointRouteBinding)->EnrollmentLookup<'a> {
     }
 }
 fn provision(db:&Path,checkpoint:PolicyCheckpoint) {
-    RemoteAnchorLedger::provision(db,policy(),checkpoint).unwrap();
+    // This simulates independently provisioned immutable reader registry.
+    let parent=db.parent().unwrap();
+    RemoteAnchorLedger::provision(db,child_policy(parent),checkpoint).unwrap();
 }
 fn flush(path:&Path) {
     Connection::open(path).unwrap()
@@ -86,7 +105,9 @@ fn flush(path:&Path) {
 async fn child_remote_anchor_service_process() {
     let Some(root)=std::env::var_os(CHILD_ROOT) else {return};
     let root=PathBuf::from(root);
-    let ledger=RemoteAnchorLedger::open(&root.join("anchor.sqlite"),policy()).unwrap();
+    let ledger=RemoteAnchorLedger::open(
+        &root.join("anchor.sqlite"),child_policy(&root)
+    ).unwrap();
     let ledger=Arc::new(Mutex::new(ledger));
     let endpoint=Endpoint::builder(presets::Minimal)
         .clear_ip_transports()
@@ -429,4 +450,268 @@ fn real_quic_signed_cas_lost_reply_recovers_after_authority_restart_and_policy_r
         akula_wire_lab::peer_enrollment_w6::SignedRecoveryOutcome::NoPending
     );
     restarted.finish(false);
+}
+
+#[test]
+fn separate_local_hosts_do_not_commit_after_cross_host_revoke() {
+    use std::sync::mpsc;
+
+    let dir=tempdir().unwrap();
+    let a_path=dir.path().join("a-policy.sqlite");
+    let b_path=dir.path().join("b-policy.sqlite");
+    let mailbox_path=dir.path().join("b-mailbox.sqlite");
+    let anchor_path=dir.path().join("anchor.sqlite");
+    // Two physically separate SQLite files model two independent hosts.
+    // Both are first bootstrapped with the SAME operator-approved state.
+    let mut bootstrap=PeerEnrollmentDb::open(&a_path,root().verifying_key()).unwrap();
+    bootstrap.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
+    let initial=bootstrap.checkpoint().unwrap();
+    drop(bootstrap);
+    flush(&a_path);
+    fs::copy(&a_path,&b_path).unwrap();
+    // Host A and host B have DISTINCT pinned reader TLS identities, not
+    // one shared credential. The primary reader is 41, secondary 49.
+    fs::write(dir.path().join(SECOND_WRITER_FILE),b"pinned-reader:49").unwrap();
+    provision(&anchor_path,initial);
+    let server=ChildAuthority::start(dir.path());
+    let admin=client(42,server.address());
+    let mut host_a=PeerEnrollmentDb::open_for_authority(
+        &a_path,root().verifying_key(),authority(),
+    ).unwrap();
+
+    let (entered_tx,entered_rx)=mpsc::sync_channel::<()>(1);
+    let (finish_tx,finish_rx)=mpsc::sync_channel::<()>(1);
+    let writer_addr=server.address();
+    let writer_mailbox_path=mailbox_path.clone();
+    let writer=thread::spawn(move || -> Result<(),EnrollmentError> {
+        let mut host_b=PeerEnrollmentDb::open_for_authority(
+            &b_path,root().verifying_key(),authority(),
+        )?;
+        let reader=client(49,writer_addr);
+        let local_binding=binding();
+        host_b.with_anchored_write(
+            &reader,lookup(&local_binding),|_|{
+                // The remote fence was granted BEFORE callback entry.
+                entered_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(7)).unwrap();
+                // Actual independently durable Mailbox SQLite COMMIT on
+                // host B, NOT merely an in-memory callback flag.
+                let mut mailbox=Connection::open(&writer_mailbox_path)?;
+                mailbox.execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA synchronous=FULL;
+                     CREATE TABLE IF NOT EXISTS received (
+                       id INTEGER PRIMARY KEY, body BLOB NOT NULL
+                     );"
+                )?;
+                let tx=mailbox.transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Immediate
+                )?;
+                tx.execute(
+                    "INSERT INTO received(id,body) VALUES(1,?1)",
+                    rusqlite::params![b"durable mailbox commit".as_slice()],
+                )?;
+                tx.commit()?;
+                Ok(())
+            },
+        )
+    });
+
+    entered_rx.recv_timeout(Duration::from_secs(7)).unwrap();
+    let change=signed(2,PolicyOperation::Revoke);
+    let (old,next)=host_a.preview_signed_update(&change).unwrap();
+    let proof=sign_anchor_transition(&root(),authority(),&change,old,next).unwrap();
+    assert_eq!(old,initial);
+    assert!(matches!(
+        host_a.apply_signed_anchored_with_proof(&change,&proof,&admin),
+        Err(EnrollmentError::Anchor(AnchorError::Conflict))
+    ));
+    // The submitted revoke is durably HELD locally at host A. Authority
+    // cannot claim the revocation is committed while host B is still writing.
+    assert_eq!(admin.current().unwrap(),old);
+    let mut invoked=false;
+    let held:Result<(),EnrollmentError>=host_a.with_anchored_write(
+        &admin,lookup(&binding()),|_|{invoked=true;Ok(())}
+    );
+    assert!(matches!(held,Err(EnrollmentError::PendingRecovery)));
+    assert!(!invoked);
+
+    finish_tx.send(()).unwrap();
+    writer.join().unwrap().unwrap(); // writer's durable callback completed
+    // Independent process/file reader verifies persisted Mailbox content.
+    let persisted:i64=Connection::open(&mailbox_path).unwrap().query_row(
+        "SELECT COUNT(*) FROM received WHERE id=1",[],|r|r.get(0)
+    ).unwrap();
+    assert_eq!(persisted,1);
+    assert_eq!(
+        host_a.recover_pending_signed_update(&admin).unwrap(),
+        akula_wire_lab::peer_enrollment_w6::SignedRecoveryOutcome::ForwardedPending
+    );
+    assert_eq!(admin.current().unwrap(),next);
+
+    // Host B's independent policy file STILL says "Allow", but can no
+    // longer obtain a write permit from the external authority at rev=1.
+    let mut host_b=PeerEnrollmentDb::open_for_authority(
+        &dir.path().join("b-policy.sqlite"),root().verifying_key(),authority(),
+    ).unwrap();
+    let reader=client(49,server.address());
+    let mut wrongly_committed=false;
+    let stale:Result<(),EnrollmentError>=host_b.with_anchored_write(
+        &reader,lookup(&binding()),|_|{wrongly_committed=true;Ok(())}
+    );
+    assert!(matches!(stale,Err(EnrollmentError::CheckpointMismatch)));
+    assert!(!wrongly_committed);
+    server.finish(false);
+}
+
+#[test]
+fn real_quic_writer_fence_survives_authority_sigkill_until_explicit_finish() {
+    let dir=tempdir().unwrap();
+    let remote=dir.path().join("anchor.sqlite");
+    let old=cp(1,1);
+    let next=cp(2,2);
+    provision(&remote,old);
+    let server=ChildAuthority::start(dir.path());
+    let reader=client(41,server.address());
+    let nonce=[179;32];
+    reader.begin_write_fence(old,nonce).unwrap();
+    assert_eq!(reader.current().unwrap(),old);
+    server.finish(true); // independent authority OS process SIGKILL
+
+    let restarted=ChildAuthority::start(dir.path());
+    let admin=client(42,restarted.address());
+    let reader=client(41,restarted.address());
+    assert!(matches!(
+        authorized_cas(&admin,old,next),
+        Err(AnchorError::Conflict)
+    ));
+    assert_eq!(reader.current().unwrap(),old);
+    // No implicit timeouts or cleanup on child startup.
+    assert!(matches!(
+        reader.finish_write_fence(old,[180;32]),
+        Err(AnchorError::Conflict)
+    ));
+    // Simulates explicit settlement only AFTER the writer has been stopped
+    // or has positively completed its durable write.
+    reader.finish_write_fence(old,nonce).unwrap();
+    authorized_cas(&admin,old,next).unwrap();
+    assert_eq!(reader.current().unwrap(),next);
+    restarted.finish(false);
+}
+
+#[test]
+fn callback_failure_retains_remote_fence_across_authority_process_restart() {
+    let dir=tempdir().unwrap();
+    let local_path=dir.path().join("policy.sqlite");
+    let remote_path=dir.path().join("anchor.sqlite");
+    let mut seed=PeerEnrollmentDb::open(&local_path,root().verifying_key()).unwrap();
+    seed.apply_signed(&signed(1,PolicyOperation::Allow)).unwrap();
+    let old=seed.checkpoint().unwrap();
+    drop(seed);
+    provision(&remote_path,old);
+    let server=ChildAuthority::start(dir.path());
+    let reader=client(41,server.address());
+    let mut local=PeerEnrollmentDb::open_for_authority(
+        &local_path,root().verifying_key(),authority(),
+    ).unwrap();
+    let mut entered=false;
+    let result:Result<(),EnrollmentError>=local.with_anchored_write(
+        &reader,lookup(&binding()),|_|{
+            entered=true;
+            // The callback reports an unknown durable outcome: the system
+            // MUST NOT assume no bytes were committed or clear the fence.
+            Err(EnrollmentError::CorruptStorage)
+        }
+    );
+    assert!(entered);
+    assert!(matches!(result,Err(EnrollmentError::CorruptStorage)));
+    let admin=client(42,server.address());
+    assert_eq!(admin.current().unwrap(),old);
+    assert_eq!(
+        authorized_cas(&admin,old,cp(2,2)).unwrap_err(),
+        AnchorError::Conflict
+    );
+    server.finish(true);
+    let restarted=ChildAuthority::start(dir.path());
+    let new_admin=client(42,restarted.address());
+    assert_eq!(
+        authorized_cas(&new_admin,old,cp(2,2)).unwrap_err(),
+        AnchorError::Conflict
+    );
+    // No auto-expiry and no unsafe fabricated "recovery success".
+    assert_eq!(new_admin.current().unwrap(),old);
+    restarted.finish(false);
+}
+
+#[test]
+fn witness_signed_orphan_recovery_rotates_real_quic_writer_after_authority_restart() {
+    let dir=tempdir().unwrap();
+    let db=dir.path().join("anchor.sqlite");
+    let old=cp(1,1);
+    let next=cp(2,2);
+    provision(&db,old);
+    let old_server=ChildAuthority::start(dir.path());
+    let old_reader=client(41,old_server.address());
+    let admin=client(42,old_server.address());
+    old_reader.begin_write_fence(old,[166;32]).unwrap();
+    assert_eq!(admin.current().unwrap(),old);
+    assert_eq!(
+        authorized_cas(&admin,old,next).unwrap_err(),
+        AnchorError::Conflict
+    );
+    drop(old_reader);
+    drop(admin);
+
+    // In this lab, stop the server process and explicitly attest to
+    // isolation using pinned offline test keys. These signatures are
+    // NOT evidence of real-world OS death: physical custody of the old
+    // writer is a separate production trust requirement.
+    old_server.finish(true);
+    let mut maintenance=RemoteAnchorLedger::open(&db,policy()).unwrap();
+    let pending=maintenance.inspect_orphan_fence().unwrap().unwrap();
+    assert_eq!(pending.reader,key(41).public());
+    let order=OrphanFenceRecoveryOrder {
+        authority:pending.authority,
+        previous_reader:pending.reader,
+        replacement_reader:key(49).public(),
+        checkpoint:pending.checkpoint,
+        nonce:pending.nonce,
+        generation:pending.next_generation,
+    };
+    let op=sign_orphan_recovery_operator(&root(),&order);
+    let witness=sign_orphan_recovery_witness(
+        &SigningKey::from_bytes(&[234;32]),&order
+    );
+    maintenance.recover_orphan_after_external_isolation(
+        &order,&op,&witness,
+    ).unwrap();
+    drop(maintenance);
+
+    assert!(RemoteAnchorLedger::open(&db,policy()).is_err());
+    let mut pinned_new=policy();
+    pinned_new.reader=key(49).public();
+    assert!(RemoteAnchorLedger::open(&db,pinned_new).is_ok());
+
+    // Restart with independently updated and pinned trusted config, NOT
+    // a value copied from the remote SQLite or a network response.
+    fs::write(dir.path().join(ROTATED_READER_FILE),b"new-reader:49").unwrap();
+    let server=ChildAuthority::start(dir.path());
+    let old_client=client(41,server.address());
+    let new_client=client(49,server.address());
+    let admin=client(42,server.address());
+    assert_eq!(old_client.current().unwrap_err(),AnchorError::InvalidAttestation);
+    assert_eq!(
+        old_client.begin_write_fence(old,[168;32]).unwrap_err(),
+        AnchorError::InvalidAttestation
+    );
+    assert_eq!(new_client.current().unwrap(),old);
+    new_client.begin_write_fence(old,[169;32]).unwrap();
+    assert_eq!(
+        authorized_cas(&admin,old,next).unwrap_err(),
+        AnchorError::Conflict
+    );
+    new_client.finish_write_fence(old,[169;32]).unwrap();
+    authorized_cas(&admin,old,next).unwrap();
+    assert_eq!(admin.current().unwrap(),next);
+    server.finish(false);
 }
