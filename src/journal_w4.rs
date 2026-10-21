@@ -59,6 +59,7 @@ impl Journal {
     /// This journal does not verify receipt signatures on its own.
     pub fn record_verified_receipt(&mut self,recipient:[u8;16],message:[u8;16],level:Delivery)
         ->Result<Delivery,JournalError>{
+        if level == Delivery::Recipient { return Err(JournalError::InvalidState); }
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old:Option<i64>=tx.query_row("SELECT status FROM outbox WHERE recipient=?1 AND message=?2",
             params![recipient.as_slice(),message.as_slice()],|r|r.get(0)).optional()?;
@@ -69,6 +70,30 @@ impl Journal {
         }
         tx.commit()?;Ok(if (old as i64)>(level as i64){old}else{level})
     }
+    /// Elevate to recipient-confirmed only with a verified signature AND an
+    /// exact ciphertext digest match. No arbitrary relay can advance this state.
+    pub fn apply_recipient_receipt(
+        &mut self, receipt: &crate::receipt_w4::VerifiedRecipientReceipt,
+    ) -> Result<Delivery, JournalError> {
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recipient=receipt.recipient_id();
+        let message=receipt.message_id();
+        let row:Option<(Vec<u8>,i64)>=tx.query_row(
+            "SELECT digest,status FROM outbox WHERE recipient=?1 AND message=?2",
+            params![recipient.as_slice(),message.as_slice()],
+            |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let (digest,status)=row.ok_or(JournalError::NotFound)?;
+        if digest.as_slice()!=receipt.packet_digest() {return Err(JournalError::Conflict);}
+        let old=Delivery::from_int(status)?;
+        if old != Delivery::Recipient {
+            tx.execute("UPDATE outbox SET status=4 WHERE recipient=?1 AND message=?2",
+                params![recipient.as_slice(),message.as_slice()])?;
+        }
+        tx.commit()?;
+        Ok(Delivery::Recipient)
+    }
+
     pub fn state(&self,recipient:[u8;16],message:[u8;16])->Result<Delivery,JournalError>{
         let value:i64=self.db.query_row("SELECT status FROM outbox WHERE recipient=?1 AND message=?2",
             params![recipient.as_slice(),message.as_slice()],|r|r.get(0))?;
