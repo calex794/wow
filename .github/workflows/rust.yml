@@ -1,7 +1,13 @@
 name: rust-wire-lab
+# Feature branches run through pull_request once; avoid duplicate push builds.
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:
     runs-on: ubuntu-latest
