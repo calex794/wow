@@ -248,10 +248,12 @@ fn revoking_relay_consent_prevents_future_transfers(){
  sim.connect(Node::B,Node::V,true);
  sim.connect(Node::V,Node::Mailbox,true);
  sim.connect(Node::Mailbox,Node::G,true);
+ sim.relay_opt_in(Node::B,true);
  sim.submit_data(id(1),100,b"private test").unwrap();
  sim.run(1).unwrap();
  assert!(sim.packet(Node::B,Flow::Data,id(1)).is_some());
  sim.relay_opt_in(Node::B,false);
+ assert!(sim.packet(Node::B,Flow::Data,id(1)).is_none());
  sim.relay_opt_in(Node::V,true);
  sim.run(8).unwrap();
  assert!(sim.packet(Node::V,Flow::Data,id(1)).is_none());
