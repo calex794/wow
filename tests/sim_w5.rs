@@ -101,6 +101,7 @@ fn failed_gateway_switch_and_dropped_ack_never_cause_false_delivery(){
 fn partitions_ttl_opt_in_and_resource_limits(){
  let mut sim=Simulation::new(7);
  sim.connect(Node::A,Node::B,true);
+ sim.relay_opt_in(Node::B,true);
  sim.submit_data(id(1),3,b"opaque").unwrap();
  sim.run(5).unwrap();
  assert!(sim.packet(Node::B,Flow::Data,id(1)).is_some());
@@ -247,10 +248,12 @@ fn revoking_relay_consent_prevents_future_transfers(){
  sim.connect(Node::B,Node::V,true);
  sim.connect(Node::V,Node::Mailbox,true);
  sim.connect(Node::Mailbox,Node::G,true);
+ sim.relay_opt_in(Node::B,true);
  sim.submit_data(id(1),100,b"private test").unwrap();
  sim.run(1).unwrap();
  assert!(sim.packet(Node::B,Flow::Data,id(1)).is_some());
  sim.relay_opt_in(Node::B,false);
+ assert!(sim.packet(Node::B,Flow::Data,id(1)).is_none());
  sim.relay_opt_in(Node::V,true);
  sim.run(8).unwrap();
  assert!(sim.packet(Node::V,Flow::Data,id(1)).is_none());
