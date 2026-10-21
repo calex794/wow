@@ -236,16 +236,6 @@ impl Simulation {
         if self.tick >= MAX_TICKS { return Err(SimError::ResourceLimit); }
         self.tick += 1;
 
-        // Complete flights scheduled on prior ticks before offering new ones.
-        let flights = std::mem::take(&mut self.pending);
-        for flight in flights {
-            if flight.due <= self.tick {
-                self.arrive(flight)?;
-            } else {
-                self.pending.push(flight);
-            }
-        }
-
         // Snapshot before transfers: at most one hop per tick. No copy may
         // turn into an instantaneous multi-hop delivery.
         let mut candidates = Vec::new();
@@ -261,6 +251,18 @@ impl Simulation {
                 candidates.push(Transit {
                     from, to, flow, id, stored: stored.clone(), due: self.tick,
                 });
+            }
+        }
+
+        // Freeze forwarding candidates before processing delayed arrivals.
+        // A packet arriving this tick cannot start another hop before the next.
+        // Preexisting pending flights were considered while collecting candidates.
+        let flights = std::mem::take(&mut self.pending);
+        for flight in flights {
+            if flight.due <= self.tick {
+                self.arrive(flight)?;
+            } else {
+                self.pending.push(flight);
             }
         }
 
