@@ -12,9 +12,12 @@
 //! The global revision and tombstones survive ordinary process restarts.
 //!
 //! Bounds: 128 endpoint rows, including revoked tombstones. No automatic
-//! deletion. File/WAL quota, multi-process revocation ordering, cross-host
-//! propagation, SQLite rollback after restoring an old snapshot, OS disk
-//! tampering, and enrollment hardware proof are OUT OF SCOPE here.
+//! deletion. An OPTIONAL external checkpoint gate rejects stale/tampered
+//! policy DB snapshots and advances a separately trusted revision *before*
+//! applying SQLite changes. The anchor MUST be monotonic/durable and hosted
+//! outside the attacker's rollback domain; no real HSM/server is provided.
+//! File/WAL quota, cross-host propagation, hardware key custody, and a safe
+//! administrator-led recovery protocol are OUT OF SCOPE here.
 //! This is a lab-only trust-policy component, not an HTTP/QUIC admin endpoint.
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::EndpointId;
@@ -64,9 +67,116 @@ pub enum EnrollmentError {
     EpochRollback,
     BindingConflict,
     CorruptStorage,
+    Anchor(AnchorError),
+    CheckpointMismatch,
 }
 impl From<rusqlite::Error> for EnrollmentError {
     fn from(value: rusqlite::Error) -> Self { Self::Db(value) }
+}
+
+
+const CHECKPOINT_DOMAIN: &[u8] = b"Akula/WOW/W6/policy-checkpoint/lab-v1\0";
+
+/// Canonical, operator-root-bound digest over ALL 128-or-fewer persisted
+/// endpoint records (including revoke tombstones) and the last revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyCheckpoint {
+    pub revision: u64,
+    pub digest: [u8; 32],
+}
+
+/// Errors from an EXTERNAL, non-rollbackable source. No untrusted local file
+/// may masquerade as an authoritative anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorError {
+    Unavailable,
+    Conflict,
+    InvalidAttestation,
+}
+
+/// Trust contract: current() must return a *fresh authenticated* checkpoint;
+/// advance() must be atomic, durable, compare-and-swap and strictly
+/// monotonic. The trusted anchor must live outside the SQLite snapshot
+/// rollback/tamper domain. Implementing this over another writable file on
+/// the same machine IS NOT SECURITY. An in-memory implementation is suitable
+/// for regression tests ONLY and is lost after reboot.
+pub trait TrustedPolicyAnchor: Send + Sync {
+    fn current(&self) -> Result<PolicyCheckpoint, AnchorError>;
+    fn advance(
+        &self, expected: PolicyCheckpoint, replacement: PolicyCheckpoint,
+    ) -> Result<(), AnchorError>;
+}
+
+/// Scope from trusted W6 server config, NEVER network-provided fields.
+#[derive(Clone, Copy)]
+pub struct EnrollmentLookup<'a> {
+    pub remote: &'a EndpointId,
+    pub relay: &'a [u8;16],
+    pub namespace: &'a [u8;16],
+    pub token: &'a [u8;16],
+    pub issuer: &'a [u8;16],
+}
+
+fn ensure_anchor(
+    anchor: &dyn TrustedPolicyAnchor, local: PolicyCheckpoint,
+) -> Result<(), EnrollmentError> {
+    let remote = anchor.current().map_err(EnrollmentError::Anchor)?;
+    if remote != local { return Err(EnrollmentError::CheckpointMismatch); }
+    Ok(())
+}
+
+/// Reads a canonical SQLite snapshot. Never derive the trusted checkpoint
+/// from this method alone; the external anchor must be provisioned by an
+/// independent control plane, not initialized from possibly untrusted DB.
+fn policy_checkpoint(
+    db: &Connection, operator: &VerifyingKey,
+) -> Result<PolicyCheckpoint, EnrollmentError> {
+    let revision: i64 = db.query_row(
+        "SELECT last_revision FROM w6_policy_state WHERE singleton=1",
+        [], |row| row.get(0),
+    )?;
+    if revision < 0 { return Err(EnrollmentError::CorruptStorage); }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CHECKPOINT_DOMAIN);
+    hasher.update(operator.as_bytes());
+    hasher.update(&(revision as u64).to_be_bytes());
+
+    let mut stmt = db.prepare(
+        "SELECT endpoint,device,epoch,relay,namespace,token,issuer,revoked
+         FROM w6_peer_enrollments ORDER BY endpoint ASC"
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut count = 0u64;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > MAX_ENROLLED_ENDPOINTS as u64 {
+            return Err(EnrollmentError::CorruptStorage);
+        }
+        let endpoint: Vec<u8> = row.get(0)?;
+        let stored = StoredBinding {
+            device: row.get(1)?, epoch: row.get(2)?,
+            relay: row.get(3)?, namespace: row.get(4)?,
+            token: row.get(5)?, issuer: row.get(6)?,
+            revoked: row.get(7)?,
+        };
+        if endpoint.len() != 32 || !stored.valid() {
+            return Err(EnrollmentError::CorruptStorage);
+        }
+        hasher.update(&endpoint);
+        hasher.update(&stored.device);
+        hasher.update(&stored.epoch.to_be_bytes());
+        hasher.update(&stored.relay);
+        hasher.update(&stored.namespace);
+        hasher.update(&stored.token);
+        hasher.update(&stored.issuer);
+        hasher.update(&stored.revoked.to_be_bytes());
+    }
+    hasher.update(&count.to_be_bytes());
+    Ok(PolicyCheckpoint {
+        revision: revision as u64,
+        digest: *hasher.finalize().as_bytes(),
+    })
 }
 
 fn bytes16(raw: &[u8], start: usize) -> [u8;16] {
@@ -238,6 +348,13 @@ impl PeerEnrollmentDb {
         Ok(Self { db, operator })
     }
 
+    /// Informational digest for external provisioning/test fixtures. It is
+    /// NOT independently trustworthy until an external anchor has recorded
+    /// it through a privileged bootstrap ceremony.
+    pub fn checkpoint(&self) -> Result<PolicyCheckpoint, EnrollmentError> {
+        policy_checkpoint(&self.db, &self.operator)
+    }
+
     pub fn last_revision(&self) -> Result<u64, EnrollmentError> {
         let value: i64 = self.db.query_row(
             "SELECT last_revision FROM w6_policy_state WHERE singleton=1",
@@ -250,6 +367,23 @@ impl PeerEnrollmentDb {
     /// Serialized, atomic signed update. No remote W6 handler can call this.
     /// Monotonic revision rejects stale/replayed changes across a restart.
     pub fn apply_signed(&mut self, bytes: &[u8]) -> Result<(), EnrollmentError> {
+        self.apply_signed_internal(bytes, None)
+    }
+
+    /// Anchored operator update. Publishes the new canonical checkpoint
+    /// BEFORE SQLite commit. A crash or failure between the two steps leaves
+    /// an anchor ahead of the DB; subsequent reads fail closed rather than
+    /// resurrecting an older authorization. Recovery requires a separately
+    /// authenticated operator workflow, not automatic rollback of the anchor.
+    pub fn apply_signed_anchored(
+        &mut self, bytes: &[u8], anchor: &dyn TrustedPolicyAnchor,
+    ) -> Result<(), EnrollmentError> {
+        self.apply_signed_internal(bytes, Some(anchor))
+    }
+
+    fn apply_signed_internal(
+        &mut self, bytes: &[u8], anchor: Option<&dyn TrustedPolicyAnchor>,
+    ) -> Result<(), EnrollmentError> {
         let action = decode(bytes)?;
         let sig = Signature::from_slice(&bytes[BODY_BYTES..])
             .map_err(|_| EnrollmentError::InvalidSignature)?;
@@ -257,6 +391,13 @@ impl PeerEnrollmentDb {
             &signing_input(&bytes[..BODY_BYTES]), &sig,
         ).map_err(|_| EnrollmentError::InvalidSignature)?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior = if let Some(anchor) = anchor {
+            let local = policy_checkpoint(&tx, &self.operator)?;
+            ensure_anchor(anchor, local)?;
+            Some(local)
+        } else {
+            None
+        };
         let last: i64 = tx.query_row(
             "SELECT last_revision FROM w6_policy_state WHERE singleton=1",
             [], |row|row.get(0),
@@ -328,6 +469,16 @@ impl PeerEnrollmentDb {
             "UPDATE w6_policy_state SET last_revision=?1 WHERE singleton=1",
             params![action.revision as i64],
         )?;
+        if let (Some(anchor), Some(previous)) = (anchor, prior) {
+            let next = policy_checkpoint(&tx, &self.operator)?;
+            if next.revision <= previous.revision {
+                return Err(EnrollmentError::RevisionRollback);
+            }
+            // Critical order: external durable anchor BEFORE local SQLite
+            // commit. Failure of the anchor means no local policy mutation.
+            // If SQLite subsequently fails, the anchor is ahead: fail closed.
+            anchor.advance(previous, next).map_err(EnrollmentError::Anchor)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -340,6 +491,23 @@ impl PeerEnrollmentDb {
         namespace: &[u8;16], token: &[u8;16], issuer: &[u8;16],
     ) -> Result<([u8;16],u64), EnrollmentError> {
         authorize_from(&self.db, remote, relay, namespace, token, issuer)
+    }
+
+
+    /// Provisional QUIC admission, using one real SQLite write transaction
+    /// to read a canonical snapshot and verify the *external* anchor before
+    /// the stream is read. No mailbox write is authorized by this alone.
+    pub fn authorize_anchored(
+        &mut self, anchor: &dyn TrustedPolicyAnchor, lookup: EnrollmentLookup<'_>,
+    ) -> Result<([u8;16],u64), EnrollmentError> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_anchor(anchor, policy_checkpoint(&tx, &self.operator)?)?;
+        let identity = authorize_from(
+            &tx, lookup.remote, lookup.relay, lookup.namespace,
+            lookup.token, lookup.issuer,
+        )?;
+        tx.commit()?;
+        Ok(identity)
     }
 
     /// The mandatory final authorization boundary for shared-SQLite writers.
@@ -365,10 +533,45 @@ impl PeerEnrollmentDb {
         E: From<EnrollmentError>,
         F: FnOnce(([u8;16], u64)) -> Result<T, E>,
     {
+        self.with_write_internal(
+            None, EnrollmentLookup { remote, relay, namespace, token, issuer },
+            commit_mailbox,
+        )
+    }
+
+    /// REQUIRED final grant for an anchored W6 network ingress: proof of
+    /// current externally attested policy snapshot happens INSIDE the same
+    /// SQLite IMMEDIATE transaction held across the Mailbox durable COMMIT.
+    /// Do not substitute the legacy unanchored method in a network adapter.
+    pub fn with_anchored_write<T, E, F>(
+        &mut self, anchor: &dyn TrustedPolicyAnchor,
+        lookup: EnrollmentLookup<'_>, commit_mailbox: F,
+    ) -> Result<T, E>
+    where
+        E: From<EnrollmentError>,
+        F: FnOnce(([u8;16],u64)) -> Result<T,E>,
+    {
+        self.with_write_internal(Some(anchor), lookup, commit_mailbox)
+    }
+
+
+    fn with_write_internal<T, E, F>(
+        &mut self, anchor: Option<&dyn TrustedPolicyAnchor>,
+        lookup: EnrollmentLookup<'_>, commit_mailbox: F,
+    ) -> Result<T, E>
+    where
+        E: From<EnrollmentError>,
+        F: FnOnce(([u8;16], u64)) -> Result<T, E>,
+    {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(EnrollmentError::from).map_err(E::from)?;
+        if let Some(anchor) = anchor {
+            let snapshot=policy_checkpoint(&tx, &self.operator).map_err(E::from)?;
+            ensure_anchor(anchor, snapshot).map_err(E::from)?;
+        }
         let identity = authorize_from(
-            &tx, remote, relay, namespace, token, issuer,
+            &tx, lookup.remote, lookup.relay, lookup.namespace,
+            lookup.token, lookup.issuer,
         ).map_err(E::from)?;
         let result = commit_mailbox(identity)?;
         tx.commit().map_err(EnrollmentError::from).map_err(E::from)?;

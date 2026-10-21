@@ -3,6 +3,10 @@
 //! no external relay, N0 discovery, WAN or user information.
 #![cfg(feature = "iroh-transport")]
 
+#[path = "support/w6_memory_anchor.rs"]
+mod w6_memory_anchor;
+use w6_memory_anchor::MemoryAnchor;
+
 use akula_wire_lab::crypto_identity_w3::{seal, SignedHeader};
 use akula_wire_lab::crypto_w3::new_recipient;
 use akula_wire_lab::guarded_tcp_w5::GuardedTcpClock;
@@ -44,6 +48,7 @@ struct Lab {
     trusted: Endpoint,
     stranger: Endpoint,
     enrollment: Mutex<PeerEnrollmentDb>,
+    anchor: MemoryAnchor,
     operator: SigningKey,
     trusted_binding: EndpointRouteBinding,
     relay_policy: RelayPolicy,
@@ -105,9 +110,14 @@ impl Lab {
             binding:trusted_binding,
         }).unwrap();
         enrollment.apply_signed(&signed).unwrap();
+        // Test-only independent checkpoint bootstrapped explicitly after
+        // offline operator enrollment. Never bootstrap from untrusted DB
+        // automatically in a real network service.
+        let anchor = MemoryAnchor::new(enrollment.checkpoint().unwrap());
+        assert_eq!(anchor.observed().revision,1);
         Self {
             _dir:dir,server,trusted,stranger,
-            enrollment:Mutex::new(enrollment),operator,trusted_binding,
+            enrollment:Mutex::new(enrollment),anchor,operator,trusted_binding,
             relay_policy:route_policy,issuer_registry,device_registry,
             mailbox:Mutex::new(mailbox),guard:Mutex::new(IngressGuard::new()),
             signed_grant,packet,
@@ -117,7 +127,8 @@ impl Lab {
     {
         IrohMailboxContext {
             local:&self.server,expected_local_id:self.server.id(),
-            enrollments:&self.enrollment,devices:&self.device_registry,
+            enrollments:&self.enrollment,policy_anchor:&self.anchor,
+            devices:&self.device_registry,
             issuer_trust:&self.issuer_registry,
             relay_policy:&self.relay_policy,
             guard:&self.guard,mailbox:&self.mailbox,
@@ -295,7 +306,7 @@ async fn signed_operator_revoke_drops_existing_quic_endpoint_before_ingress() {
     let revoke = sign_operator_change(&lab.operator,&OperatorChange {
         operation:PolicyOperation::Revoke,revision:2,binding:lab.trusted_binding,
     }).unwrap();
-    lab.enrollment.lock().unwrap().apply_signed(&revoke).unwrap();
+    lab.enrollment.lock().unwrap().apply_signed_anchored(&revoke,&lab.anchor).unwrap();
     assert!(matches!(
         receive_authenticated_iroh_mailbox(
             &receiver,lab.context(Duration::from_secs(2))
@@ -330,7 +341,7 @@ async fn revocation_between_ticket_admission_and_read_fails_at_commit_boundary()
             operation:PolicyOperation::Revoke,revision:2,
             binding:lab.trusted_binding,
         }).unwrap();
-        lab.enrollment.lock().unwrap().apply_signed(&signed).unwrap();
+        lab.enrollment.lock().unwrap().apply_signed_anchored(&signed,&lab.anchor).unwrap();
         transmit(&sender,&lab.wire()).await;
     };
     let (outcome,())=tokio::join!(result,attack);
@@ -364,7 +375,7 @@ async fn operator_signed_epoch_rotation_requires_matching_w3_registry() {
     let change=sign_operator_change(&lab.operator,&OperatorChange {
         operation:PolicyOperation::Allow,revision:2,binding:rotated,
     }).unwrap();
-    lab.enrollment.lock().unwrap().apply_signed(&change).unwrap();
+    lab.enrollment.lock().unwrap().apply_signed_anchored(&change,&lab.anchor).unwrap();
     // Policy now demands epoch 10, but W3 registry still holds epoch 9.
     assert!(matches!(
         receive_authenticated_iroh_mailbox(
@@ -397,6 +408,55 @@ async fn wrong_alpn_rejected_before_ticket_or_storage_even_with_valid_tls_key() 
     assert!(matches!(
         receive_authenticated_iroh_mailbox(&receiver,context).await,
         Err(IrohIngressError::WrongAlpn)
+    ));
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn trust_anchor_unavailable_rejects_genuine_roha_tls_before_stream() {
+    let lab=Lab::new().await;
+    let (_sender,receiver)=connect_pair(
+        &lab.server,&lab.trusted,W6_LAB_ALPN,
+    ).await;
+    assert_eq!(receiver.remote_id(),lab.trusted.id());
+    lab.anchor.set_unavailable(true);
+    assert!(matches!(
+        receive_authenticated_iroh_mailbox(
+            &receiver,lab.context(Duration::from_secs(2)),
+        ).await,
+        Err(IrohIngressError::Enrollment(
+            EnrollmentError::Anchor(
+                akula_wire_lab::peer_enrollment_w6::AnchorError::Unavailable
+            )
+        ))
+    ));
+    lab.assert_message_count(0);
+    lab.assert_clean_guard();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn unanchored_sql_policy_revoke_cannot_masquerade_as_verified_state() {
+    let lab=Lab::new().await;
+    let (_sender,receiver)=connect_pair(
+        &lab.server,&lab.trusted,W6_LAB_ALPN,
+    ).await;
+    let forged_local_state=sign_operator_change(&lab.operator,&OperatorChange {
+        operation:PolicyOperation::Revoke,revision:2,
+        binding:lab.trusted_binding,
+    }).unwrap();
+    // This simulates a local-only policy mutation bypassing external
+    // checkpoint publication. W6 network ingress MUST refuse both the old
+    // and new state until an independently trusted checkpoint matches it.
+    lab.enrollment.lock().unwrap().apply_signed(&forged_local_state).unwrap();
+    assert!(matches!(
+        receive_authenticated_iroh_mailbox(
+            &receiver,lab.context(Duration::from_secs(2)),
+        ).await,
+        Err(IrohIngressError::Enrollment(
+            EnrollmentError::CheckpointMismatch
+        ))
     ));
     lab.assert_message_count(0);
     lab.assert_clean_guard();
