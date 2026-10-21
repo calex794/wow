@@ -14,6 +14,7 @@ pub mod trust_w3;
 pub mod crypto_identity_w3;
 pub mod journal_w4;
 pub mod receipt_w4;
+pub mod sim_w5;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
