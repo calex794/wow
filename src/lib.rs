@@ -10,6 +10,7 @@ pub const BLE_HEADER_BYTES: usize = 8;
 
 pub mod transport;
 pub mod crypto_w3;
+pub mod trust_w3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
