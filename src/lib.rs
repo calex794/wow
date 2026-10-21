@@ -16,6 +16,11 @@ pub mod journal_w4;
 pub mod receipt_w4;
 pub mod sim_w5;
 pub mod mailbox_w5;
+pub mod ingress_bridge_w5;
+pub mod route_grant_w5;
+pub mod ingress_guard_w5;
+pub mod guarded_tcp_w5;
+pub mod peer_proof_w5;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
