@@ -1,7 +1,15 @@
 name: rust-wire-lab
 on:
   push:
+    branches: [main]
   pull_request:
+
+# A feature branch with a PR runs once, not both on push and pull_request.
+# Superseded PR commits do not need to consume runner capacity.
+concurrency:
+  group: wow-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
