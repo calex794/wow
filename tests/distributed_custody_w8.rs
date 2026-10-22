@@ -184,8 +184,7 @@ fn revocation_expired_offer_and_clock_rollback_fail_closed() {
         expected_source:id(21),target_id:id(13),target_epoch:7,
         signer:&key(13),trust:&trusted,now_ms:299,
     }),Err(TransferError::ClockRollback)));
-    assert!(matches!(issue(&mut source,id(31),id(13),&trusted),
-        Ok(_)));
+    assert!(issue(&mut source,id(31),id(13),&trusted).is_ok());
 }
 
 #[test]
