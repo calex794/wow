@@ -60,6 +60,31 @@ pub struct TransferSnapshot {
     pub offer_id: [u8;16],
 }
 
+/// One source-issued transfer: this grouping keeps source security context
+/// explicit rather than mixing recipient, peer and slot coordinates.
+#[derive(Debug,Clone,Copy)]
+pub struct OfferIssue {
+    pub recipient:[u8;16],
+    pub message:[u8;16],
+    pub attempt_id:[u8;16],
+    pub offer_id:[u8;16],
+    pub source_id:[u8;16],
+    pub source_epoch:u64,
+    pub target_id:[u8;16],
+    pub target_epoch:u64,
+    pub now_ms:i64,
+}
+/// Receiver authorization supplied out of band, never extracted from offer.
+pub struct PeerConsent<'a> {
+    pub expected_source:[u8;16],
+    pub target_id:[u8;16],
+    pub target_epoch:u64,
+    pub signer:&'a SigningKey,
+    pub trust:&'a TrustRegistry,
+    pub now_ms:i64,
+}
+type TransferSnapshotRow=(Vec<u8>,Vec<u8>,Vec<u8>,i64);
+
 #[derive(Clone,Copy,Debug)]
 pub struct OfferClaims {
     pub source_id:[u8;16],
@@ -189,11 +214,12 @@ pub fn verify_acceptance(wire:&[u8],trust:&TrustRegistry)->Result<Acceptance,Tra
 // reserve is already spent BEFORE a CustodyOffer can be signed and issued.
 impl Journal {
     pub fn issue_custody_offer(
-        &mut self, recipient:[u8;16],message:[u8;16],attempt_id:[u8;16],
-        offer_id:[u8;16],source_id:[u8;16],source_epoch:u64,
-        target_id:[u8;16],target_epoch:u64,now_ms:i64,
-        signer:&SigningKey,trust:&TrustRegistry,
+        &mut self,request:OfferIssue,signer:&SigningKey,trust:&TrustRegistry,
     )->Result<Vec<u8>,TransferError>{
+        let OfferIssue {
+            recipient,message,attempt_id,offer_id,source_id,source_epoch,
+            target_id,target_epoch,now_ms,
+        }=request;
         if !is_nonzero(offer_id)||!is_nonzero(attempt_id)||now_ms<0{
             return Err(TransferError::Invalid);
         }
@@ -315,7 +341,7 @@ impl Journal {
     pub fn custody_transfer_snapshot(
         &self,offer_id:[u8;16],
     )->Result<TransferSnapshot,TransferError>{
-        let row:Option<(Vec<u8>,Vec<u8>,Vec<u8>,i64)>=self.db.query_row(
+        let row:Option<TransferSnapshotRow>=self.db.query_row(
             "SELECT target,slot_alias,offer_id,phase
              FROM custody_transfer_source WHERE offer_id=?1",
             params![offer_id.as_slice()],
@@ -358,10 +384,11 @@ impl PeerCustodyStore {
     }
 
     pub fn accept(
-        &mut self,wire:&[u8],exact_w3:&[u8],
-        expected_source:[u8;16],target_id:[u8;16],target_epoch:u64,
-        signer:&SigningKey,trust:&TrustRegistry,now_ms:i64,
+        &mut self,wire:&[u8],exact_w3:&[u8],consent:PeerConsent<'_>,
     )->Result<Vec<u8>,TransferError>{
+        let PeerConsent {
+            expected_source,target_id,target_epoch,signer,trust,now_ms,
+        }=consent;
         if now_ms<0 || exact_w3.is_empty()||exact_w3.len()>crate::MAX_MESSAGE_BYTES
             ||!is_nonzero(expected_source)||!is_nonzero(target_id)
         {return Err(TransferError::Invalid);}
