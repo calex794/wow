@@ -66,6 +66,17 @@ impl Journal {
               PRIMARY KEY(recipient,message,attempt),
               UNIQUE(recipient,message,slot),
               FOREIGN KEY(recipient,message) REFERENCES multipath_plan(recipient,message));
+            CREATE TABLE IF NOT EXISTS custody_transfer_source(
+              recipient BLOB NOT NULL CHECK(length(recipient)=16),
+              message BLOB NOT NULL CHECK(length(message)=16),
+              slot_alias BLOB NOT NULL CHECK(length(slot_alias)=16),
+              offer_id BLOB NOT NULL UNIQUE CHECK(length(offer_id)=16),
+              target BLOB NOT NULL CHECK(length(target)=16),
+              offer BLOB NOT NULL CHECK(length(offer)=185),
+              phase INTEGER NOT NULL CHECK(phase BETWEEN 1 AND 4),
+              acceptance BLOB CHECK(acceptance IS NULL OR length(acceptance)=209),
+              PRIMARY KEY(recipient,message,slot_alias),
+              FOREIGN KEY(recipient,message) REFERENCES multipath_plan(recipient,message));
             PRAGMA foreign_keys=ON;")?;
         Ok(Self{db})
     }
@@ -119,9 +130,13 @@ impl Journal {
             tx.execute("UPDATE outbox SET status=4 WHERE recipient=?1 AND message=?2",
                 params![recipient.as_slice(),message.as_slice()])?;
         }
-        // One transaction: verified W4 sets final status AND fences route credits.
-        // Failure of either statement rolls both changes back.
+        // One transaction: verified W4 sets final status AND fences route
+        // credits and all pending/ambiguous peer custody offers in this
+        // sender ledger. Peer-custody ACK by itself never ends delivery.
         tx.execute("UPDATE multipath_plan SET stopped=1
+                    WHERE recipient=?1 AND message=?2",
+                   params![recipient.as_slice(),message.as_slice()])?;
+        tx.execute("UPDATE custody_transfer_source SET phase=4
                     WHERE recipient=?1 AND message=?2",
                    params![recipient.as_slice(),message.as_slice()])?;
         tx.commit()?;
