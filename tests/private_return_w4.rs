@@ -1,6 +1,6 @@
 //! Private reverse W4: HPKE hides recipient/message IDs from custodians.
 use akula_wire_lab::crypto_identity_w3::{SignedHeader, TrustedRecipient};
-use akula_wire_lab::crypto_w3::{new_recipient, RecipientSecret, RecipientPublic};
+use akula_wire_lab::crypto_w3::{new_recipient, RecipientSecret};
 use akula_wire_lab::journal_w4::{Delivery, Insert, Journal, JournalError};
 use akula_wire_lab::multipath_w5::{Lane, RouteError};
 use akula_wire_lab::private_return_w4::{
@@ -122,9 +122,8 @@ fn changed_public_return_tag_and_wrong_route_are_denied() {
 
 #[test]
 fn wrong_hpke_recipient_and_ciphertext_tamper_never_expose_plain_w4() {
-    let (_,pubkey)=new_recipient();
+    let (secret,pubkey)=new_recipient();
     let (other_secret,_)=new_recipient();
-    let (secret,_)=new_recipient();
     let trust=recipient_trust();
     let mut sealed=private_return_w4::seal_signed_receipt(
         &signed_receipt(b"packet"),&pubkey,id(31),
