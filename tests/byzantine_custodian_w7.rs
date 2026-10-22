@@ -31,7 +31,6 @@ struct Case {
     trust: TrustRegistry,
     custodian: SigningKey,
     second_custodian: SigningKey,
-    bob: SigningKey,
 }
 impl Case {
     fn new() -> Self {
@@ -60,7 +59,7 @@ impl Case {
         ).unwrap();
         Self {
             dir: tempdir().unwrap(), wire, trust,
-            custodian, second_custodian, bob,
+            custodian, second_custodian,
         }
     }
 
