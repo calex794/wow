@@ -14,8 +14,8 @@ default = []
 iroh-transport = ["dep:iroh", "dep:tokio"]
 
 [dependencies]
-# Pin the isolated verified W3 v2 crypto boundary; no transport deps.
-akula-blue-w3 = { git = "https://github.com/calex794/blue", rev = "76675f9fbb7e86c67a24d20dae60b0ce8227b1c3" }
+# Pin the audited Blue W3 v2+v3 lab boundary; no transport dependencies.
+akula-blue-w3 = { git = "https://github.com/calex794/blue", rev = "6728da03a49fb6c7da317e6021de65f5a242816c" }
 # Project-pinned transport fork: same revisions as Akula/staya/roha-transport.
 # The crate retains package version 1.3.0; source MUST be our Roha fork.
 iroh = { git = "https://github.com/calex794/roha", rev = "a42ad5aef1626df80d39398e05dac6e362bf6e49", default-features = false, features = ["tls-ring"], optional = true }
