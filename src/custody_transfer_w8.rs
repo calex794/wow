@@ -216,7 +216,7 @@ impl Journal {
         if now_ms<last_now{return Err(TransferError::ClockRollback);}
         if now_ms>=expiry{return Err(TransferError::Expired);}
         if peer.as_slice()!=target_id{return Err(TransferError::Conflict);}
-        if digest!=blake3::hash(&packet).as_bytes() {return Err(TransferError::Conflict);}
+        if digest.as_slice()!=blake3::hash(&packet).as_bytes() {return Err(TransferError::Conflict);}
         let hint=private_route_w3::inspect_route(&packet)
             .map_err(|_|TransferError::Invalid)?;
         if hint.message_id != message{return Err(TransferError::Invalid);}
