@@ -170,7 +170,47 @@ impl Journal {
         }
         let (header, _payload)=crate::crypto_identity_w3::open(packet, context)
             .map_err(|_| JournalError::Unauthorized)?;
-        // Header's recipient identity was authenticated by open().
+        self.commit_authenticated_receipt(packet, header, recipient_signer, recipient_epoch)
+    }
+
+    /// Private W3 v3 is decrypted and Ed25519-verified using independent
+    /// sender trust and an invitation-scoped route token BEFORE the recipient
+    /// atomically commits inbox dedup and its signed final W4 receipt.
+    /// No automatic fallback to public-identity W3 v2 is permitted.
+    ///
+    /// This LAB interface does not encrypt the return path of W4: never
+    /// expose the returned receipt to an untrusted relay or public mailbox.
+    pub fn accept_private_authenticated_and_queue_receipt(
+        &mut self,
+        packet: &[u8],
+        context: crate::crypto_identity_w3::TrustedRecipient<'_>,
+        route_token: [u8;16],
+        recipient_signer: &ed25519_dalek::SigningKey,
+        recipient_epoch: u64,
+    ) -> Result<(Insert, Vec<u8>), JournalError> {
+        let enrolled = context.registry.key_for(context.recipient_id, recipient_epoch)
+            .map_err(|_| JournalError::Unauthorized)?;
+        if enrolled != &recipient_signer.verifying_key() {
+            return Err(JournalError::Unauthorized);
+        }
+        let verified=crate::private_route_w3::open_authenticated(
+            packet, context, route_token,
+        ).map_err(|_| JournalError::Unauthorized)?;
+        self.commit_authenticated_receipt(
+            packet, verified.header().into(), recipient_signer, recipient_epoch,
+        )
+    }
+
+    // Caller performed suite-specific cryptographic sender authentication
+    // and verified current recipient signing identity. Do not make public:
+    // unauthenticated callers must never fabricate a durable recipient W4.
+    fn commit_authenticated_receipt(
+        &mut self,
+        packet: &[u8],
+        header: crate::crypto_identity_w3::SignedHeader,
+        recipient_signer: &ed25519_dalek::SigningKey,
+        recipient_epoch: u64,
+    ) -> Result<(Insert, Vec<u8>), JournalError> {
         let digest=blake3::hash(packet);
         let sender=header.sender_id;
         let message=header.message_id;
@@ -214,6 +254,7 @@ impl Journal {
         };
         tx.commit()?;
         Ok((result,receipt))
+
     }
 
     /// Retransmit the original signed receipt after restart/ACK loss.
