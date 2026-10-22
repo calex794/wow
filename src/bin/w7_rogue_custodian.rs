@@ -55,6 +55,10 @@ struct Config {
     recipient: EndpointId,
 }
 
+fn mail_error(error: impl std::fmt::Debug) -> io::Error {
+    io::Error::other(format!("W7 lab mailbox error: {error:?}"))
+}
+
 fn read_stored(db: &Path) -> Option<Vec<u8>> {
     let mailbox = Mailbox::open(db, MailboxLimits::default()).ok()?;
     mailbox.get_page(id(4), 101, None, 1).ok()?.into_iter()
@@ -95,8 +99,10 @@ fn store(
 
     if config.mode != Mode::Fake {
         {
-            let mut mailbox = Mailbox::open(&config.db, MailboxLimits::default())?;
-            mailbox.put(id(4), id(5), 100, 200, wire)?;
+            let mut mailbox = Mailbox::open(&config.db, MailboxLimits::default())
+                .map_err(mail_error)?;
+            mailbox.put(id(4), id(5), 100, 200, wire)
+                .map_err(mail_error)?;
         }
         if config.mode == Mode::Delete {
             // A modified program can bypass Mailbox API and delete the row.
