@@ -87,10 +87,14 @@ async fn rpc(endpoint: &Endpoint, rogue: &Rogue, payload: &[u8]) -> Vec<u8> {
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
     tx.write_all(payload).await.unwrap();
     tx.finish().unwrap();
-    tokio::time::timeout(
+    let response = tokio::time::timeout(
         Duration::from_secs(5),
         rx.read_to_end(akula_wire_lab::MAX_MESSAGE_BYTES + 512),
-    ).await.expect("QUIC fetch deadline").expect("QUIC response read failed")
+    ).await.expect("QUIC fetch deadline").expect("QUIC response read failed");
+    // QUIC application close marks the response as read; allow the
+    // independent server process to finish its connection cleanly.
+    conn.close(0u32.into(), b"response consumed");
+    response
 }
 
 /// No application data is sent to untrusted custodians in plaintext.
