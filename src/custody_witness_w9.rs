@@ -119,10 +119,21 @@ fn signer_is_trusted(
     if enrolled!=&signer.verifying_key(){return Err(WitnessError::UntrustedWitness);}
     Ok(())
 }
-fn sign_checkpoint(
-    id:[u8;16],epoch:u64,sequence:u64,verdict:Verdict,
-    slot:[u8;32],digest:[u8;32],prior:[u8;32],signer:&SigningKey,
-)->Vec<u8>{
+struct CheckpointClaims {
+    id:[u8;16],
+    epoch:u64,
+    sequence:u64,
+    verdict:Verdict,
+    slot:[u8;32],
+    digest:[u8;32],
+    prior:[u8;32],
+}
+type StoredWitnessRow=(Vec<u8>,Vec<u8>,Option<Vec<u8>>,Option<Vec<u8>>);
+
+fn sign_checkpoint(claims:CheckpointClaims,signer:&SigningKey)->Vec<u8>{
+    let CheckpointClaims {
+        id,epoch,sequence,verdict,slot,digest,prior,
+    }=claims;
     let mut body=Vec::with_capacity(CHECKPOINT_LEN);
     body.push(VERSION);
     body.extend_from_slice(&id);
@@ -311,7 +322,9 @@ impl WitnessStore {
         let prior=arr32(&prior);
         let seq=(last as u64)+1;
         let digest=*blake3::hash(offer).as_bytes();
-        let receipt=sign_checkpoint(id,epoch,seq,verdict,slot,digest,prior,signer);
+        let receipt=sign_checkpoint(CheckpointClaims {
+            id,epoch,sequence:seq,verdict,slot,digest,prior,
+        },signer);
         let next=arr32(&receipt[HEAD_OFFSET..BODY_LEN]);
         tx.execute(
             "INSERT INTO witness_events(seq,slot,digest,verdict,prior,head,signed_checkpoint)
@@ -338,8 +351,7 @@ impl WitnessStore {
         if offer.len()!=OFFER_LEN{return Err(WitnessError::Invalid);}
         let slot=commit_slot(claims.source_id,claims.slot_alias);
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        type ExistingRow=(Vec<u8>,Vec<u8>,Option<Vec<u8>>,Option<Vec<u8>>);
-        let existing:Option<ExistingRow>=tx.query_row(
+        let existing:Option<StoredWitnessRow>=tx.query_row(
             "SELECT first_offer,first_checkpoint,conflicting_offer,conflicting_checkpoint
              FROM witness_slots WHERE slot=?1",
             params![slot.as_slice()],
@@ -396,7 +408,7 @@ impl WitnessStore {
         &self,source_id:[u8;16],slot_alias:[u8;16],
     )->Result<Option<ForkEvidence>,WitnessError>{
         let slot=commit_slot(source_id,slot_alias);
-        let row:Option<(Vec<u8>,Vec<u8>,Option<Vec<u8>>,Option<Vec<u8>>)>=
+        let row:Option<StoredWitnessRow>=
             self.db.query_row(
                 "SELECT first_offer,first_checkpoint,conflicting_offer,conflicting_checkpoint
                  FROM witness_slots WHERE slot=?1",
