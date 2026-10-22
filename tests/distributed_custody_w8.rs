@@ -7,7 +7,7 @@ use akula_wire_lab::custody_transfer_w8::{
     OFFER_LEN, ACCEPT_LEN,
 };
 use akula_wire_lab::journal_w4::{Delivery, Journal};
-use akula_wire_lab::multipath_w5::{Lane, RouteError};
+use akula_wire_lab::multipath_w5::Lane;
 use akula_wire_lab::private_route_w3;
 use akula_wire_lab::receipt_w4;
 use akula_wire_lab::trust_w3::TrustRegistry;
