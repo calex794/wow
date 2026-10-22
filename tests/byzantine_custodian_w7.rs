@@ -294,7 +294,8 @@ fn competing_same_slot_claims_are_potential_fork_not_final_delivery() {
 fn revoked_or_old_epoch_custodian_proof_must_not_restore_trust() {
     let case = Case::new();
     let signed = case.proof(&case.custodian, 13, 41);
-    let mut registry = case.trust.clone();
+    let mut registry = TrustRegistry::new();
+    registry.enroll(id(13), 7, case.custodian.verifying_key()).unwrap();
     registry.enroll(id(13), 8, case.custodian.verifying_key()).unwrap();
     assert!(matches!(custody_receipt_w6::verify(
         &signed, case.expected(13, 41, 100_000), &registry,
