@@ -3,7 +3,7 @@
 use akula_wire_lab::crypto_identity_w3::SignedHeader;
 use akula_wire_lab::crypto_w3::new_recipient;
 use akula_wire_lab::custody_transfer_w8::{
-    self, OfferClaims, PeerCustodyStore, TransferError, TransferPhase,
+    self, OfferClaims, OfferIssue, PeerConsent, PeerCustodyStore, TransferError, TransferPhase,
     OFFER_LEN, ACCEPT_LEN,
 };
 use akula_wire_lab::journal_w4::{Delivery, Journal};
@@ -44,10 +44,12 @@ fn initial(journal:&mut Journal,wire:&[u8]) {
 }
 fn issue(journal:&mut Journal,offer_id:[u8;16],target:[u8;16],
          source_trust:&TrustRegistry)->Result<Vec<u8>,TransferError>{
-    journal.issue_custody_offer(
-        id(8),id(5),id(44),offer_id,id(21),3,target,
-        if target==id(13){7}else{8},102,&key(21),source_trust,
-    )
+    journal.issue_custody_offer(OfferIssue {
+        recipient:id(8),message:id(5),attempt_id:id(44),
+        offer_id,source_id:id(21),source_epoch:3,
+        target_id:target,target_epoch:if target==id(13){7}else{8},
+        now_ms:102,
+    },&key(21),source_trust)
 }
 
 #[test]
@@ -66,9 +68,10 @@ fn accepted_in_independent_sqlite_after_source_offline_ack_lost_replay_then_conf
     assert_eq!(claims.target_id,id(13));
     assert_eq!(claims.ciphertext_digest,*blake3::hash(&wire).as_bytes());
     let mut receiver=PeerCustodyStore::open(&receiver_path).unwrap();
-    let acceptance=receiver.accept(
-        &raw,&wire,id(21),id(13),7,&key(13),&trusted,105,
-    ).unwrap();
+    let acceptance=receiver.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:105,
+    }).unwrap();
     assert_eq!(acceptance.len(),ACCEPT_LEN);
     let verified=custody_transfer_w8::verify_acceptance(&acceptance,&trusted).unwrap();
     assert_eq!(verified.offer_id,id(31));
@@ -82,9 +85,10 @@ fn accepted_in_independent_sqlite_after_source_offline_ack_lost_replay_then_conf
     assert!(matches!(issue(&mut source,id(32),id(14),&trusted),
         Err(TransferError::Conflict)));
     assert_eq!(issue(&mut source,id(31),id(13),&trusted).unwrap(),raw);
-    let recovered=receiver.accept(
-        &raw,&wire,id(21),id(13),7,&key(13),&trusted,107,
-    ).unwrap();
+    let recovered=receiver.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:107,
+    }).unwrap();
     assert_eq!(recovered,acceptance);
     assert_eq!(source.accept_peer_custody_claim(&recovered,&trusted).unwrap(),
                TransferPhase::PeerClaimed);
@@ -108,19 +112,25 @@ fn signed_offer_is_exactly_bound_to_target_slot_and_ciphertext() {
     initial(&mut source,&wire);
     let raw=issue(&mut source,id(31),id(13),&trusted).unwrap();
     let mut x=PeerCustodyStore::open(&dir.path().join("x.sqlite")).unwrap();
-    assert!(matches!(x.accept(
-        &raw,&wire,id(21),id(14),8,&key(14),&trusted,105,
-    ),Err(TransferError::Unauthorized)));
+    assert!(matches!(x.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(14),target_epoch:8,
+        signer:&key(14),trust:&trusted,now_ms:105,
+    }),Err(TransferError::Unauthorized)));
     let mut altered=wire.clone();
     *altered.last_mut().unwrap()^=1;
-    assert!(matches!(x.accept(
-        &raw,&altered,id(21),id(13),7,&key(13),&trusted,105,
-    ),Err(TransferError::Conflict)));
+    assert!(matches!(x.accept(&raw,&altered,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:105,
+    }),Err(TransferError::Conflict)));
     let mut forged=raw.clone();forged[100]^=1;
-    assert!(matches!(x.accept(
-        &forged,&wire,id(21),id(13),7,&key(13),&trusted,105,
-    ),Err(TransferError::BadSignature)));
-    let forged_ack=x.accept(&raw,&wire,id(21),id(13),7,&key(13),&trusted,105).unwrap();
+    assert!(matches!(x.accept(&forged,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:105,
+    }),Err(TransferError::BadSignature)));
+    let forged_ack=x.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:105,
+    }).unwrap();
     let mut modified=forged_ack.clone();*modified.last_mut().unwrap()^=1;
     assert!(matches!(source.accept_peer_custody_claim(&modified,&trusted),
         Err(TransferError::BadSignature)));
@@ -137,7 +147,10 @@ fn forged_peer_acceptance_by_other_key_does_not_release_credit() {
     initial(&mut source,&wire);
     let raw=issue(&mut source,id(31),id(13),&trusted).unwrap();
     let mut x=PeerCustodyStore::open(&dir.path().join("x.sqlite")).unwrap();
-    let mut ack=x.accept(&raw,&wire,id(21),id(13),7,&key(13),&trusted,103).unwrap();
+    let mut ack=x.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:103,
+    }).unwrap();
     *ack.last_mut().unwrap()^=1;
     assert!(matches!(source.accept_peer_custody_claim(&ack,&trusted),
         Err(TransferError::BadSignature)));
@@ -153,18 +166,24 @@ fn revocation_expired_offer_and_clock_rollback_fail_closed() {
     initial(&mut source,&wire);
     let raw=issue(&mut source,id(31),id(13),&trusted).unwrap();
     let mut receiver=PeerCustodyStore::open(&dir.path().join("x.sqlite")).unwrap();
-    assert!(matches!(receiver.accept(
-        &raw,&wire,id(21),id(13),7,&key(13),&trusted,500_000,
-    ),Err(TransferError::Expired)));
+    assert!(matches!(receiver.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:500_000,
+    }),Err(TransferError::Expired)));
     let mut revoked=trust();
     revoked.revoke(id(21)).unwrap();
-    assert!(matches!(receiver.accept(
-        &raw,&wire,id(21),id(13),7,&key(13),&revoked,101,
-    ),Err(TransferError::Unauthorized)));
-    receiver.accept(&raw,&wire,id(21),id(13),7,&key(13),&trusted,300).unwrap();
-    assert!(matches!(receiver.accept(
-        &raw,&wire,id(21),id(13),7,&key(13),&trusted,299,
-    ),Err(TransferError::ClockRollback)));
+    assert!(matches!(receiver.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&revoked,now_ms:101,
+    }),Err(TransferError::Unauthorized)));
+    receiver.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:300,
+    }).unwrap();
+    assert!(matches!(receiver.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:299,
+    }),Err(TransferError::ClockRollback)));
     assert!(matches!(issue(&mut source,id(31),id(13),&trusted),
         Ok(_)));
 }
@@ -176,7 +195,10 @@ fn terminal_recipient_w4_fences_late_custody_offer_and_marks_source_recipient() 
     initial(&mut source,&wire);
     let raw=issue(&mut source,id(31),id(13),&trusted).unwrap();
     let mut receiver=PeerCustodyStore::open(&dir.path().join("x.sqlite")).unwrap();
-    let peer_ack=receiver.accept(&raw,&wire,id(21),id(13),7,&key(13),&trusted,104).unwrap();
+    let peer_ack=receiver.accept(&raw,&wire,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:104,
+    }).unwrap();
     let signed=receipt_w4::sign(&key(8),id(8),id(5),
         *blake3::hash(&wire).as_bytes(),6);
     let final_ack=receipt_w4::verify(&signed,&trusted).unwrap();
@@ -235,8 +257,14 @@ fn malicious_issuer_can_sign_two_forks_accepted_by_distinct_sqlite_devices() {
     let offer_y=custody_transfer_w8::sign_offer(y,&key(21)).unwrap();
     let mut store_x=PeerCustodyStore::open(&dir.path().join("x.sqlite")).unwrap();
     let mut store_y=PeerCustodyStore::open(&dir.path().join("y.sqlite")).unwrap();
-    let ack_x=store_x.accept(&offer_x,&packet,id(21),id(13),7,&key(13),&trusted,105).unwrap();
-    let ack_y=store_y.accept(&offer_y,&packet,id(21),id(14),8,&key(14),&trusted,105).unwrap();
+    let ack_x=store_x.accept(&offer_x,&packet,PeerConsent {
+        expected_source:id(21),target_id:id(13),target_epoch:7,
+        signer:&key(13),trust:&trusted,now_ms:105,
+    }).unwrap();
+    let ack_y=store_y.accept(&offer_y,&packet,PeerConsent {
+        expected_source:id(21),target_id:id(14),target_epoch:8,
+        signer:&key(14),trust:&trusted,now_ms:105,
+    }).unwrap();
     let verified_x=custody_transfer_w8::verify_acceptance(&ack_x,&trusted).unwrap();
     let verified_y=custody_transfer_w8::verify_acceptance(&ack_y,&trusted).unwrap();
     assert_eq!(verified_x.slot_alias,verified_y.slot_alias);
