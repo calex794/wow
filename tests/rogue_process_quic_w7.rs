@@ -55,7 +55,7 @@ impl Rogue {
         let mut line = String::new();
         BufReader::new(output).read_line(&mut line)
             .expect("custodian must announce ready endpoint");
-        let fields = line.trim().split_whitespace().collect::<Vec<_>>();
+        let fields = line.split_whitespace().collect::<Vec<_>>();
         assert_eq!(fields.first().copied(), Some("READY"), "{mode}: {line}");
         assert_eq!(fields.len(), 3, "{mode}: {line}");
         let id: EndpointId = fields[1].parse().unwrap();
@@ -91,10 +91,6 @@ async fn rpc(endpoint: &Endpoint, rogue: &Rogue, payload: &[u8]) -> Vec<u8> {
         Duration::from_secs(5),
         rx.read_to_end(akula_wire_lab::MAX_MESSAGE_BYTES + 512),
     ).await.expect("QUIC fetch deadline").expect("QUIC response read failed")
-}
-
-fn sealed() -> (Vec<u8>, hpke::kem::X25519HkdfSha256, hpke::kem::X25519HkdfSha256) {
-    unreachable!("used only as a compile-time type sentinel; never called")
 }
 
 /// No application data is sent to untrusted custodians in plaintext.
