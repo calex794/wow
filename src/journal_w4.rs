@@ -19,7 +19,7 @@ impl Delivery {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Insert { New, Duplicate }
-pub struct Journal { db: Connection }
+pub struct Journal { pub(crate) db: Connection }
 impl Journal {
     pub fn open(path:&Path)->Result<Self,JournalError>{
         let db=Connection::open(path)?;
@@ -43,7 +43,30 @@ impl Journal {
                 message BLOB NOT NULL CHECK(length(message)=16),
                 digest BLOB NOT NULL CHECK(length(digest)=32),
                 receipt BLOB NOT NULL CHECK(length(receipt)=137),
-                PRIMARY KEY(sender,message));")?;
+                PRIMARY KEY(sender,message));
+            CREATE TABLE IF NOT EXISTS multipath_plan(
+              recipient BLOB NOT NULL CHECK(length(recipient)=16),
+              message BLOB NOT NULL CHECK(length(message)=16),
+              digest BLOB NOT NULL CHECK(length(digest)=32),
+              expiry INTEGER NOT NULL,
+              budget INTEGER NOT NULL CHECK(budget BETWEEN 1 AND 8),
+              local_hint BLOB NOT NULL UNIQUE CHECK(length(local_hint)=16),
+              stopped INTEGER NOT NULL DEFAULT 0 CHECK(stopped BETWEEN 0 AND 1),
+              last_now INTEGER NOT NULL CHECK(last_now>=0),
+              PRIMARY KEY(recipient,message),
+              FOREIGN KEY(recipient,message) REFERENCES outbox(recipient,message));
+            CREATE TABLE IF NOT EXISTS multipath_attempt(
+              recipient BLOB NOT NULL CHECK(length(recipient)=16),
+              message BLOB NOT NULL CHECK(length(message)=16),
+              attempt BLOB NOT NULL CHECK(length(attempt)=16),
+              alias BLOB NOT NULL UNIQUE CHECK(length(alias)=16),
+              peer BLOB NOT NULL CHECK(length(peer)=16),
+              lane INTEGER NOT NULL CHECK(lane BETWEEN 1 AND 3),
+              slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 7),
+              PRIMARY KEY(recipient,message,attempt),
+              UNIQUE(recipient,message,slot),
+              FOREIGN KEY(recipient,message) REFERENCES multipath_plan(recipient,message));
+            PRAGMA foreign_keys=ON;")?;
         Ok(Self{db})
     }
     pub fn enqueue(&mut self,recipient:[u8;16],message:[u8;16],expiry:i64,packet:&[u8])
@@ -96,6 +119,11 @@ impl Journal {
             tx.execute("UPDATE outbox SET status=4 WHERE recipient=?1 AND message=?2",
                 params![recipient.as_slice(),message.as_slice()])?;
         }
+        // One transaction: verified W4 sets final status AND fences route credits.
+        // Failure of either statement rolls both changes back.
+        tx.execute("UPDATE multipath_plan SET stopped=1
+                    WHERE recipient=?1 AND message=?2",
+                   params![recipient.as_slice(),message.as_slice()])?;
         tx.commit()?;
         Ok(Delivery::Recipient)
     }
