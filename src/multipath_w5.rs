@@ -46,6 +46,9 @@ fn digest(packet:&[u8])->Result<[u8;32],RouteError>{
     }
     Ok(*blake3::hash(packet).as_bytes())
 }
+// Named alias keeps the SQL row contract visible without a deeply nested local type.
+type StoredPlanRow=(Vec<u8>,i64,i64,Vec<u8>,i64,i64);
+
 impl Journal {
     /// Private owner-only method; parent MUST be already durably enqueued.
     /// Returned hint is locally generated, NOT derived from recipient identity.
@@ -66,7 +69,7 @@ impl Journal {
         let (old,ends,status)=parent.ok_or(RouteError::Missing)?;
         if old.as_slice()!=original.as_slice() || ends!=expiry{return Err(RouteError::Conflict);}
         if status==4{return Err(RouteError::RecipientConfirmed);}
-        let previous:Option<(Vec<u8>,i64,i64,Vec<u8>,i64,i64)>=tx.query_row(
+        let previous:Option<StoredPlanRow>=tx.query_row(
             "SELECT digest,expiry,budget,local_hint,stopped,last_now
              FROM multipath_plan WHERE recipient=?1 AND message=?2",
             params![recipient.as_slice(),message.as_slice()],
@@ -98,9 +101,10 @@ impl Journal {
     /// Persist the reservation BEFORE sending the ciphertext. Identical retry
     /// returns the stored route attempt, with no new credit. Slots never refund.
     pub fn reserve_multipath(
-        &mut self,recipient:[u8;16],message:[u8;16],packet:&[u8],
+        &mut self,identity:([u8;16],[u8;16]),packet:&[u8],
         request:[u8;16],peer:[u8;16],lane:Lane,now:i64,
     )->Result<RouteAttempt,RouteError>{
+        let (recipient,message)=identity;
         if now<0 || request==[0;16] || peer==[0;16]{return Err(RouteError::Invalid);}
         let original=digest(packet)?;
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;

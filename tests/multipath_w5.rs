@@ -23,7 +23,7 @@ fn original_plus_three_lanes_never_exceeds_four_after_restarts_or_lost_acks(){
         assert_eq!(j.enqueue(id(2),id(7),9000,CIPHERTEXT).unwrap(),Insert::New);
         let hint=j.begin_multipath(id(2),id(7),CIPHERTEXT,9000,4,100).unwrap();
         assert_eq!(j.begin_multipath(id(2),id(7),CIPHERTEXT,9000,4,101).unwrap(),hint);
-        forecast=j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        forecast=j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(11),id(21),Lane::Forecast,102).unwrap();
         assert_eq!(forecast.slot,1);
         assert_eq!(j.multipath_snapshot(id(2),id(7)).unwrap().allocated,2);
@@ -32,20 +32,20 @@ fn original_plus_three_lanes_never_exceeds_four_after_restarts_or_lost_acks(){
         let mut j=Journal::open(&p).unwrap();
         // A previously sent attempt was ACK-lost. Reissuing its request ID
         // returns its exact same local record, not another copy credit.
-        assert_eq!(j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        assert_eq!(j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(11),id(21),Lane::Forecast,104).unwrap(),forecast);
-        assert!(matches!(j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        assert!(matches!(j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(11),id(99),Lane::Forecast,105),Err(RouteError::Conflict)));
-        assert!(matches!(j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        assert!(matches!(j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(15),id(25),Lane::Forecast,103),Err(RouteError::ClockRollback)));
-        let explore=j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        let explore=j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(12),id(22),Lane::Explore,106).unwrap();
-        let gateway=j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        let gateway=j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(13),id(23),Lane::Gateway,107).unwrap();
         assert_ne!(forecast.alias,explore.alias);
         assert_ne!(explore.alias,gateway.alias);
         assert_eq!(j.multipath_snapshot(id(2),id(7)).unwrap().allocated,4);
-        assert!(matches!(j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        assert!(matches!(j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(14),id(24),Lane::Gateway,108),Err(RouteError::Exhausted)));
         assert!(matches!(j.begin_multipath(id(2),id(7),b"other",9000,4,109),
             Err(RouteError::Conflict)));
@@ -72,7 +72,7 @@ fn concurrent_connections_cannot_overissue_one_sqlite_quota(){
         threads.push(thread::spawn(move||{
             let mut j=Journal::open(path.as_ref()).unwrap();
             gate.wait();
-            j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+            j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
                 id(10+n),id(30+n),Lane::Explore,101)
         }));
     }
@@ -100,7 +100,7 @@ fn verified_recipient_w4_fences_all_local_routes_across_restart(){
         let mut j=Journal::open(&p).unwrap();
         j.enqueue(id(2),id(7),9000,CIPHERTEXT).unwrap();
         j.begin_multipath(id(2),id(7),CIPHERTEXT,9000,4,100).unwrap();
-        j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(11),id(21),Lane::Forecast,101).unwrap();
         let fake=sign(&SigningKey::from_bytes(&[8;32]),id(2),id(7),digest,8);
         assert!(matches!(verify(&fake,&trust),Err(ReceiptError::InvalidSignature)));
@@ -116,7 +116,7 @@ fn verified_recipient_w4_fences_all_local_routes_across_restart(){
         assert_eq!(j.apply_recipient_receipt(&verify(&raw,&trust).unwrap()).unwrap(),
             Delivery::Recipient);
         assert!(j.multipath_snapshot(id(2),id(7)).unwrap().stopped);
-        assert!(matches!(j.reserve_multipath(id(2),id(7),CIPHERTEXT,
+        assert!(matches!(j.reserve_multipath((id(2),id(7)),CIPHERTEXT,
             id(12),id(22),Lane::Explore,104),Err(RouteError::RecipientConfirmed)));
     }
     assert!(matches!(Journal::open(&p).unwrap()
@@ -175,7 +175,7 @@ fn real_w3_packet_three_paths_one_recipient_inbox_and_exact_durable_w4(){
             (12u8,22u8,Lane::Explore),
             (13u8,23u8,Lane::Gateway)
         ]{
-            sender.reserve_multipath(id(2),id(7),&packet,
+            sender.reserve_multipath((id(2),id(7)),&packet,
                 id(nonce),id(peer),lane,101).unwrap();
         }
     }
@@ -211,6 +211,6 @@ fn real_w3_packet_three_paths_one_recipient_inbox_and_exact_durable_w4(){
         assert!(sender.multipath_snapshot(id(2),id(7)).unwrap().stopped);
     }
     assert!(matches!(Journal::open(&origin).unwrap()
-        .reserve_multipath(id(2),id(7),&packet,id(14),id(24),Lane::Explore,200),
+        .reserve_multipath((id(2),id(7)),&packet,id(14),id(24),Lane::Explore,200),
         Err(RouteError::RecipientConfirmed)));
 }
