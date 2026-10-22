@@ -188,6 +188,13 @@ async fn serve_connection(
         send.write_all(&response).await?;
     }
     send.finish()?;
+    // Dropping the final Connection handle immediately after finish() can
+    // close this QUIC session before the peer receives the FIN and bytes.
+    // Client explicitly closes its connection only after read_to_end.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        connection.closed(),
+    ).await;
     Ok(())
 }
 
