@@ -17,7 +17,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rusqlite::{params, Connection as Sqlite};
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
