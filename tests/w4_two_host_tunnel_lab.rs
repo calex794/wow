@@ -60,11 +60,11 @@ fn start_server(dir: &Path, sender_pub: &str, mode: &str, port: SocketAddr)
     assert_eq!(ready.trim(), format!("READY {port}"));
     (server, stdout)
 }
-fn expect_server_success(mut child: Child, mut stdout: BufReader<std::process::ChildStdout>)
+fn expect_server_success(mut child: Child, stdout: BufReader<std::process::ChildStdout>)
     -> String
 {
     let mut output = String::new();
-    for line in stdout.by_ref().lines() {
+    for line in stdout.lines() {
         output.push_str(&line.unwrap());
         output.push('\n');
     }
@@ -135,8 +135,8 @@ fn lost_reverse_channel_does_not_mark_recipient_until_retried() {
     let port=temporary_port();
     let (server,reader)=start_server(dir.path(),&sender_pub,"serve-once",port);
     let args=[
-        "resend",
-        dir.path().join("sender.keys").display().to_string().as_str().to_owned(),
+        "resend".to_string(),
+        dir.path().join("sender.keys").display().to_string(),
         dir.path().join("sender.sqlite").display().to_string(),
         invite,port.to_string(),mid.clone(),
     ];
