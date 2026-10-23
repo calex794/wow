@@ -10,3 +10,4 @@ publish = false
 akula-wire-lab = { path = "../.." }
 aws-sdk-s3 = "=1.119.0"
 tokio = { version = "1.48", features = ["rt-multi-thread", "time"] }
+blake3 = "1.5"
