@@ -15,7 +15,7 @@ use crate::custody_witness_w9::{self, ChainRelation, WitnessError, CHECKPOINT_LE
 use crate::trust_w3::TrustRegistry;
 use crate::witness_pin_w10::{PinError, WitnessPinStore};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::Path;
 
 const DOMAIN: &[u8] = b"Akula/WOW/W11/independent-checkpoint-anchor/Ed25519-v1\0";
@@ -93,6 +93,8 @@ pub enum AnchorGossip {
 }
 /// Private evidence includes both signed W9 statements and can link slots.
 pub type WitnessForkPair = (Vec<u8>, Vec<u8>);
+/// Exact persisted W9 checkpoint and independent signed W11 receipt.
+pub type AnchoredCheckpoint = (Vec<u8>, Vec<u8>);
 type StoredForkPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 type SavedState = (Option<Vec<u8>>, Option<Vec<u8>>, i64);
 
@@ -371,7 +373,7 @@ impl AnchorStore {
         Ok(frozen != 0)
     }
     /// Current independently anchored tuple. Frozen anchor is unusable.
-    pub fn latest(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, AnchorError> {
+    pub fn latest(&self) -> Result<Option<AnchoredCheckpoint>, AnchorError> {
         if self.frozen()? { return Err(AnchorError::Frozen); }
         let saved: SavedState = self.db.query_row(
             "SELECT checkpoint,receipt,frozen FROM anchor_state WHERE singleton=1",
