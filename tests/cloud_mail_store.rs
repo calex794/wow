@@ -115,7 +115,7 @@ impl CloudMailStore for Fake {
     upload_and_pin(&mut f,grant(key(2),data),data,1).unwrap();
     assert_eq!(upload_and_pin(&mut f,grant(key(2),b"ghijkl"),b"ghijkl",2),
         Err(CloudError::Conflict));
-    assert_eq!(f.entries.get(&key(2)).unwrap().1,data);
+    assert_eq!(f.entries.get(&key(2)).unwrap().1.as_slice(),data);
 }
 #[test] fn invalid_byte_limit_and_empty_packet_rejected() {
     let mut f=Fake::default();
