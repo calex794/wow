@@ -44,3 +44,28 @@ fn separate_client_reads_after_sender_is_dropped() {
         assert_eq!(receiver.read_exact(key,&rev,16384,original).await.unwrap(),data);
     });
 }
+
+
+#[test]
+#[ignore = "requires isolated localhost MinIO with versioning"]
+fn signed_versioned_get_to_plain_http_reader() {
+    let rt=tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        assert_eq!(env("WOW_MINIO_ENDPOINT"), "http://127.0.0.1:9000");
+        let key=object();
+        let data=b"opaque encrypted mail for independent HTTP read";
+        let url={
+            let issuer=client();
+            let rev=issuer.put_once(key,data).await.unwrap();
+            issuer.presign_read(key,&rev,30).await.unwrap()
+        };
+        // Receiver needs only this temporary URL, not an S3 client.
+        let response=std::process::Command::new("curl")
+            .args(["--fail","--silent","--show-error","--max-time","10"])
+            .arg(&url).output().unwrap();
+        assert!(response.status.success());
+        assert_eq!(response.stdout,data);
+        assert_eq!(*blake3::hash(&response.stdout).as_bytes(),
+                   *blake3::hash(data).as_bytes());
+    });
+}
