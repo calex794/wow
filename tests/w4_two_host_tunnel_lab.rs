@@ -105,7 +105,8 @@ fn independent_processes_have_exact_w3_and_recipient_signed_w4() {
     let (sender_pub,invite)=keys(&dir);
     let port=temporary_port();
     let (server,reader)=start_server(dir.path(),&sender_pub,"serve-once",port);
-    let args=make_args(dir.path(),&invite,&port.to_string(),"1024-byte real W3/W4 lab");
+    let payload = "x".repeat(1024);
+    let args=make_args(dir.path(),&invite,&port.to_string(),&payload);
     let output = output_text(&run(&args.iter().map(String::as_str).collect::<Vec<_>>()));
     let mid=field(&output,"MESSAGE_ID=");
     assert!(output.contains("RECIPIENT_CONFIRMED "));
