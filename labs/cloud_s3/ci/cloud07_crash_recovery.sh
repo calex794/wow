@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+test "$WOW_MINIO_ENDPOINT" = "http://127.0.0.1:9000"
+base="$RUNNER_TEMP/wow-cloud07"
+a="$base/alice"; b="$base/bob"
+mkdir -m 700 -p "$a" "$b"
+binary="$(pwd)/labs/cloud_s3/target/debug/cloud07_actor"
+test -x "$binary"
+net="wow-cloud07"
+docker network create --internal "$net" >/dev/null
+trap 'docker network disconnect "$net" wow-cloud02-minio >/dev/null 2>&1 || true; docker network rm "$net" >/dev/null 2>&1 || true' EXIT
+docker network connect "$net" wow-cloud02-minio
+actor(){
+  local who="$1" op="$2" dir access secret
+  if [ "$who" = alice ]; then
+    dir="$a"; access="$WOW_ALICE_ACCESS"; secret="$WOW_ALICE_SECRET"
+  else
+    dir="$b"; access="$WOW_BOB_ACCESS"; secret="$WOW_BOB_SECRET"
+  fi
+  docker run --rm --network "$net" --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --pids-limit 64 --memory 512m \
+    --user "$(id -u):$(id -g)" -v "$binary:/opt/actor:ro" \
+    -v "$dir:/state:rw" \
+    -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+    -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    -e WOW_MINIO_ENDPOINT=http://wow-cloud02-minio:9000 \
+    -e WOW_MINIO_BUCKET="$WOW_MINIO_BUCKET" \
+    -e WOW_SELF_ACCESS="$access" -e WOW_SELF_SECRET="$secret" \
+    ubuntu:24.04 /opt/actor "$who" "$op"
+}
+actor alice init
+actor bob init
+cp "$a/public.sign" "$b/peer.sign"
+cp "$b/public.sign" "$a/peer.sign"
+cp "$a/public.hpke" "$b/peer.hpke"
+cp "$b/public.hpke" "$a/peer.hpke"
+actor alice send
+cp "$a/forward.meta" "$b/forward.meta"
+# Actual process is killed BEFORE SQLite commit: no W4 survives.
+docker run -d --name wow-cloud07-pre --network "$net" --read-only \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --user "$(id -u):$(id -g)" -v "$binary:/opt/actor:ro" \
+  -v "$b:/state:rw" \
+  -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+  -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+  -e WOW_MINIO_ENDPOINT=http://wow-cloud02-minio:9000 \
+  -e WOW_MINIO_BUCKET="$WOW_MINIO_BUCKET" \
+  -e WOW_SELF_ACCESS="$WOW_BOB_ACCESS" -e WOW_SELF_SECRET="$WOW_BOB_SECRET" \
+  ubuntu:24.04 /opt/actor bob precommit-pause >/dev/null
+for _ in $(seq 1 100); do
+  if test -f "$b/verified_precommit.marker"; then break; fi
+  sleep 0.1
+done
+test -f "$b/verified_precommit.marker"
+docker kill wow-cloud07-pre >/dev/null
+docker rm wow-cloud07-pre >/dev/null
+actor bob check-none
+# Commit and SIGKILL process after durable SQLite W4 transaction.
+docker run -d --name wow-cloud07-post --network "$net" --read-only \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --user "$(id -u):$(id -g)" -v "$binary:/opt/actor:ro" \
+  -v "$b:/state:rw" \
+  -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+  -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+  -e WOW_MINIO_ENDPOINT=http://wow-cloud02-minio:9000 \
+  -e WOW_MINIO_BUCKET="$WOW_MINIO_BUCKET" \
+  -e WOW_SELF_ACCESS="$WOW_BOB_ACCESS" -e WOW_SELF_SECRET="$WOW_BOB_SECRET" \
+  ubuntu:24.04 /opt/actor bob commit-pause >/dev/null
+for _ in $(seq 1 100); do
+  if test -f "$b/committed.marker"; then break; fi
+  sleep 0.1
+done
+test -f "$b/committed.marker"
+docker kill wow-cloud07-post >/dev/null
+docker rm wow-cloud07-post >/dev/null
+actor bob resume
+cp "$b/return.meta" "$a/return.meta"
+actor alice reject-corrupt
+actor alice confirm
+actor alice assert-final
+actor alice confirm
+echo "CLOUD-07: real MinIO W3/W4, pre/post SQLite SIGKILL, replay PASS"
