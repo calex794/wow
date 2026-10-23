@@ -113,6 +113,32 @@ jobs:
           if [[ -n "${WOW_CLOUD_PROXY_PID:-}" ]]; then
             kill "$WOW_CLOUD_PROXY_PID" 2>/dev/null || true
           fi
+      - name: CLOUD-06 separate Alice and Bob processes
+        env:
+          WOW_ALICE_ACCESS: wow_alice_ci
+          WOW_ALICE_SECRET: wow_alice_disposable_pass_20261023
+          WOW_BOB_ACCESS: wow_bob_ci
+          WOW_BOB_SECRET: wow_bob_disposable_pass_20261023
+        run: |
+          set -euo pipefail
+          echo "opaque pre-encrypted lab packet" > "$RUNNER_TEMP/forward.w3"
+          printf '%s' "opaque encrypted lab receipt" > "$RUNNER_TEMP/reverse.w4"
+          cargo build --manifest-path labs/cloud_s3/Cargo.toml --bin cloud06_node
+          node="labs/cloud_s3/target/debug/cloud06_node"
+          "$node" HASH unused "$RUNNER_TEMP/forward.w3" "$RUNNER_TEMP/w3.digest"
+          "$node" HASH unused "$RUNNER_TEMP/reverse.w4" "$RUNNER_TEMP/w4.digest"
+          # Distinct process invocations; sender exits before receiver reads.
+          "$node" ALICE put "$RUNNER_TEMP/forward.w3" "$RUNNER_TEMP/w3.version"
+          WOW_EXPECTED_BLAKE3="$(cat "$RUNNER_TEMP/w3.digest")" \
+            "$node" BOB read "$RUNNER_TEMP/w3.version" "$RUNNER_TEMP/received.w3"
+          cmp "$RUNNER_TEMP/forward.w3" "$RUNNER_TEMP/received.w3"
+          "$node" BOB put "$RUNNER_TEMP/reverse.w4" "$RUNNER_TEMP/w4.version"
+          WOW_EXPECTED_BLAKE3="$(cat "$RUNNER_TEMP/w4.digest")" \
+            "$node" ALICE read "$RUNNER_TEMP/w4.version" "$RUNNER_TEMP/received.w4"
+          cmp "$RUNNER_TEMP/reverse.w4" "$RUNNER_TEMP/received.w4"
+          # Sender write-only cannot independently reconcile: fail closed.
+          "$node" ALICE reconcile "$RUNNER_TEMP/forward.w3" "$RUNNER_TEMP/reconcile.status"
+          grep -Fx 'RECONCILIATION_NEEDS_READ_CAPABILITY' "$RUNNER_TEMP/reconcile.status"
       - name: Execute real conditional PUT and exact-version GET
         run: |
           set -euo pipefail
