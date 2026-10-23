@@ -33,12 +33,12 @@ impl ExternalCausalPin{
    params![scope.as_slice(),actor.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
   match prev {
    Some((_,_,1))=>return Err(PinError::Frozen),
-   Some((seq,_,_)) if observed.seq < seq=>return Err(PinError::Rollback),
-   Some((seq,d,_)) if observed.seq==seq && d!=observed.digest=> {
+   Some((seq,_,_)) if observed.seq < seq as u64=>return Err(PinError::Rollback),
+   Some((seq,d,_)) if observed.seq==seq as u64 && d.as_slice()!=observed.digest.as_slice()=> {
       tx.execute("UPDATE causal_pin SET frozen=1 WHERE private_scope=?1 AND custodian=?2",params![scope.as_slice(),actor.as_slice()])?;
       tx.commit()?;return Err(PinError::Conflict)
    }
-   Some((seq,d,_)) if observed.seq==seq&&d==observed.digest=>return Ok(()),
+   Some((seq,d,_)) if observed.seq==seq as u64&&d.as_slice()==observed.digest.as_slice()=>return Ok(()),
    _=>{}
   }
   tx.execute("INSERT INTO causal_pin(private_scope,custodian,seq,digest,frozen)
