@@ -2,7 +2,8 @@
 //! observation, NOT proof that a malicious custodian ever stored W3 bytes.
 //! The database MUST live independently of the custodian SQLite to detect
 //! rollback of that database. Never publicize scope or hashes.
-use crate::causal_w12::CausalCommitment;
+use crate::causal_w12::{CausalCommitment, verify_w12_signed_claim};
+use crate::trust_w3::TrustRegistry;
 use rusqlite::{Connection,OptionalExtension,params,TransactionBehavior};
 use std::path::Path;
 #[derive(Debug)]
@@ -59,5 +60,29 @@ impl ExternalCausalPin{
    Some((seq,d,_)) if actual.is_some_and(|v|v.seq==seq as u64&&v.digest.as_slice()==d)=>Ok(Check::Match),
    Some((_seq,_d,_))=>Err(PinError::Missing), // advanced head needs verified continuity
   }
+ }
+}
+
+
+impl ExternalCausalPin {
+ /// Verified entry-point for a *custodian-signed claim*. Not a genuine W10
+ /// witness checkpoint. Authenticate transport, scope and STORE rights
+ /// separately before exposing this outside a laboratory.
+ pub fn pin_signed_claim(
+   &mut self,raw:&[u8],expected_scope:[u8;16],
+   expected_actor:[u8;16],trust:&TrustRegistry,
+ )->Result<CausalCommitment,PinError>{
+   let verified=verify_w12_signed_claim(raw,trust).map_err(|_|PinError::Invalid)?;
+   if verified.private_scope!=expected_scope || verified.custodian_id!=expected_actor {
+      return Err(PinError::Invalid);
+   }
+   let prior=self.compare(expected_scope,expected_actor,Some(verified.commitment))?;
+   match prior {
+     Check::Rollback|Check::Conflict=>return Err(PinError::Conflict),
+     _=>{}
+   }
+   // Fail closed on missing continuity rather than trusting a new higher seq.
+   self.pin_observed(expected_scope,expected_actor,verified.commitment)?;
+   Ok(verified.commitment)
  }
 }
