@@ -8,5 +8,5 @@ publish = false
 # W3/W4, K-credit journal, and Akula Sync do NOT depend on AWS SDK.
 [dependencies]
 akula-wire-lab = { path = "../.." }
-aws-sdk-s3 = { version = "=1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = "=1.119.0"
 tokio = { version = "1.48", features = ["rt-multi-thread", "time"] }
