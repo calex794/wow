@@ -6,8 +6,9 @@ use std::{env,fs};
 use wow_cloud_s3_lab::S3Lab;
 fn need(n:&str)->String{env::var(n).expect("missing CI-only environment variable")}
 fn account(who:&str)->S3Lab{
- assert_eq!(need("WOW_MINIO_ENDPOINT"),"http://127.0.0.1:9000");
- S3Lab::new(&need("WOW_MINIO_ENDPOINT"),"us-east-1",&need("WOW_MINIO_BUCKET"),
+ let endpoint=need("WOW_MINIO_ENDPOINT");
+ assert!(endpoint=="http://127.0.0.1:9000" || endpoint=="http://wow-cloud02-minio:9000", "non-lab S3 endpoint forbidden");
+ S3Lab::new(&endpoint,"us-east-1",&need("WOW_MINIO_BUCKET"),
    &need(&format!("WOW_{}_ACCESS",who)),&need(&format!("WOW_{}_SECRET",who)))
 }
 fn key(n:u8,o:u8)->CloudKey{CloudKey{namespace:[n;16],object:[o;16]}}
