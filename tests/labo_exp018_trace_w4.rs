@@ -18,6 +18,7 @@ use tempfile::tempdir;
 const TICK_MS: u64 = 20_000;
 const CLAIM: &str = "measured-human-contact-times-with-synthetic-outages-and-w4-markers";
 const HEADER: &str = "source,phase,seed,gateway_percent,pickup_hours,scenario,policy,pair_set_sha256,message_ref,message_index,created_tick,ttl_ticks,custody_copies,first_gateway_stored_tick,mailbox_uploaded_tick,recipient_stored_tick,source_confirmed_tick,delivery_channel,claim";
+const HEADER_V2: &str = "source,phase,seed,gateway_percent,pickup_hours,scenario,policy,pair_set_sha256,message_ref,message_index,created_tick,ttl_ticks,gateway_deposit_events,distinct_gateway_nodes,first_gateway_stored_tick,mailbox_uploaded_tick,recipient_stored_tick,source_confirmed_tick,delivery_channel,claim";
 const FIXTURE: &str = include_str!("fixtures/labo_exp018_12_events.csv");
 
 fn id(n: u8) -> [u8; 16] { [n; 16] }
@@ -50,6 +51,7 @@ struct ModelLetter {
     // IMPORTANT: number of cumulative deposits, NOT simultaneous copies.
     // The simulator can MOVE a copy repeatedly while its max is K=4.
     deposit_events: usize,
+    distinct_gateway_nodes: Option<usize>,
     first_gateway_tick: Option<u64>,
     uploaded_tick: Option<u64>,
     recipient_tick: Option<u64>,
@@ -59,29 +61,32 @@ struct ModelLetter {
     policy: String,
 }
 impl ModelLetter {
-    fn parse(line: &str) -> Self {
+    fn parse(line: &str, v2: bool) -> Self {
         // Restricted LABO v1 export: ASCII identifiers and integral fields,
         // no quoting or embedded commas. Fail closed on schema changes.
         assert!(!line.contains('"'), "CSV quoting requires a real parser");
         let x: Vec<&str> = line.split(',').collect();
-        assert_eq!(x.len(), 19, "unexpected LABO event CSV width");
-        assert_eq!(x[0], "SFHH-conference-2009");
+        let first = if v2 { 14 } else { 13 };
+        assert_eq!(x.len(), if v2 { 20 } else { 19 },
+                   "unexpected LABO event CSV width");
+        assert!(matches!(x[0], "SFHH-conference-2009" | "InVS-office-2015"));
         assert!(matches!(x[6], "gateway_direct4" | "hybrid_parallel4"));
         assert!(matches!(x[5], "control" | "gateway_disk_reset" |
             "gateway_radio_offline" | "gateway_internet_offline" |
             "return_channel_unavailable"));
-        assert_eq!(x[18], CLAIM);
+        assert_eq!(x[first+5], CLAIM);
         assert_eq!(x[7].len(), 64); // cohort fingerprint, not real W3 digest
         let event = Self {
             message_id: parse_message_ref(x[8]),
             created_tick: x[10].parse().unwrap(),
             ttl_ticks: x[11].parse().unwrap(),
             deposit_events: x[12].parse().unwrap(),
-            first_gateway_tick: maybe_tick(x[13]),
-            uploaded_tick: maybe_tick(x[14]),
-            recipient_tick: maybe_tick(x[15]),
-            return_tick: maybe_tick(x[16]),
-            channel: x[17].to_owned(),
+            distinct_gateway_nodes: if v2 { Some(x[13].parse().unwrap()) } else { None },
+            first_gateway_tick: maybe_tick(x[first]),
+            uploaded_tick: maybe_tick(x[first+1]),
+            recipient_tick: maybe_tick(x[first+2]),
+            return_tick: maybe_tick(x[first+3]),
+            channel: x[first+4].to_owned(),
             scenario: x[5].to_owned(),
             policy: x[6].to_owned(),
         };
@@ -95,6 +100,10 @@ impl ModelLetter {
         assert_eq!(self.ttl_ticks, 720);
         assert!(self.created_tick > 0);
         assert_eq!(self.first_gateway_tick.is_some(), self.deposit_events > 0);
+        if let Some(distinct) = self.distinct_gateway_nodes {
+            assert!(distinct <= self.deposit_events);
+            assert_eq!(distinct > 0, self.deposit_events > 0);
+        }
         if let Some(stored) = self.first_gateway_tick {
             assert!(stored >= self.created_tick && stored < self.expiry());
         }
@@ -119,11 +128,17 @@ impl ModelLetter {
         }
     }
 }
-fn sample() -> Vec<ModelLetter> {
-    let mut lines = FIXTURE.lines();
-    assert_eq!(lines.next(), Some(HEADER));
-    lines.map(ModelLetter::parse).collect()
+fn parse_rows(text: &str) -> Vec<ModelLetter> {
+    let mut lines = text.lines();
+    let header = lines.next().expect("missing LABO header");
+    let v2 = match header {
+        HEADER => false,
+        HEADER_V2 => true,
+        _ => panic!("unknown LABO event CSV version"),
+    };
+    lines.map(|line| ModelLetter::parse(line, v2)).collect()
 }
+fn sample() -> Vec<ModelLetter> { parse_rows(FIXTURE) }
 fn millis(tick: u64) -> u64 {
     tick.checked_mul(TICK_MS).unwrap()
 }
@@ -147,6 +162,23 @@ fn recorded_event_schema_preserves_model_timing_not_copy_authority() {
 #[test]
 fn lab_model_schedule_yields_real_w4_only_after_verified_recipient_commit() {
     let events = sample();
+    assert_eq!(replay(&events), (9, 7));
+}
+
+// Opt-in only: thousands of crypto operations and isolated SQLite files.
+#[test]
+#[ignore = "requires LABO_EXP018_EVENTS_CSV path to a pinned 7680-row LABO artifact"]
+fn full_labo_event_schedule_with_signed_w4() {
+    let path = std::env::var("LABO_EXP018_EVENTS_CSV").expect("missing replay input path");
+    let contents = std::fs::read_to_string(path).expect("unable to read LABO CSV");
+    let events = parse_rows(&contents);
+    assert_eq!(events.len(), 7680);
+    assert_eq!(events.iter().filter(|e| e.recipient_tick.is_some()).count(), 1615);
+    assert_eq!(events.iter().filter(|e| e.return_tick.is_some()).count(), 1209);
+    assert_eq!(replay(&events), (1615, 1209));
+}
+
+fn replay(events: &[ModelLetter]) -> (usize, usize) {
     let dir = tempdir().unwrap();
     let registry = trust();
     let mut durable_recipient = 0;
@@ -256,8 +288,7 @@ fn lab_model_schedule_yields_real_w4_only_after_verified_recipient_commit() {
             &opaque, invitation(), &mut alice,
         ).unwrap(), Delivery::Recipient);
     }
-    assert_eq!(durable_recipient, 9);
-    assert_eq!(source_confirmed, 7);
+    (durable_recipient, source_confirmed)
 }
 
 #[test]
