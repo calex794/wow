@@ -156,7 +156,7 @@ fn lost_reverse_channel_does_not_mark_recipient_until_retried() {
 #[test]
 fn public_listener_and_world_readable_secret_are_refused() {
     let dir=tempdir().unwrap();
-    let (sender_pub,_invite)=keys(&dir);
+    let (sender_pub,invite)=keys(&dir);
     let result=run(&[
         "serve-once",
         dir.path().join("recipient.keys").to_str().unwrap(),
@@ -177,6 +177,35 @@ fn public_listener_and_world_readable_secret_are_refused() {
     let bad=run(&["send-new",
         dir.path().join("sender.keys").to_str().unwrap(),
         dir.path().join("outbox.sqlite").to_str().unwrap(),
-        "00","127.0.0.1:40000","hello"]);
+        &invite,"127.0.0.1:40000","hello"]);
     assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("insecure key file permissions"),
+        "must reject world-readable secret before network access"
+    );
+}
+
+#[test]
+fn unknown_sender_cannot_commit_recipient_sqlite_or_create_w4() {
+    let dir=tempdir().unwrap();
+    let (trusted_sender, invite)=keys(&dir);
+    let rogue_key=dir.path().join("rogue.keys");
+    output_text(&run(&["init-sender",rogue_key.to_str().unwrap()]));
+    let port=temporary_port();
+    let (server,mut reader)=start_server(dir.path(),&trusted_sender,"serve-once",port);
+    let result=run(&[
+        "send-new",rogue_key.to_str().unwrap(),
+        dir.path().join("rogue.sqlite").to_str().unwrap(),
+        &invite,&port.to_string(),"not enrolled",
+    ]);
+    assert!(!result.status.success(),"unauthorized identity must not complete W4");
+    let mut out=String::new();
+    use std::io::Read;
+    reader.read_to_string(&mut out).unwrap();
+    assert!(!server.wait_with_output().unwrap().status.success());
+    assert!(!out.contains("RECIPIENT_COMMITTED"));
+    let db=rusqlite::Connection::open(dir.path().join("recipient.sqlite")).unwrap();
+    let inbox:i64=db.query_row("SELECT COUNT(*) FROM inbox",[],|r|r.get(0)).unwrap();
+    let receipts:i64=db.query_row("SELECT COUNT(*) FROM receipt_outbox",[],|r|r.get(0)).unwrap();
+    assert_eq!((inbox,receipts),(0,0));
 }
