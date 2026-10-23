@@ -1,0 +1,69 @@
+name: WOW W4 two-host test package
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/w4-two-host-package.yml'
+      - 'src/bin/w4_tunnel_lab.rs'
+      - 'scripts/w4-two-host/**'
+      - 'spec/W4-TWO-HOST-SSH-TUNNEL-LAB.md'
+      - 'Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wow-w4-two-host-package-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x64-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate SSH tunnel launcher without network
+        run: |
+          sh -n scripts/w4-two-host/ssh_tunnel.sh
+          sh -n scripts/w4-two-host/check_tunnel.sh
+          sh scripts/w4-two-host/check_tunnel.sh
+      - name: Compile and package Linux x86_64 laboratory binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --bin w4_tunnel_lab
+          name=wow-w4-two-host-linux-x86_64
+          mkdir -p "dist/$name"
+          cp target/release/w4_tunnel_lab "dist/$name/"
+          cp scripts/w4-two-host/ssh_tunnel.sh "dist/$name/"
+          test -s Cargo.lock
+          cp Cargo.lock "dist/$name/"
+          cp spec/W4-TWO-HOST-SSH-TUNNEL-LAB.md "dist/$name/INSTRUCTIONS.md"
+          chmod 755 "dist/$name/w4_tunnel_lab"
+          git rev-parse HEAD > "dist/$name/SOURCE_COMMIT"
+          printf '%s\n' "${{ github.event.pull_request.head.sha || github.sha }}" > "dist/$name/SOURCE_HEAD"
+          rustc --version > "dist/$name/RUSTC_VERSION"
+          (
+            cd "dist/$name"
+            sha256sum w4_tunnel_lab ssh_tunnel.sh INSTRUCTIONS.md Cargo.lock SOURCE_COMMIT SOURCE_HEAD RUSTC_VERSION > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (
+            cd dist
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+            sha256sum --check "$name.tar.gz.sha256"
+          )
+          test -s "dist/$name.tar.gz"
+          echo "W4_BUNDLE_READY=$name"
+          cat "dist/$name/SOURCE_COMMIT"
+      - name: Save downloadable pinned binary, usage and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: wow-w4-two-host-linux-x86_64-${{ github.sha }}
+          path: |
+            dist/wow-w4-two-host-linux-x86_64.tar.gz
+            dist/wow-w4-two-host-linux-x86_64.tar.gz.sha256
+          retention-days: 14
+          if-no-files-found: error

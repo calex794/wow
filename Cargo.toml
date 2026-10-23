@@ -10,6 +10,10 @@ name = "akula_wire_lab"
 path = "src/lib.rs"
 
 [[bin]]
+name = "w4_tunnel_lab"
+path = "src/bin/w4_tunnel_lab.rs"
+
+[[bin]]
 name = "w10_private_witness"
 path = "src/bin/w10_private_witness.rs"
 required-features = ["iroh-transport"]
