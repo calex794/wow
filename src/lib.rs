@@ -18,6 +18,7 @@ pub mod custody_audit_w7;
 pub mod journal_w4;
 pub mod multipath_w5;
 pub mod custody_transfer_w8;
+pub mod causal_w12;
 pub mod custody_witness_w9;
 pub mod witness_pin_w10;
 pub mod receipt_w4;
