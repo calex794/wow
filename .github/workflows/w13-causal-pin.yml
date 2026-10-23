@@ -5,6 +5,7 @@ on:
       - 'src/causal_pin_w13.rs'
       - 'src/lib.rs'
       - 'tests/causal_pin_w13.rs'
+      - 'tests/causal_w13_sqlite_rollback.rs'
       - '.github/workflows/w13-causal-pin.yml'
   workflow_dispatch:
 permissions:
@@ -16,4 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test independent pinned history
-        run: cargo test --test causal_pin_w13
+        run: |
+          cargo test --test causal_pin_w13
+          cargo test --test causal_w13_sqlite_rollback
