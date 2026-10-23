@@ -35,9 +35,9 @@ fn maybe_tick(value: &str) -> Option<u64> {
 fn parse_message_ref(value: &str) -> [u8; 16] {
     assert_eq!(value.len(), 32, "bad synthetic trace ID length");
     let mut out = [0u8; 16];
-    for (i, bytes) in value.as_bytes().chunks_exact(2).enumerate() {
-        let digits = std::str::from_utf8(bytes).unwrap();
-        out[i] = u8::from_str_radix(digits, 16).expect("not lowercase hex");
+    for (i, item) in out.iter_mut().enumerate() {
+        let digits = value.get(2*i..2*i+2).expect("non-ASCII synthetic ID");
+        *item = u8::from_str_radix(digits, 16).expect("not lowercase hex");
     }
     assert_ne!(out, [0u8; 16]);
     out
@@ -115,7 +115,7 @@ impl ModelLetter {
         }
         if let Some(receipt) = self.return_tick {
             assert!(receipt > self.recipient_tick.expect("receipt without recipient"));
-            assert_eq!(self.scenario != "return_channel_unavailable", true);
+            assert_ne!(self.scenario, "return_channel_unavailable");
         }
     }
 }
