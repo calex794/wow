@@ -72,7 +72,7 @@ fn reverse_mail_w4_survives_unknown_ack_and_restart(){
   assert_eq!(private_return_w4::open_verify_and_apply(&exact,invitation(),&mut a).unwrap(),Delivery::Recipient);
   assert_eq!(a.retry_bytes(id(8),id(5),100_010).unwrap(),None);
   // A corrupted cloud W4 MUST NOT confirm the sender.
-  let mut damaged=exact.clone();damaged[damaged.len()-1]^=1;
+  let mut damaged=exact.clone();let last=damaged.len()-1;damaged[last]^=1;
   assert!(private_return_w4::open_verify_and_apply(&damaged,invitation(),&mut a).is_err());
  });
 }
