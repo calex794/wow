@@ -12,6 +12,7 @@ fn grant(k:CloudKey, bytes:&[u8])->UploadGrant {
 fn permit(k:CloudKey)->ReadPermit {
     ReadPermit {key:k,max_bytes:1024,expires_at_ms:200}
 }
+#[derive(Default)]
 struct Fake {
     entries:HashMap<CloudKey,(u64,Vec<u8>)>,
     uploads:usize,
@@ -20,10 +21,6 @@ struct Fake {
     corrupt_read:bool,
     dishonest_len:bool,
     unavailable:bool,
-}
-impl Default for Fake {
-    fn default()->Self { Self {entries:HashMap::new(),uploads:0,lost_ack:false,
-        missing_read:false,corrupt_read:false,dishonest_len:false,unavailable:false} }
 }
 impl CloudMailStore for Fake {
     fn provider(&self)->CloudProvider {CloudProvider::Fake}
