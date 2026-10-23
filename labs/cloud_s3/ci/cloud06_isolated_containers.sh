@@ -13,6 +13,10 @@ test "${WOW_MINIO_ENDPOINT:?}" = "http://127.0.0.1:9000"
 repo_root="$(pwd)"
 binary="$repo_root/labs/cloud_s3/target/debug/cloud06_node"
 test -x "$binary"
+# AWS SDK rustls native-roots must see a valid trust bundle. Minimal Ubuntu
+# runner images omit certificates; mount the host's read-only verified bundle.
+cert_bundle="/etc/ssl/certs/ca-certificates.crt"
+test -s "$cert_bundle"
 base="$RUNNER_TEMP/wow-cloud06-container"
 alice="$base/alice"
 bob="$base/bob"
@@ -37,6 +41,8 @@ run_alice() {
     --security-opt no-new-privileges --pids-limit 64 --memory 256m \
     --user "$(id -u):$(id -g)" \
     -v "$binary:/opt/cloud06_node:ro" \
+    -v "$cert_bundle:/etc/ssl/certs/ca-certificates.crt:ro" \
+    -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     -v "$alice:/state:rw" \
     -e WOW_MINIO_ENDPOINT="http://wow-cloud02-minio:9000" \
     -e WOW_MINIO_BUCKET="$WOW_MINIO_BUCKET" \
@@ -50,6 +56,8 @@ run_bob() {
     --security-opt no-new-privileges --pids-limit 64 --memory 256m \
     --user "$(id -u):$(id -g)" \
     -v "$binary:/opt/cloud06_node:ro" \
+    -v "$cert_bundle:/etc/ssl/certs/ca-certificates.crt:ro" \
+    -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     -v "$bob:/state:rw" \
     -e WOW_MINIO_ENDPOINT="http://wow-cloud02-minio:9000" \
     -e WOW_MINIO_BUCKET="$WOW_MINIO_BUCKET" \
