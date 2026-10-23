@@ -20,7 +20,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EPOCH: u64 = 1;
 const FORWARD_TTL_MS: u64 = 15 * 60 * 1000;
@@ -29,7 +29,7 @@ const RETURN_METADATA_LEN: usize = 16 + 32;
 const SENDER_SECRET_BYTES: usize = 32 + 32 + 32;
 const RECIPIENT_SECRET_BYTES: usize = 32 + 32 + 16;
 const INVITE_BYTES: usize = 32 + 32 + 16;
-const IO_BUDGET: Duration = Duration::from_secs(10);
+const IO_BUDGET: Duration = Duration::from_secs(15);
 
 fn error(value: impl std::fmt::Debug) -> io::Error {
     io::Error::other(format!("W4 tunnel experiment: {value:?}"))
@@ -192,21 +192,63 @@ fn parse_invite(value: &str) -> Result<Invitation, io::Error> {
     Ok(Invitation { signing, secret_public,
         recipient_id: device_id(&pub_signing), route_token: token })
 }
-fn send_frame(socket: &mut TcpStream, bytes: &[u8]) -> Result<(), io::Error> {
+fn exhausted() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "absolute 15-second I/O budget exceeded")
+}
+fn read_before(socket: &mut TcpStream, mut bytes: &mut [u8],
+               deadline: Instant) -> Result<(), io::Error> {
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return Err(exhausted()); }
+        socket.set_read_timeout(Some(left))?;
+        match socket.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) => {
+                let (_, rest) = bytes.split_at_mut(count);
+                bytes = rest;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if Instant::now() >= deadline { return Err(exhausted()); }
+    Ok(())
+}
+fn write_before(socket: &mut TcpStream, mut bytes: &[u8],
+                deadline: Instant) -> Result<(), io::Error> {
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return Err(exhausted()); }
+        socket.set_write_timeout(Some(left))?;
+        match socket.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => bytes = &bytes[count..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if Instant::now() >= deadline { return Err(exhausted()); }
+    Ok(())
+}
+fn send_frame(socket: &mut TcpStream, bytes: &[u8],
+              deadline: Instant) -> Result<(), io::Error> {
     if bytes.is_empty() || bytes.len() > MAX_MESSAGE_BYTES {
         return Err(bad("framed payload outside limit"));
     }
-    socket.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    socket.write_all(bytes)?;
-    socket.flush()
+    write_before(socket, &(bytes.len() as u32).to_be_bytes(), deadline)?;
+    write_before(socket, bytes, deadline)?;
+    socket.flush()?;
+    if Instant::now() >= deadline { return Err(exhausted()); }
+    Ok(())
 }
-fn recv_frame(socket: &mut TcpStream, cap: usize) -> Result<Vec<u8>, io::Error> {
+fn recv_frame(socket: &mut TcpStream, cap: usize,
+              deadline: Instant) -> Result<Vec<u8>, io::Error> {
     let mut len = [0u8;4];
-    socket.read_exact(&mut len)?;
+    read_before(socket, &mut len, deadline)?;
     let size = u32::from_be_bytes(len) as usize;
     if size == 0 || size > cap { return Err(bad("invalid inbound frame size")); }
     let mut data = vec![0u8;size];
-    socket.read_exact(&mut data)?;
+    read_before(socket, &mut data, deadline)?;
     Ok(data)
 }
 fn server_once(keys: &Path, db: &Path, verify: &str,
@@ -224,9 +266,8 @@ fn server_once(keys: &Path, db: &Path, verify: &str,
     io::stdout().flush()?;
     let (mut socket, from) = listener.accept()?;
     if !from.ip().is_loopback() { return Err(bad("non-loopback connection")); }
-    socket.set_read_timeout(Some(IO_BUDGET))?;
-    socket.set_write_timeout(Some(IO_BUDGET))?;
-    let packet = recv_frame(&mut socket, MAX_MESSAGE_BYTES)?;
+    let io_deadline = Instant::now() + IO_BUDGET;
+    let packet = recv_frame(&mut socket, MAX_MESSAGE_BYTES, io_deadline)?;
     let hint = private_route_w3::inspect_route(&packet).map_err(error)?;
     if hint.token != recipient.route_token { return Err(bad("wrong invitation token")); }
     let now = now_ms()?;
@@ -266,7 +307,7 @@ fn server_once(keys: &Path, db: &Path, verify: &str,
         &signed, &return_public, return_tag,
     ).map_err(error)?;
     if encrypted.len() != ENVELOPE_LEN { return Err(bad("invalid encrypted W4 size")); }
-    send_frame(&mut socket, &encrypted)?;
+    send_frame(&mut socket, &encrypted, io_deadline)?;
     println!("W4_SENT {}", hex(&hint.message_id));
     Ok(())
 }
@@ -284,10 +325,9 @@ fn deliver(keys: &Path, db: &Path, invitation: &Invitation,
         return Err(bad("stored W3 does not match recipient invitation"));
     }
     let mut socket = TcpStream::connect_timeout(&addr, IO_BUDGET)?;
-    socket.set_read_timeout(Some(IO_BUDGET))?;
-    socket.set_write_timeout(Some(IO_BUDGET))?;
-    send_frame(&mut socket, &packet)?;
-    let encrypted = recv_frame(&mut socket, ENVELOPE_LEN)?;
+    let io_deadline = Instant::now() + IO_BUDGET;
+    send_frame(&mut socket, &packet, io_deadline)?;
+    let encrypted = recv_frame(&mut socket, ENVELOPE_LEN, io_deadline)?;
     if encrypted.len() != ENVELOPE_LEN { return Err(bad("return length mismatch")); }
     let mut trust = TrustRegistry::new();
     trust.enroll(invitation.recipient_id, EPOCH, invitation.signing).map_err(error)?;
