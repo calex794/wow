@@ -6,7 +6,7 @@ use akula_wire_lab::{
 };
 use ed25519_dalek::SigningKey;
 use std::fs;
-fn packet(sender:&SigningKey,pk:&crypto_w3::RecipientPublicKey,message:[u8;16])->Vec<u8>{
+fn packet(sender:&SigningKey,pk:&crypto_w3::RecipientPublic,message:[u8;16])->Vec<u8>{
  private_route_w3::seal_private(sender,pk,[9;16],SignedHeader{
   sender_id:[7;16],recipient_id:[3;16],message_id:message,expiry:10_000_000,epoch:1
  },b"sealed snapshot test").unwrap()
