@@ -56,6 +56,29 @@ impl S3Lab {
         }
         Ok(CloudRevision::S3VersionId(version.to_owned()))
     }
+    /// Reconcile a lost write response by reading exact version and digest.
+    /// Never repeat a conditional PUT blindly.
+    pub async fn reconcile_unknown_put(&self, key: CloudKey, bytes: &[u8])
+        -> Result<CloudRevision, CloudError> {
+        if bytes.is_empty() || bytes.len() > MAX_CLOUD_MAIL_BYTES {
+            return Err(CloudError::TooLarge);
+        }
+        let head=self.client.head_object().bucket(&self.bucket)
+            .key(object_key(key)).send().await.map_err(|_|CloudError::Ambiguous)?;
+        if head.content_length() != Some(bytes.len() as i64) {
+            return Err(CloudError::Corrupt);
+        }
+        let version=head.version_id().ok_or(CloudError::Ambiguous)?;
+        if version.is_empty() || version=="null" || version.len()>128 {
+            return Err(CloudError::InvalidRevision);
+        }
+        let pin=CloudRevision::S3VersionId(version.to_owned());
+        let expected=*blake3::hash(bytes).as_bytes();
+        let actual=self.read_exact(key,&pin,bytes.len(),expected).await
+            .map_err(|e| if e==CloudError::Unavailable {CloudError::Ambiguous} else {e})?;
+        if actual!=bytes {return Err(CloudError::Corrupt);}
+        Ok(pin)
+    }
     /// Laboratory capability: permit an exact-version read for at most one minute.
     /// The caller authenticates the recipient and transports this privately.
     pub async fn presign_read(
