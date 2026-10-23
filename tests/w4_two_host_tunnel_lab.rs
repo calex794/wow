@@ -189,6 +189,9 @@ fn public_listener_and_world_readable_secret_are_refused() {
 fn unknown_sender_cannot_commit_recipient_sqlite_or_create_w4() {
     let dir=tempdir().unwrap();
     let (trusted_sender, invite)=keys(&dir);
+    // Pre-create tables so we can prove that unauthenticated W3 wrote zero
+    // inbox rows and zero signed receipt rows, not merely that open failed.
+    Journal::open(&dir.path().join("recipient.sqlite")).unwrap();
     let rogue_key=dir.path().join("rogue.keys");
     output_text(&run(&["init-sender",rogue_key.to_str().unwrap()]));
     let port=temporary_port();
