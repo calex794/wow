@@ -37,8 +37,8 @@ impl S3Lab {
             .build();
         Self { client: Client::from_conf(conf), bucket: bucket.to_owned() }
     }
-    /// Explicitly versioned create-only; never retry failed writes blindly.
-    /// AWS SDK may retry transport errors within the request. No W4 implied.
+    /// Explicitly versioned create-only, with SDK retries disabled.
+    /// Errors are ambiguous until separately reconciled; no W4 implied.
     pub async fn put_once(
         &self, key: CloudKey, encrypted: &[u8],
     ) -> Result<CloudRevision, CloudError> {
