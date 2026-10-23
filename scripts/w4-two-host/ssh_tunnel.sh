@@ -1,16 +1,16 @@
 #!/bin/sh
 # One-way SSH forwarding for the WOW W4 two-host laboratory.
-# Run using: sh ssh_tunnel.sh receiver|sender user@vps
+# Run using: sh ssh_tunnel.sh direct|receiver|sender user@vps
 # The relay uses a UNIX socket in a private SSH-owned directory on VPS;
 # no public relay TCP port is created. SSH host keys MUST be pre-pinned.
 set -eu
 if [ "$#" -ne 2 ]; then
-    echo "usage: sh ssh_tunnel.sh receiver|sender user@vps" >&2
+    echo "usage: sh ssh_tunnel.sh direct|receiver|sender user@vps" >&2
     exit 2
 fi
 role=$1
 host=$2
-case "$role" in receiver|sender) ;; *) echo "invalid role" >&2; exit 2;; esac
+case "$role" in direct|receiver|sender) ;; *) echo "invalid role" >&2; exit 2;; esac
 case "$host" in
     ""|-*|*@*/*|*[!A-Za-z0-9_@.:-]*)
         echo "invalid SSH destination" >&2
@@ -18,6 +18,18 @@ case "$host" in
         ;;
 esac
 command -v ssh >/dev/null 2>&1 || { echo "OpenSSH is required" >&2; exit 2; }
+
+# One physical PC plus one independently administered VPS is the simplest
+# *two-host* smoke test. The recipient binary on VPS binds 127.0.0.1:42042,
+# and only the sending PC gets a loopback listener. No VPS public W4 port.
+if [ "$role" = direct ]; then
+    echo "PC -> encrypted SSH -> VPS 127.0.0.1:42042"
+    exec ssh -T -N \
+        -o BatchMode=yes -o StrictHostKeyChecking=yes \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        -L "127.0.0.1:42043:127.0.0.1:42042" "$host"
+fi
 
 # Reuse exactly the same ASCII session label on both physical machines.
 session=${WOW_E2E_SESSION:-w4-labo}
