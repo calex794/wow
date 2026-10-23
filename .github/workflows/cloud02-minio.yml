@@ -63,28 +63,27 @@ jobs:
           status="$(aws --endpoint-url "$WOW_MINIO_ENDPOINT" s3api get-bucket-versioning \
             --bucket "$WOW_MINIO_BUCKET" --query Status --output text)"
           test "$status" = Enabled
+      - name: Download pinned MinIO admin client
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --silent --show-error \
+            --output "$RUNNER_TEMP/mc" \
+            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z
+          printf '%s  %s\n' \
+            '01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891' \
+            "$RUNNER_TEMP/mc" | sha256sum --check -
+          chmod 0700 "$RUNNER_TEMP/mc"
       - name: Provision independent mail principals
         run: |
           set -euo pipefail
-          docker run --rm --network host \
-            -v "$GITHUB_WORKSPACE/labs/cloud_s3/ci:/policies:ro" \
-            -e MC_HOST_lab="http://$WOW_MINIO_ACCESS:$WOW_MINIO_SECRET@127.0.0.1:9000" \
-            quay.io/minio/mc:latest \
-            admin user add lab wow_alice_ci wow_alice_disposable_pass_20261023
-          docker run --rm --network host \
-            -e MC_HOST_lab="http://$WOW_MINIO_ACCESS:$WOW_MINIO_SECRET@127.0.0.1:9000" \
-            quay.io/minio/mc:latest \
-            admin user add lab wow_bob_ci wow_bob_disposable_pass_20261023
+          mc="$RUNNER_TEMP/mc"
+          export MC_HOST_lab="http://${WOW_MINIO_ACCESS}:${WOW_MINIO_SECRET}@127.0.0.1:9000"
+          "$mc" admin user add lab wow_alice_ci wow_alice_disposable_pass_20261023
+          "$mc" admin user add lab wow_bob_ci wow_bob_disposable_pass_20261023
           for policy in alice bob; do
-            docker run --rm --network host \
-              -v "$GITHUB_WORKSPACE/labs/cloud_s3/ci:/policies:ro" \
-              -e MC_HOST_lab="http://$WOW_MINIO_ACCESS:$WOW_MINIO_SECRET@127.0.0.1:9000" \
-              quay.io/minio/mc:latest \
-              admin policy create lab "wow-${policy}-ci" "/policies/${policy}-policy.json"
-            docker run --rm --network host \
-              -e MC_HOST_lab="http://$WOW_MINIO_ACCESS:$WOW_MINIO_SECRET@127.0.0.1:9000" \
-              quay.io/minio/mc:latest \
-              admin policy attach lab "wow-${policy}-ci" --user "wow_${policy}_ci"
+            "$mc" admin policy create lab "wow-${policy}-ci" \
+              "$GITHUB_WORKSPACE/labs/cloud_s3/ci/${policy}-policy.json"
+            "$mc" admin policy attach lab "wow-${policy}-ci" --user "wow_${policy}_ci"
           done
       - name: Test scoped account permissions on real MinIO
         env:
