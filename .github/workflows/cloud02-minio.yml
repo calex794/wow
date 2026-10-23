@@ -68,6 +68,8 @@ jobs:
           set -euo pipefail
           cargo test --manifest-path labs/cloud_s3/Cargo.toml \
             --test minio_offline -- --ignored --nocapture --test-threads=1
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud_w3_w4_e2e -- --ignored --nocapture --test-threads=1
       - name: Stop isolated MinIO
         if: always()
         run: |
