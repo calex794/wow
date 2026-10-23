@@ -14,7 +14,7 @@ use akula_wire_lab::private_route_w3;
 use akula_wire_lab::witness_pin_w10::{PinError,PinOutcome,WitnessPinStore};
 use akula_wire_lab::trust_w3::TrustRegistry;
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint,EndpointAddr,EndpointId,endpoint::{presets,Connection}};
+use iroh::{Endpoint,EndpointAddr,EndpointId,endpoint::presets};
 use std::io::{BufRead,BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
