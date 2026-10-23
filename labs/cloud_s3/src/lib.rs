@@ -56,6 +56,26 @@ impl S3Lab {
         }
         Ok(CloudRevision::S3VersionId(version.to_owned()))
     }
+    /// Laboratory capability: permit an exact-version read for at most one minute.
+    /// The caller authenticates the recipient and transports this privately.
+    pub async fn presign_read(
+        &self, key: CloudKey, version: &CloudRevision, ttl_seconds: u64,
+    ) -> Result<String, CloudError> {
+        use aws_sdk_s3::presigning::PresigningConfig;
+        use std::time::Duration;
+        let CloudRevision::S3VersionId(v) = version else {
+            return Err(CloudError::InvalidRevision);
+        };
+        if v.is_empty() || v == "null" || v.len() > 128 || ttl_seconds == 0 || ttl_seconds > 60 {
+            return Err(CloudError::InvalidGrant);
+        }
+        let config=PresigningConfig::expires_in(Duration::from_secs(ttl_seconds))
+            .map_err(|_| CloudError::InvalidGrant)?;
+        let grant=self.client.get_object()
+            .bucket(&self.bucket).key(object_key(key)).version_id(v)
+            .presigned(config).await.map_err(|_| CloudError::Unavailable)?;
+        Ok(grant.uri().to_owned())
+    }
     /// A pinned version is necessary; NEVER silently fetch latest.
     /// A HEAD size bound is followed by a per-chunk bounded stream. This still
     /// does NOT authorize the caller or pin a trusted remote endpoint.
