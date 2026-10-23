@@ -292,6 +292,7 @@ pub struct VerifiedW12Claim {
     pub custodian_epoch: u64,
     pub seq: u64,
     pub predecessor: [u8;32],
+    pub packet_digest: [u8;32],
     pub commitment: CausalCommitment,
 }
 
@@ -319,7 +320,7 @@ pub fn verify_w12_signed_claim(
     pos+=16;
     let message=&body[pos..pos+16];
     pos+=16;
-    let _packet_digest=&body[pos..pos+32];
+    let packet_digest:[u8;32]=body[pos..pos+32].try_into().map_err(|_|CausalError::Invalid)?;
     if scope==[0;16] || actor==[0;16] || epoch==0
         || epoch>i64::MAX as u64 || seq==0 || seq>i64::MAX as u64
         || recipient==[0;16] || message==[0;16]
@@ -330,7 +331,7 @@ pub fn verify_w12_signed_claim(
     key.verify(body,&sig).map_err(|_|CausalError::Unauthorized)?;
     Ok(VerifiedW12Claim {
         private_scope:scope,custodian_id:actor,custodian_epoch:epoch,seq,
-        predecessor,commitment:CausalCommitment{
+        predecessor,packet_digest,commitment:CausalCommitment{
             seq,digest:digest_of(body,&raw[body.len()..]),
         }
     })
