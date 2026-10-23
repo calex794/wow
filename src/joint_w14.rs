@@ -92,3 +92,27 @@ pub fn verify_joint(
  {return Err(JointError::WrongLink);}
  Ok(c)
 }
+
+
+/// The actual W10 pinned W9 checkpoint MUST match the checkpoint
+/// bound into W14. An in-memory W9 response alone is insufficient.
+pub fn sign_joint_against_w10(
+ offer:&[u8],checkpoint:&[u8],w12:&[u8],scope:[u8;16],
+ witness:[u8;16],epoch:u64,signer:&SigningKey,trust:&TrustRegistry,
+ pin:&crate::witness_pin_w10::WitnessPinStore,
+)->Result<Vec<u8>,JointError>{
+ let pinned=pin.current().map_err(|_|JointError::Invalid)?;
+ if pinned.as_deref()!=Some(checkpoint){return Err(JointError::WrongLink);}
+ pin.inspect(trust).map_err(|_|JointError::Invalid)?;
+ sign_joint(offer,checkpoint,w12,scope,witness,epoch,signer,trust)
+}
+pub fn verify_joint_against_w10(
+ joint:&[u8],offer:&[u8],checkpoint:&[u8],w12:&[u8],
+ scope:[u8;16],witness:[u8;16],trust:&TrustRegistry,
+ pin:&crate::witness_pin_w10::WitnessPinStore,
+)->Result<JointClaim,JointError>{
+ let pinned=pin.current().map_err(|_|JointError::Invalid)?;
+ if pinned.as_deref()!=Some(checkpoint){return Err(JointError::WrongLink);}
+ pin.inspect(trust).map_err(|_|JointError::Invalid)?;
+ verify_joint(joint,offer,checkpoint,w12,scope,witness,trust)
+}
