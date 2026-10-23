@@ -1,0 +1,19 @@
+name: WOW W13 independent causal pin
+on:
+  pull_request:
+    paths:
+      - 'src/causal_pin_w13.rs'
+      - 'src/lib.rs'
+      - 'tests/causal_pin_w13.rs'
+      - '.github/workflows/w13-causal-pin.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test independent pinned history
+        run: cargo test --test causal_pin_w13
