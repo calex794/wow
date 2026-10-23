@@ -128,7 +128,7 @@ fn w14_three_seeds_seven_attack_rates_no_wrong_joint_acceptance(){
                     let accepted=match method{
                         0=>{
                             let mut bytes=joint.clone();
-                            bytes[bytes.len()-1]^=1;
+                            let last=bytes.len()-1; bytes[last]^=1;
                             verify_joint_against_w10(&bytes,evidence,context,&t,&pin).is_ok()
                         },
                         1=>verify_joint_against_w10(&joint,
