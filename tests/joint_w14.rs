@@ -3,7 +3,7 @@ use akula_wire_lab::{
  custody_transfer_w8::{self,OfferClaims},
  custody_witness_w9::{WitnessStore,WitnessObservation},
  journal_w4::Journal,private_route_w3,crypto_identity_w3::SignedHeader,crypto_w3,
- joint_w14::{sign_joint,verify_joint},trust_w3::TrustRegistry
+ joint_w14::{sign_joint_against_w10,verify_joint_against_w10},witness_pin_w10::WitnessPinStore,trust_w3::TrustRegistry
 };
 use ed25519_dalek::SigningKey;
 fn id(n:u8)->[u8;16]{[n;16]}
@@ -36,20 +36,22 @@ fn private_joint_w8_w9_w12_rejects_cross_message_replay_and_mutation(){
  let cp=match w.observe(&offer,&witness,&trust).unwrap(){
     WitnessObservation::FirstSeen(x)=>x,_=>panic!("fork")
  };
- let receipt=sign_joint(&offer,&cp,&proof,id(5),id(17),9,&witness,&trust).unwrap();
- assert!(verify_joint(&receipt,&offer,&cp,&proof,id(5),id(17),&trust).is_ok());
+ let mut pin=WitnessPinStore::open(&dir.path().join("w10.sqlite"),id(17),9).unwrap();
+ pin.pin(&cp,&trust).unwrap();
+ let receipt=sign_joint_against_w10(&offer,&cp,&proof,id(5),id(17),9,&witness,&trust,&pin).unwrap();
+ assert!(verify_joint_against_w10(&receipt,&offer,&cp,&proof,id(5),id(17),&trust,&pin).is_ok());
  let mut wrong=receipt.clone();
  *wrong.last_mut().unwrap()^=1;
- assert!(verify_joint(&wrong,&offer,&cp,&proof,id(5),id(17),&trust).is_err());
- assert!(verify_joint(&receipt,&offer,&cp,&proof,id(6),id(17),&trust).is_err());
+ assert!(verify_joint_against_w10(&wrong,&offer,&cp,&proof,id(5),id(17),&trust,&pin).is_err());
+ assert!(verify_joint_against_w10(&receipt,&offer,&cp,&proof,id(6),id(17),&trust,&pin).is_err());
  let mut bad_offer=offer.clone();
  *bad_offer.last_mut().unwrap()^=1;
- assert!(verify_joint(&receipt,&bad_offer,&cp,&proof,id(5),id(17),&trust).is_err());
+ assert!(verify_joint_against_w10(&receipt,&bad_offer,&cp,&proof,id(5),id(17),&trust,&pin).is_err());
  // Even a newly signed offer for the same message cannot be substituted.
  let alternate=custody_transfer_w8::sign_offer(OfferClaims{
    source_id:id(8),source_epoch:1,target_id:id(14),target_epoch:7,
    slot_alias:id(22),offer_id:id(32),
    ciphertext_digest:verified.packet_digest,expires_at_ms:500_000,
  },&keeper).unwrap();
- assert!(verify_joint(&receipt,&alternate,&cp,&proof,id(5),id(17),&trust).is_err());
+ assert!(verify_joint_against_w10(&receipt,&alternate,&cp,&proof,id(5),id(17),&trust,&pin).is_err());
 }
