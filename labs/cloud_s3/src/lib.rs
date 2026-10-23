@@ -3,7 +3,7 @@
 //! The bucket must have S3 VERSIONING ENABLED before test execution.
 //! Offline custodian read is tested with an independently instantiated client.
 use akula_wire_lab::cloud_mail_store::{CloudKey, CloudRevision, CloudError, MAX_CLOUD_MAIL_BYTES};
-use aws_sdk_s3::{Client, config::{Builder as S3ConfigBuilder, Credentials, Region}, primitives::ByteStream};
+use aws_sdk_s3::{Client, config::{retry::RetryConfig, Builder as S3ConfigBuilder, Credentials, Region}, primitives::ByteStream};
 
 pub struct S3Lab {
     client: Client,
@@ -31,6 +31,8 @@ impl S3Lab {
             .credentials_provider(Credentials::new(access, secret, None, None, "wow-cloud-lab"))
             .endpoint_url(endpoint)
             .force_path_style(true)
+            // Lost ACK must NOT trigger SDK-level blind repeated PUT attempts.
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
             .build();
         Self { client: Client::from_conf(conf), bucket: bucket.to_owned() }
     }
@@ -54,9 +56,8 @@ impl S3Lab {
         Ok(CloudRevision::S3VersionId(version.to_owned()))
     }
     /// A pinned version is necessary; NEVER silently fetch latest.
-    /// HEAD limits ordinary memory allocation for honest S3 servers; a lying
-    /// object server can still violate advertised Content-Length. Production
-    /// requires true bounded streaming, separately tracked before any rollout.
+    /// A HEAD size bound is followed by a per-chunk bounded stream. This still
+    /// does NOT authorize the caller or pin a trusted remote endpoint.
     pub async fn read_exact(
         &self, key: CloudKey, rev: &CloudRevision, max_bytes: usize,
         expected_blake3: [u8;32],
@@ -80,9 +81,20 @@ impl S3Lab {
         if get.content_length().unwrap_or(-1)!=len {
             return Err(CloudError::Corrupt);
         }
-        let body=get.body.collect().await.map_err(|_|CloudError::Unavailable)?;
-        let bytes=body.into_bytes().to_vec();
-        if bytes.len()!=len as usize || bytes.len()>max_bytes ||
+        // HEAD cannot be trusted as a true bound for an adversarial server.
+        // Count actual streamed bytes before appending each chunk. Never call
+        // ByteStream::collect() on an untrusted response.
+        let mut stream=get.body;
+        let mut bytes=Vec::with_capacity(len as usize);
+        while let Some(next)=stream.next().await {
+            let chunk=next.map_err(|_|CloudError::Unavailable)?;
+            let total=bytes.len().checked_add(chunk.len()).ok_or(CloudError::TooLarge)?;
+            if total>max_bytes || total>len as usize {
+                return Err(CloudError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len()!=len as usize ||
             *blake3::hash(&bytes).as_bytes()!=expected_blake3 {
             return Err(CloudError::Corrupt);
         }
