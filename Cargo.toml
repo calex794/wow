@@ -22,6 +22,8 @@ required-features = ["iroh-transport"]
 [features]
 default = []
 iroh-transport = ["dep:iroh", "dep:tokio"]
+# Explicit opt-in lab-only process abort injection. Never enable in product.
+causal-lab-fault = []
 
 [dependencies]
 # Pin the audited Blue W3 v2+v3 lab boundary; no transport dependencies.
@@ -46,3 +48,8 @@ tempfile = "3.12"
 noq = { git = "https://github.com/calex794/noq", rev = "2eabf9895d40c263aa3369afd66efcf4a5d95056" }
 noq-proto = { git = "https://github.com/calex794/noq", rev = "2eabf9895d40c263aa3369afd66efcf4a5d95056" }
 noq-udp = { git = "https://github.com/calex794/noq", rev = "2eabf9895d40c263aa3369afd66efcf4a5d95056" }
+
+[[bin]]
+name = "w12_causal_crash_worker"
+path = "src/bin/w12_causal_crash_worker.rs"
+required-features = ["causal-lab-fault"]
