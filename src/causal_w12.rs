@@ -139,7 +139,7 @@ impl Journal {
                 return Err(CausalError::Conflict);
             };
             if scope!=req.private_scope || actor!=req.custodian_id || seq<=0
-                || !body.starts_with(DOMAIN) || fixed32(&commitment)!=Ok(digest_of(&body,&sig))
+                || !body.starts_with(DOMAIN) || fixed32(&commitment).ok()!=Some(digest_of(&body,&sig))
             {return Err(CausalError::Conflict);}
             let sig=Signature::from_slice(&sig).map_err(|_|CausalError::Corrupt)?;
             signer.verifying_key().verify(&body,&sig)
