@@ -16,6 +16,19 @@ pub struct JointClaim {
  pub w9_seq:u64,pub w9_head:[u8;32],
  pub offer_hash:[u8;32],pub ciphertext_digest:[u8;32],
 }
+
+#[derive(Clone,Copy)]
+pub struct JointEvidence<'a> {
+ pub offer:&'a [u8],
+ pub checkpoint:&'a [u8],
+ pub w12:&'a [u8],
+}
+#[derive(Clone,Copy)]
+pub struct JointContext {
+ pub private_scope:[u8;16],
+ pub witness:[u8;16],
+ pub epoch:u64,
+}
 fn encode(c:JointClaim)->Vec<u8>{
  let mut b=DOMAIN.to_vec();
  b.extend_from_slice(&c.witness);
@@ -45,9 +58,11 @@ fn pair(
  Ok((o,cp,w))
 }
 pub fn sign_joint(
- offer:&[u8],checkpoint:&[u8],w12:&[u8],private_scope:[u8;16],
- witness:[u8;16],epoch:u64,signer:&SigningKey,trust:&TrustRegistry,
+ evidence:JointEvidence<'_>,context:JointContext,
+ signer:&SigningKey,trust:&TrustRegistry,
 )->Result<Vec<u8>,JointError>{
+ let JointEvidence{offer,checkpoint,w12}=evidence;
+ let JointContext{private_scope,witness,epoch}=context;
  if private_scope==[0;16]||epoch==0 || trust.key_for(witness,epoch).ok()!=Some(&signer.verifying_key()) {
    return Err(JointError::Untrusted)
  }
@@ -63,9 +78,11 @@ pub fn sign_joint(
  Ok(out)
 }
 pub fn verify_joint(
- joint:&[u8],offer:&[u8],checkpoint:&[u8],w12:&[u8],
- expected_scope:[u8;16],expected_witness:[u8;16],trust:&TrustRegistry,
+ joint:&[u8],evidence:JointEvidence<'_>,context:JointContext,
+ trust:&TrustRegistry,
 )->Result<JointClaim,JointError>{
+ let JointEvidence{offer,checkpoint,w12}=evidence;
+ let JointContext{private_scope:expected_scope,witness:expected_witness,epoch:expected_epoch}=context;
  if joint.len()!=W14_LEN||!joint.starts_with(DOMAIN){return Err(JointError::Invalid);}
  let mut offset=DOMAIN.len();
  let mut take=|n:usize|{let slice=&joint[offset..offset+n];offset+=n;slice};
@@ -80,7 +97,7 @@ pub fn verify_joint(
  let offer_hash:[u8;32]=take(32).try_into().map_err(|_|JointError::Invalid)?;
  let ciphertext_digest:[u8;32]=take(32).try_into().map_err(|_|JointError::Invalid)?;
  let c=JointClaim{witness,witness_epoch:epoch,private_scope:scope,custodian,w12_seq:seq,w12_digest:digest,w9_seq,w9_head,offer_hash,ciphertext_digest};
- if scope!=expected_scope||witness!=expected_witness||epoch==0{return Err(JointError::WrongLink);}
+ if scope!=expected_scope||witness!=expected_witness||epoch!=expected_epoch||epoch==0{return Err(JointError::WrongLink);}
  let key=trust.key_for(witness,epoch).map_err(|_|JointError::Untrusted)?;
  let signature=Signature::from_slice(&joint[offset..]).map_err(|_|JointError::BadSignature)?;
  key.verify(&joint[..offset],&signature).map_err(|_|JointError::BadSignature)?;
@@ -97,22 +114,22 @@ pub fn verify_joint(
 /// The actual W10 pinned W9 checkpoint MUST match the checkpoint
 /// bound into W14. An in-memory W9 response alone is insufficient.
 pub fn sign_joint_against_w10(
- offer:&[u8],checkpoint:&[u8],w12:&[u8],scope:[u8;16],
- witness:[u8;16],epoch:u64,signer:&SigningKey,trust:&TrustRegistry,
- pin:&crate::witness_pin_w10::WitnessPinStore,
+ evidence:JointEvidence<'_>,context:JointContext,signer:&SigningKey,
+ trust:&TrustRegistry,pin:&crate::witness_pin_w10::WitnessPinStore,
 )->Result<Vec<u8>,JointError>{
+ let checkpoint=evidence.checkpoint;
  let pinned=pin.current().map_err(|_|JointError::Invalid)?;
  if pinned.as_deref()!=Some(checkpoint){return Err(JointError::WrongLink);}
  pin.inspect(trust).map_err(|_|JointError::Invalid)?;
- sign_joint(offer,checkpoint,w12,scope,witness,epoch,signer,trust)
+ sign_joint(evidence,context,signer,trust)
 }
 pub fn verify_joint_against_w10(
- joint:&[u8],offer:&[u8],checkpoint:&[u8],w12:&[u8],
- scope:[u8;16],witness:[u8;16],trust:&TrustRegistry,
- pin:&crate::witness_pin_w10::WitnessPinStore,
+ joint:&[u8],evidence:JointEvidence<'_>,context:JointContext,
+ trust:&TrustRegistry,pin:&crate::witness_pin_w10::WitnessPinStore,
 )->Result<JointClaim,JointError>{
+ let checkpoint=evidence.checkpoint;
  let pinned=pin.current().map_err(|_|JointError::Invalid)?;
  if pinned.as_deref()!=Some(checkpoint){return Err(JointError::WrongLink);}
  pin.inspect(trust).map_err(|_|JointError::Invalid)?;
- verify_joint(joint,offer,checkpoint,w12,scope,witness,trust)
+ verify_joint(joint,evidence,context,trust)
 }
