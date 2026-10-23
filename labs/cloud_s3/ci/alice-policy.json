@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnlyAliceForwardUpload",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::wow-mail-lab/wow-mail/15151515151515151515151515151515/*"
+      ]
+    },
+    {
+      "Sid": "OnlyAliceExactReverseRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": [
+        "arn:aws:s3:::wow-mail-lab/wow-mail/3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d/*"
+      ]
+    }
+  ]
+}
