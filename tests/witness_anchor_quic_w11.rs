@@ -5,7 +5,7 @@
 #![cfg(feature = "iroh-transport")]
 
 use akula_wire_lab::custody_transfer_w8::{self, OfferClaims};
-use akula_wire_lab::custody_witness_w9::{self, WitnessObservation, WitnessStore, CHECKPOINT_LEN};
+use akula_wire_lab::custody_witness_w9::{WitnessObservation, WitnessStore, CHECKPOINT_LEN};
 use akula_wire_lab::trust_w3::TrustRegistry;
 use akula_wire_lab::witness_anchor_w11::{
     self, AnchorComparison, AnchorGossip, AnchorIdentity, AnchorStore,
