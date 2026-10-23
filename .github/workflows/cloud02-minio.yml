@@ -95,6 +95,24 @@ jobs:
           set -euo pipefail
           cargo test --manifest-path labs/cloud_s3/Cargo.toml \
             --test cloud05_scoped_accounts -- --ignored --nocapture --test-threads=1
+      - name: Drop real successful MinIO PUT response at TCP proxy
+        run: |
+          set -euo pipefail
+          python3 labs/cloud_s3/ci/lost_put_ack_proxy.py &
+          proxy_pid=$!
+          echo "WOW_CLOUD_PROXY_PID=$proxy_pid" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do
+            if (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud05_lost_ack -- --ignored --nocapture --test-threads=1
+      - name: Stop network fault proxy
+        if: always()
+        run: |
+          if [[ -n "${WOW_CLOUD_PROXY_PID:-}" ]]; then
+            kill "$WOW_CLOUD_PROXY_PID" 2>/dev/null || true
+          fi
       - name: Execute real conditional PUT and exact-version GET
         run: |
           set -euo pipefail
