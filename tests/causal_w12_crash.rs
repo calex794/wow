@@ -1,3 +1,4 @@
+#![cfg(feature = "causal-lab-fault")]
 //! Child process SIGABRT before and after SQLite COMMIT, parent inspects
 //! durable state. No physical power-cut/fsync guarantee or W4 is claimed.
 use std::process::Command;
