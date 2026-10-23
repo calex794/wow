@@ -66,7 +66,7 @@ VPS должен разрешать указанные SSH-перенаправ�
 ```bash
 ./target/release/w4_tunnel_lab send-new sender.keys sender.sqlite \
   'СЮДА_RECIPIENT_INVITE_С_ПК_B' 127.0.0.1:42043 \
-  'TEST MESSAGE 1KiB'
+  "$(printf '%01024d' 0)"
 ```
 
 На ПК А ожидаем строки `MESSAGE_ID=...`, `RECIPIENT_CONFIRMED ...`. На ПК Б — `RECIPIENT_COMMITTED ... new` и `W4_SENT ...`. При разрыве после `MESSAGE_ID` тот же пакет повторяется:
