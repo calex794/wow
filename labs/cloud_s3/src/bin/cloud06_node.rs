@@ -14,6 +14,11 @@ fn key(n:u8,o:u8)->CloudKey{CloudKey{namespace:[n;16],object:[o;16]}}
 fn main(){
  let args:Vec<String>=env::args().collect();
  assert_eq!(args.len(),5,"usage: cloud06_node ROLE put|read|reconcile INPUT OUTPUT");
+ if args[1]=="HASH"{
+   let data=fs::read(&args[3]).unwrap();
+   fs::write(&args[4],blake3::hash(&data).to_hex().as_bytes()).unwrap();
+   return;
+ }
  let who=&args[1];assert!(who=="ALICE"||who=="BOB");
  let mode=&args[2];
  let rt=tokio::runtime::Runtime::new().unwrap();
