@@ -1,0 +1,75 @@
+name: WOW unified verification campaign
+on:
+  pull_request:
+    paths:
+      - 'tests/campaign_fault_profiles.rs'
+      - '.github/workflows/wow-unified-campaign.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  campaign:
+    name: ${{ matrix.group }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - crypto-and-authorization-boundaries
+          - causal-and-witness-integrity
+          - sqlite-and-fault-recovery
+          - malicious-claim-profiles
+          - offline-time-safety
+          - quic-loopback
+          - scaling-and-resources
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record scenario provenance
+        run: |
+          mkdir -p campaign-results
+          echo "group=${{ matrix.group }}" > campaign-results/metadata.txt
+          echo "sha=${{ github.sha }}" >> campaign-results/metadata.txt
+          echo "runner=ubuntu-24.04; not physical cluster" >> campaign-results/metadata.txt
+      - name: Security and identity
+        if: matrix.group == 'crypto-and-authorization-boundaries'
+        run: |
+          cargo test --test campaign_fault_profiles w12_untrusted_key
+          cargo test --test campaign_fault_profiles w12_exact_ciphertext
+          echo 'LIMIT: full STORE/FETCH capability enforcement not implemented' > campaign-results/limitations.txt
+      - name: Causal/witness integrity
+        if: matrix.group == 'causal-and-witness-integrity'
+        run: |
+          cargo test --test causal_pin_w13
+          cargo test --test joint_w14
+          cargo test --test causal_w13_sqlite_rollback
+      - name: Recovery and SIGABRT
+        if: matrix.group == 'sqlite-and-fault-recovery'
+        run: |
+          cargo test --test causal_w12_crash --features causal-lab-fault
+          cargo test --test causal_w13_sqlite_rollback
+          echo 'LIMIT: no physical power cut or ENOSPC injection' > campaign-results/limitations.txt
+      - name: Signed malicious claims
+        if: matrix.group == 'malicious-claim-profiles'
+        run: cargo test --test campaign_fault_profiles w14_three_seeds -- --nocapture 2>&1 | tee campaign-results/malicious.txt
+      - name: Relative time invariants
+        if: matrix.group == 'offline-time-safety'
+        run: |
+          cargo test --test campaign_fault_profiles w12_exact_ciphertext
+          echo 'LIMIT: no RTC or verified UTC restoration' > campaign-results/limitations.txt
+      - name: QUIC tests
+        if: matrix.group == 'quic-loopback'
+        run: |
+          cargo test --features iroh-transport --lib
+          echo 'LIMIT: no physically separate machines' > campaign-results/limitations.txt
+      - name: Resource baseline
+        if: matrix.group == 'scaling-and-resources'
+        run: |
+          /usr/bin/time -f 'elapsed=%e maxrss_kb=%M' -o campaign-results/resources.txt cargo test --test campaign_fault_profiles
+          echo 'LIMIT: no 1000-node physical scale or throughput test' > campaign-results/limitations.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wow-campaign-${{ matrix.group }}
+          path: campaign-results/
+          if-no-files-found: warn
