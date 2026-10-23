@@ -37,6 +37,10 @@ impl From<WitnessError> for PinError {
 #[derive(Debug,Clone,Copy,Eq,PartialEq)]
 pub enum PinOutcome { First, Unchanged, Advanced }
 
+/// Both signed observations of a witness equivocation. Keep private.
+pub type ForkPair=(Vec<u8>,Vec<u8>);
+type StoredForkPair=(Option<Vec<u8>>,Option<Vec<u8>>);
+
 pub struct WitnessPinStore {
     db:Connection,
     witness_id:[u8;16],
@@ -142,8 +146,8 @@ impl WitnessPinStore {
             .map_err(Into::into)
     }
 
-    pub fn fork(&self)->Result<Option<(Vec<u8>,Vec<u8>)>,PinError>{
-        let pair:Option<(Option<Vec<u8>>,Option<Vec<u8>>)>=self.db.query_row(
+    pub fn fork(&self)->Result<Option<ForkPair>,PinError>{
+        let pair:Option<StoredForkPair>=self.db.query_row(
             "SELECT fork_a,fork_b FROM pinned_witness WHERE singleton=1",[],
             |r|Ok((r.get(0)?,r.get(1)?)),
         ).optional()?;
