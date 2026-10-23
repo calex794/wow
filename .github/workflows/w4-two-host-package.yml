@@ -41,15 +41,20 @@ jobs:
           cp Cargo.lock "dist/$name/"
           cp spec/W4-TWO-HOST-SSH-TUNNEL-LAB.md "dist/$name/INSTRUCTIONS.md"
           chmod 755 "dist/$name/w4_tunnel_lab"
-          printf '%s\n' "$GITHUB_SHA" > "dist/$name/SOURCE_COMMIT"
+          git rev-parse HEAD > "dist/$name/SOURCE_COMMIT"
+          printf '%s\n' "${{ github.event.pull_request.head.sha || github.sha }}" > "dist/$name/SOURCE_HEAD"
           rustc --version > "dist/$name/RUSTC_VERSION"
           (
             cd "dist/$name"
-            sha256sum w4_tunnel_lab ssh_tunnel.sh INSTRUCTIONS.md Cargo.lock SOURCE_COMMIT RUSTC_VERSION > SHA256SUMS
+            sha256sum w4_tunnel_lab ssh_tunnel.sh INSTRUCTIONS.md Cargo.lock SOURCE_COMMIT SOURCE_HEAD RUSTC_VERSION > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
           tar -C dist -czf "dist/$name.tar.gz" "$name"
-          sha256sum "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+          (
+            cd dist
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+            sha256sum --check "$name.tar.gz.sha256"
+          )
           test -s "dist/$name.tar.gz"
           echo "W4_BUNDLE_READY=$name"
           cat "dist/$name/SOURCE_COMMIT"
