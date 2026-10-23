@@ -37,13 +37,15 @@ jobs:
           mkdir -p "dist/$name"
           cp target/release/w4_tunnel_lab "dist/$name/"
           cp scripts/w4-two-host/ssh_tunnel.sh "dist/$name/"
+          test -s Cargo.lock
+          cp Cargo.lock "dist/$name/"
           cp spec/W4-TWO-HOST-SSH-TUNNEL-LAB.md "dist/$name/INSTRUCTIONS.md"
           chmod 755 "dist/$name/w4_tunnel_lab"
           printf '%s\n' "$GITHUB_SHA" > "dist/$name/SOURCE_COMMIT"
           rustc --version > "dist/$name/RUSTC_VERSION"
           (
             cd "dist/$name"
-            sha256sum w4_tunnel_lab ssh_tunnel.sh INSTRUCTIONS.md SOURCE_COMMIT RUSTC_VERSION > SHA256SUMS
+            sha256sum w4_tunnel_lab ssh_tunnel.sh INSTRUCTIONS.md Cargo.lock SOURCE_COMMIT RUSTC_VERSION > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
           tar -C dist -czf "dist/$name.tar.gz" "$name"
