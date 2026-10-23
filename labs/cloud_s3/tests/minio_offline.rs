@@ -16,7 +16,7 @@ fn object()->CloudKey {
 }
 #[test]
 #[ignore = "requires real versioning-enabled MinIO, explicit disposable credentials"]
-fn independently_authorized_receiver_reads_after_custodian_goes_offline() {
+fn separate_client_reads_after_sender_is_dropped() {
     let rt=tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let key=object();
@@ -26,7 +26,7 @@ fn independently_authorized_receiver_reads_after_custodian_goes_offline() {
             let sender=client();
             sender.put_once(key,data).await.expect("create-only upload")
         }; // the sender/custodian object is dropped here
-        let receiver=client(); // standalone receiver initialized after sender disappears
+        let receiver=client(); // separate client after sender disappears; same test credentials
         let recovered=receiver.read_exact(key,&rev,16384,original).await.unwrap();
         assert_eq!(recovered,data);
         // It cannot switch to a missing or forged version.
