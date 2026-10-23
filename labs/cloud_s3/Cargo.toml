@@ -1,0 +1,12 @@
+[package]
+name = "wow-cloud-s3-lab"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately a standalone laboratory crate: the main WOW build, QUIC,
+# W3/W4, K-credit journal, and Akula Sync do NOT depend on AWS SDK.
+[dependencies]
+akula-wire-lab = { path = "../.." }
+aws-sdk-s3 = { version = "=1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "time"] }
