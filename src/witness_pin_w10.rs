@@ -159,6 +159,7 @@ impl WitnessPinStore {
     }
 
     pub fn inspect(&self,trust:&TrustRegistry)->Result<Option<u64>,PinError>{
+        if self.frozen()? {return Err(PinError::Frozen);}
         if let Some(raw)=self.current()? {
             if raw.len()!=CHECKPOINT_LEN {return Err(PinError::MissingHistory);}
             let checked=custody_witness_w9::verify_checkpoint(
