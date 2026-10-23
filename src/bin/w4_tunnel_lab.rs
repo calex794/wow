@@ -422,3 +422,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+
+#[cfg(test)]
+mod frame_budget_tests {
+    use super::*;
+    #[test]
+    fn expired_absolute_deadline_rejects_before_allocating_any_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let expired = Instant::now() - Duration::from_millis(1);
+        let err = recv_frame(&mut server, MAX_MESSAGE_BYTES, expired).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+    #[test]
+    fn oversized_frame_prefix_is_refused_without_reading_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.write_all(&u32::MAX.to_be_bytes()).unwrap();
+        let err = recv_frame(
+            &mut server, MAX_MESSAGE_BYTES, Instant::now() + Duration::from_secs(2),
+        ).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+}
