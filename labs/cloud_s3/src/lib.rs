@@ -27,6 +27,7 @@ impl S3Lab {
     /// any sender or recipient.
     pub fn new(endpoint: &str, region: &str, bucket: &str, access: &str, secret: &str) -> Self {
         let conf = S3ConfigBuilder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(Region::new(region.to_owned()))
             .credentials_provider(Credentials::new(access, secret, None, None, "wow-cloud-lab"))
             .endpoint_url(endpoint)
