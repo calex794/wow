@@ -98,6 +98,9 @@ pub struct FetchClaims {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reservation { Reserved, AlreadyReserved, AlreadyCommitted }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreLocator { pub mailbox: [u8; 16], pub offer: [u8; 16] }
+
 fn nonzero(v: &[u8; 16]) -> bool { *v != [0; 16] }
 fn valid_policy(p: &MailboxPolicy) -> bool {
     nonzero(&p.mailbox) && nonzero(&p.issuer) && nonzero(&p.custodian)
@@ -418,10 +421,11 @@ impl Journal {
     /// the SAME SQLite IMMEDIATE transaction as W12/W3 and reservation state.
     /// The signer is the separately enrolled custodian, never the mailbox owner.
     pub fn commit_custodian_store(
-        &mut self, mailbox: [u8; 16], offer: [u8; 16], w3: &[u8],
+        &mut self, locator: StoreLocator, w3: &[u8],
         custodian_signer: &SigningKey, custodian_epoch: u64,
         trust: &TrustRegistry, now: i64,
     ) -> Result<CausalCommitment, AuthError> {
+        let StoreLocator { mailbox, offer } = locator;
         if w3.is_empty() || w3.len() > MAX_MESSAGE_BYTES { return Err(AuthError::Invalid); }
         self.ensure_custodian_mailbox_schema()?;
         self.ensure_w12_schema()?;

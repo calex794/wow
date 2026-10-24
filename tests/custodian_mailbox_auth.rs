@@ -5,7 +5,7 @@ use akula_wire_lab::{
     crypto_w3,
     custodian_mailbox::{
         sign_fetch_for_lab, sign_store_for_lab, AuthError, FetchClaims,
-        MailboxPolicy, Reservation, StoreClaims,
+        MailboxPolicy, Reservation, StoreClaims, StoreLocator,
     },
     journal_w4::Journal,
     private_route_w3,
@@ -122,12 +122,12 @@ fn authorized_store_is_atomic_idempotent_and_read_is_separately_signed() {
     assert_eq!(j.request_custodian_store(&store,&f.trust,1).unwrap(),Reservation::Reserved);
     assert_eq!(j.request_custodian_store(&store,&f.trust,1).unwrap(),Reservation::AlreadyReserved);
     let first=j.commit_custodian_store(
-        MAILBOX,f.claims.offer,&f.packet,&f.custodian,1,&f.trust,2,
+        StoreLocator { mailbox: MAILBOX, offer: f.claims.offer },&f.packet,&f.custodian,1,&f.trust,2,
     ).unwrap();
     assert_eq!(first.seq,1);
     assert_eq!(j.request_custodian_store(&store,&f.trust,2).unwrap(),Reservation::AlreadyCommitted);
     assert_eq!(j.commit_custodian_store(
-        MAILBOX,f.claims.offer,&f.packet,&f.custodian,1,&f.trust,2,
+        StoreLocator { mailbox: MAILBOX, offer: f.claims.offer },&f.packet,&f.custodian,1,&f.trust,2,
     ).unwrap(),first);
     assert_eq!(count(&path,"outbox"),1);
     assert_eq!(count(&path,"causal_w12_event"),1);
@@ -163,7 +163,7 @@ fn invalid_grants_or_foreign_mailboxes_cannot_reserve_or_commit() {
     // digest is checked against exact W3 bytes at CommitStore.
     assert_eq!(j.request_custodian_store(&another,&f.trust,1).unwrap(),Reservation::Reserved);
     assert!(matches!(
-        j.commit_custodian_store(MAILBOX,wrong.offer,&f.packet,&f.custodian,1,&f.trust,2),
+        j.commit_custodian_store(StoreLocator { mailbox: MAILBOX, offer: wrong.offer },&f.packet,&f.custodian,1,&f.trust,2),
         Err(AuthError::Conflict)
     ));
     assert_eq!(count(&path,"outbox"),0);
@@ -179,14 +179,14 @@ fn wrong_ciphertext_and_revoked_store_reject_before_w12_commit() {
     j.request_custodian_store(&f.store(),&f.trust,1).unwrap();
     let mut wrong=f.packet.clone();*wrong.last_mut().unwrap()^=1;
     assert!(matches!(j.commit_custodian_store(
-        MAILBOX,f.claims.offer,&wrong,&f.custodian,1,&f.trust,2
+        StoreLocator { mailbox: MAILBOX, offer: f.claims.offer },&wrong,&f.custodian,1,&f.trust,2
     ),Err(AuthError::Conflict)));
     assert_eq!(count(&path,"outbox"),0);
     assert_eq!(count(&path,"causal_w12_event"),0);
     assert_eq!(state(&path),0);
     j.operator_revoke_store(MAILBOX).unwrap();
     assert!(matches!(j.commit_custodian_store(
-        MAILBOX,f.claims.offer,&f.packet,&f.custodian,1,&f.trust,2
+        StoreLocator { mailbox: MAILBOX, offer: f.claims.offer },&f.packet,&f.custodian,1,&f.trust,2
     ),Err(AuthError::Unauthorized)));
     assert_eq!(count(&path,"outbox"),0);
     assert_eq!(count(&path,"causal_w12_event"),0);
@@ -201,7 +201,7 @@ fn read_revocation_is_separate_from_store_revocation() {
     let mut j=f.provision(&path);
     j.request_custodian_store(&f.store(),&f.trust,1).unwrap();
     j.commit_custodian_store(
-        MAILBOX,f.claims.offer,&f.packet,&f.custodian,1,&f.trust,2
+        StoreLocator { mailbox: MAILBOX, offer: f.claims.offer },&f.packet,&f.custodian,1,&f.trust,2
     ).unwrap();
     let read=f.read();
     let mut changed=read.clone();*changed.last_mut().unwrap()^=1;

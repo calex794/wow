@@ -102,6 +102,7 @@ impl Journal {
         &mut self, req: CausalRequest, w3: &[u8],
         signer: &SigningKey, trust: &TrustRegistry,
     ) -> Result<CausalCommitment,CausalError> {
+        Self::validate_w12_request(req,w3,signer,trust)?;
         self.ensure_w12_schema()?;
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result=Self::enqueue_w3_with_causal_tx(&tx,req,w3,signer,trust)?;
@@ -118,13 +119,10 @@ impl Journal {
         Ok(result)
     }
 
-    /// Does not begin or commit a transaction. The caller owns the SQLite
-    /// IMMEDIATE write boundary, allowing a guarded mailbox reservation and
-    /// W12 ciphertext/causal evidence to be persisted atomically.
-    pub(crate) fn enqueue_w3_with_causal_tx(
-        tx: &rusqlite::Transaction<'_>, req: CausalRequest, w3: &[u8],
-        signer: &SigningKey, trust: &TrustRegistry,
-    ) -> Result<CausalCommitment,CausalError> {
+    fn validate_w12_request(
+        req: CausalRequest, w3: &[u8], signer: &SigningKey,
+        trust: &TrustRegistry,
+    ) -> Result<(), CausalError> {
         if req.private_scope == [0;16] || req.custodian_id == [0;16]
             || req.custodian_epoch == 0 || req.custodian_epoch > i64::MAX as u64
             || req.recipient == [0;16] || req.message == [0;16]
@@ -144,6 +142,17 @@ impl Journal {
         if hint.message_id != req.message || hint.expires_at_ms != req.expiry_ms as u64 {
             return Err(CausalError::Invalid);
         }
+        Ok(())
+    }
+
+    /// Does not begin or commit a transaction. The caller owns the SQLite
+    /// IMMEDIATE write boundary, allowing a guarded mailbox reservation and
+    /// W12 ciphertext/causal evidence to be persisted atomically.
+    pub(crate) fn enqueue_w3_with_causal_tx(
+        tx: &rusqlite::Transaction<'_>, req: CausalRequest, w3: &[u8],
+        signer: &SigningKey, trust: &TrustRegistry,
+    ) -> Result<CausalCommitment,CausalError> {
+        Self::validate_w12_request(req,w3,signer,trust)?;
         let packet_hash=*blake3::hash(w3).as_bytes();
         let old:Option<(Vec<u8>,i64)>=tx.query_row(
             "SELECT digest,expiry FROM outbox WHERE recipient=?1 AND message=?2",
