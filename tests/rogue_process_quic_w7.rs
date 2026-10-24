@@ -75,7 +75,7 @@ impl Rogue {
         let hex = fields[3].as_bytes();
         assert_eq!(hex.len(), 128, "signed TLS binding must contain 64 bytes");
         let mut signature = [0u8; 64];
-        for (position, pair) in hex.chunks_exact(2).enumerate() {
+        for (position, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
             signature[position] = u8::from_str_radix(
                 std::str::from_utf8(pair).unwrap(), 16,
             ).unwrap();
