@@ -65,6 +65,7 @@ pub struct ExpectedHost<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreflightError {
     InvalidChallenge,
+    EntropyUnavailable,
     InvalidStatement,
     StaleOrFutureStatement,
     WrongChallenge,
@@ -78,6 +79,7 @@ pub enum PreflightError {
     DuplicateServiceIdentity,
     DuplicateTlsIdentity,
     DuplicateOperatorIdentity,
+    ReusedKeyAcrossRoles,
     SameClaimedFailureDomain,
 }
 
@@ -100,6 +102,18 @@ pub struct PreflightReport {
 }
 
 impl RunChallenge {
+    /// Safe default: generate a fresh unpredictable nonce on the independent
+    /// verifier, not in the custodian process. No private key is used.
+    pub fn generate(
+        issued_at_ms: u64, deadline_ms: u64,
+    ) -> Result<Self, PreflightError> {
+        let mut nonce = [0u8; 32];
+        getrandom::fill(&mut nonce).map_err(|_| PreflightError::EntropyUnavailable)?;
+        let challenge = Self { nonce, issued_at_ms, deadline_ms };
+        challenge.validate(issued_at_ms)?;
+        Ok(challenge)
+    }
+
     pub fn validate(&self, now_ms: u64) -> Result<(), PreflightError> {
         if self.nonce == [0; 32] || self.issued_at_ms == 0
             || self.issued_at_ms > i64::MAX as u64
@@ -164,6 +178,9 @@ pub fn sign_for_lab(
     operator_signer: &SigningKey,
 ) -> Result<SignedHostStatement, PreflightError> {
     structural_validation(&statement)?;
+    if service_signer.verifying_key() == operator_signer.verifying_key() {
+        return Err(PreflightError::ReusedKeyAcrossRoles);
+    }
     Ok(SignedHostStatement {
         statement,
         service_signature: service_signer.sign(
@@ -210,6 +227,9 @@ fn verify_one(
         &signed_input(OPERATOR_DOMAIN, s),
         &Signature::from_bytes(&signed.operator_signature),
     ).map_err(|_| PreflightError::InvalidOperatorSignature)?;
+    if key == expected.pinned_operator_key {
+        return Err(PreflightError::ReusedKeyAcrossRoles);
+    }
     Ok(*key)
 }
 
@@ -236,6 +256,11 @@ pub fn verify_pair(
         || first_expected.pinned_operator_key == second_expected.pinned_operator_key
     {
         return Err(PreflightError::DuplicateOperatorIdentity);
+    }
+    if first_key == *second_expected.pinned_operator_key
+        || second_key == *first_expected.pinned_operator_key
+    {
+        return Err(PreflightError::ReusedKeyAcrossRoles);
     }
     if first.statement.claimed_failure_domain == second.statement.claimed_failure_domain {
         return Err(PreflightError::SameClaimedFailureDomain);
