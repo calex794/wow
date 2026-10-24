@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{tempdir, TempDir};
 const BIN: &str = env!("CARGO_BIN_EXE_w7_interhost_lab");
 
@@ -86,7 +86,7 @@ impl Host {
         assert_eq!(fields.len(),4,"unexpected server startup output {line:?}");
         assert_eq!(fields[0],"READY");
         let id=fields[1].parse().unwrap();
-        let addr=fields[2].parse().unwrap();
+        let addr: SocketAddr = fields[2].parse().unwrap();
         assert!(addr.ip().is_loopback());
         Self {process,id,addr,binding:fields[3].into(),service,epoch}
     }
