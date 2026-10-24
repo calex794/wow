@@ -88,7 +88,29 @@ for _ in $(seq 1 100); do
 done
 curl --fail --silent --max-time 2 http://127.0.0.1:9000/minio/health/live >/dev/null
 actor bob verify-duplicate
+# The return ciphertext is persisted and fsynced before cloud publication.
+# Kill Bob after preparing it, then ensure the identical bytes survive.
+docker run -d --name wow-cloud07-prepared --network "$net" --read-only \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --user "$(id -u):$(id -g)" -v "$binary:/opt/actor:ro" \
+  -v "$b:/state:rw" \
+  -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+  -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+  -e WOW_MINIO_ENDPOINT=http://wow-cloud02-minio:9000 \
+  -e WOW_MINIO_BUCKET="$WOW_MINIO_BUCKET" \
+  -e WOW_SELF_ACCESS="$WOW_BOB_ACCESS" -e WOW_SELF_SECRET="$WOW_BOB_SECRET" \
+  ubuntu:24.04 /opt/actor bob prepare-pause >/dev/null
+for _ in $(seq 1 100); do
+  if test -f "$b/envelope_prepared.marker"; then break; fi
+  sleep 0.1
+done
+test -f "$b/envelope_prepared.marker"
+docker kill wow-cloud07-prepared >/dev/null
+docker rm wow-cloud07-prepared >/dev/null
+actor bob prepare-check
+cp "$b/return.envelope" "$RUNNER_TEMP/cloud07_saved_w4"
 actor bob resume
+cmp "$b/return.envelope" "$RUNNER_TEMP/cloud07_saved_w4"
 cp "$b/return.meta" "$a/return.meta"
 actor alice reject-corrupt
 actor alice confirm
