@@ -13,18 +13,19 @@
 //! FORGED_W4 [4]                   => [3,forged W4 bytes] or [255]
 //! Frames are test-only; no invitation, real RelayGrant or W4 return privacy.
 use akula_wire_lab::custody_receipt_w6;
+use akula_wire_lab::custodian_w7_quic_lab::{endpoint_binding_message, LAB_W7_ALPN};
 use akula_wire_lab::mailbox_w5::{Mailbox, MailboxLimits};
 use akula_wire_lab::private_route_w3;
 use akula_wire_lab::receipt_w4;
 use akula_wire_lab::MAX_MESSAGE_BYTES;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use iroh::{Endpoint, EndpointId, endpoint::presets, endpoint::Connection};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-const ALPN: &[u8] = b"akula-wow/w7-hostile-custodian-local-only/1";
+const ALPN: &[u8] = LAB_W7_ALPN;
 const AUDIT_CAP: [u8; 16] = [22; 16];
 const RECIPIENT_CAP: [u8; 16] = [23; 16];
 const MAX_REQUEST: usize = MAX_MESSAGE_BYTES + 64;
@@ -220,7 +221,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket: SocketAddr = endpoint.bound_sockets().into_iter()
         .find(|addr| addr.is_ipv4() && addr.ip().is_loopback())
         .ok_or("missing loopback socket")?;
-    println!("READY {} {}", endpoint.id(), socket);
+    // Bind the independently pinned service Ed25519 identity to this
+    // ephemeral QUIC/TLS identity. A malicious C can still sign lies, but
+    // cannot pretend the response came from an unrelated pinned C key.
+    let signed_binding = signer.sign(&endpoint_binding_message(id(13), 7, &endpoint.id()));
+    let signature_hex: String = signed_binding.to_bytes().iter()
+        .map(|b| format!("{b:02x}")).collect();
+    println!("READY {} {} {}", endpoint.id(), socket, signature_hex);
     io::stdout().flush()?;
     while let Some(incoming) = endpoint.accept().await {
         match incoming.await {
