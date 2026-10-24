@@ -159,7 +159,8 @@ fn respond(
             // test server. The request chooses neither trust root nor scope.
             let mut issuers = TrustRegistry::new();
             issuers.enroll(id(9), 4,
-                SigningKey::from_bytes(&[9; 32]).verifying_key())?;
+                SigningKey::from_bytes(&[9; 32]).verifying_key())
+                .expect("deterministic fixture issuer enrollment");
             // Verify the grant BEFORE looking up the mailbox. Otherwise an
             // unauthenticated caller could distinguish "no W3" from a valid
             // stored W3 using error differences (existence metadata oracle).
