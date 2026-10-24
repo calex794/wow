@@ -24,7 +24,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
-use wow_cloud_s3_lab::S3Lab;
+use wow_cloud_s3_lab::{signed_pin::{self, Direction, PinScope, VerifiedPin}, S3Lab};
 
 const MSG: [u8; 16] = [5; 16];
 const ALICE_ID: [u8; 16] = [9; 16];
@@ -96,30 +96,55 @@ fn forward_key() -> CloudKey {
 fn return_key() -> CloudKey {
     CloudKey { namespace: [61; 16], object: [108; 16] }
 }
-fn write_meta(name: &str, rev: CloudRevision, ciphertext: &[u8]) {
-    let CloudRevision::S3VersionId(v) = rev else {
-        panic!("CLOUD-07 requires MinIO bucket versioning");
-    };
-    assert!(!v.is_empty() && v != "null" && !v.contains('\n'));
-    let manifest = format!("{}\n{}\n", v, blake3::hash(ciphertext).to_hex());
-    fs::write(state(name), manifest).unwrap();
-}
-fn read_meta(name: &str) -> (CloudRevision, [u8; 32]) {
-    let raw = fs::read_to_string(state(name)).unwrap();
-    let mut lines = raw.lines();
-    let version = lines.next().unwrap().to_owned();
-    let hex = lines.next().unwrap();
-    assert!(lines.next().is_none() && hex.len() == 64);
-    assert!(!version.is_empty() && version != "null" && version.len() <= 128);
-    let mut digest = [0u8; 32];
-    for (i, b) in digest.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+// Signed exact-version locators replace the old unauthenticated .meta files.
+// The keys in peer.sign are pre-pinned by the CI test harness. Production
+// needs an authenticated contact-enrollment and revocation protocol.
+fn forward_scope() -> PinScope {
+    PinScope {
+        direction: Direction::ForwardW3, key: forward_key(),
+        recipient: BOB_ID, message: MSG, expires_at_ms: EXPIRY,
     }
-    (CloudRevision::S3VersionId(version), digest)
 }
-async fn read_exact(name: &str, key: CloudKey) -> Vec<u8> {
-    let (version, digest) = read_meta(name);
-    store().read_exact(key, &version, 16_384, digest).await.unwrap()
+fn return_scope() -> PinScope {
+    PinScope {
+        direction: Direction::ReturnW4, key: return_key(),
+        recipient: ALICE_ID, message: MSG, expires_at_ms: EXPIRY,
+    }
+}
+fn issue_pin(name: &str, scope: PinScope, version: &CloudRevision, bytes: &[u8]) {
+    let signed = signed_pin::issue(&signing(), scope, version, bytes).unwrap();
+    secret_write(&state(name), &signed);
+}
+fn verify_pin(name: &str, scope: PinScope, signer: &VerifyingKey) -> VerifiedPin {
+    let bytes = fs::read(state(name)).unwrap();
+    signed_pin::verify(&bytes, signer, scope, NOW + 5).unwrap()
+}
+async fn read_signed(name: &str, scope: PinScope, signer: &VerifyingKey) -> Vec<u8> {
+    let verified = verify_pin(name, scope, signer);
+    store().read_exact(scope.key, &verified.revision, verified.length, verified.digest)
+        .await.unwrap()
+}
+fn verify_adversarial_pin(role: &str) {
+    let (name, scope) = if role == "bob" {
+        ("forward.pin", forward_scope())
+    } else {
+        ("return.pin", return_scope())
+    };
+    let raw = fs::read(state(name)).unwrap();
+    let signer = public_sign("peer.sign");
+    assert!(signed_pin::verify(&raw, &signer, scope, NOW + 5).is_ok());
+    let mut forged = raw.clone();
+    let middle = forged.len() / 2;
+    forged[middle] ^= 1;
+    assert!(signed_pin::verify(&forged, &signer, scope, NOW + 5).is_err());
+    let mut wrong = scope;
+    wrong.direction = if role == "bob" { Direction::ReturnW4 } else { Direction::ForwardW3 };
+    assert!(signed_pin::verify(&raw, &signer, wrong, NOW + 5).is_err());
+    wrong = scope;
+    wrong.message = [88; 16];
+    assert!(signed_pin::verify(&raw, &signer, wrong, NOW + 5).is_err());
+    assert!(signed_pin::verify(&raw, &signer, scope, EXPIRY).is_err());
+    assert!(signed_pin::verify(&raw, &public_sign("public.sign"), scope, NOW + 5).is_err());
 }
 
 async fn alice_send() {
@@ -135,10 +160,12 @@ async fn alice_send() {
                    Insert::New);
     }
     let revision = store().put_once(forward_key(), &signed).await.unwrap();
-    write_meta("forward.meta", revision, &signed);
+    issue_pin("forward.pin", forward_scope(), &revision, &signed);
 }
 
-async fn bob_wire() -> Vec<u8> { read_exact("forward.meta", forward_key()).await }
+async fn bob_wire() -> Vec<u8> {
+    read_signed("forward.pin", forward_scope(), &public_sign("peer.sign")).await
+}
 
 fn bob_authenticate(packet: &[u8]) {
     let secret = secret_hpke();
@@ -193,7 +220,7 @@ fn bob_verify_durable_offline() {
     let bob = Journal::open(&state("journal.sqlite")).unwrap();
     let receipt = bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().unwrap();
     assert!(!receipt.is_empty());
-    assert!(!state("return.meta").exists(),
+    assert!(!state("return.pin").exists(),
            "receipt must not be marked remotely published during outage");
 }
 
@@ -259,7 +286,7 @@ fn bob_prepare_check() {
     let original = fs::read(state("return.envelope")).unwrap();
     assert!(!original.is_empty());
     assert_eq!(original, bob_prepared_envelope());
-    assert!(!state("return.meta").exists());
+    assert!(!state("return.pin").exists());
     let bob = Journal::open(&state("journal.sqlite")).unwrap();
     assert!(bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().is_some());
 }
@@ -270,7 +297,7 @@ fn bob_prepare_check() {
 async fn bob_resume() {
     let encrypted = bob_prepared_envelope();
     let rev = store().put_once(return_key(), &encrypted).await.unwrap();
-    write_meta("return.meta", rev, &encrypted);
+    issue_pin("return.pin", return_scope(), &rev, &encrypted);
 }
 
 /// Bob's write-only account sees an ambiguous failed HTTP response.
@@ -284,7 +311,7 @@ async fn bob_lost_ack() {
     );
     let err = proxied.put_once(return_key(), &encrypted).await.unwrap_err();
     assert_eq!(err, akula_wire_lab::cloud_mail_store::CloudError::Ambiguous);
-    assert!(!state("return.meta").exists());
+    assert!(!state("return.pin").exists());
     marker("ambiguous_upload.marker");
 }
 
@@ -294,15 +321,20 @@ async fn bob_lost_ack() {
 async fn alice_reconcile_return() {
     let opaque = fs::read(state("return.envelope")).unwrap();
     let pin = store().reconcile_unknown_put(return_key(), &opaque).await.unwrap();
-    write_meta("return.meta", pin, &opaque);
+    // Alice can only read W4, not upload it; her signed recovery proof
+    // tells Bob the exact version observed without sharing any S3 secret.
+    issue_pin("return.proof", return_scope(), &pin, &opaque);
 }
 
 /// Bob confirms a pin supplied by the authorized reader, without any second PUT.
 fn bob_accept_return_pin() {
     let bytes = fs::read(state("return.envelope")).unwrap();
-    let (_, digest) = read_meta("return.meta");
-    assert_eq!(digest, *blake3::hash(&bytes).as_bytes());
+    let verified = verify_pin("return.proof", return_scope(), &public_sign("peer.sign"));
+    assert_eq!(verified.length, bytes.len());
+    assert_eq!(verified.digest, *blake3::hash(&bytes).as_bytes());
     assert!(state("ambiguous_upload.marker").exists());
+    // Bob, the sender of the W4 ciphertext, authenticates its final locator.
+    issue_pin("return.pin", return_scope(), &verified.revision, &bytes);
 }
 
 fn alice_verify_pending_offline() {
@@ -318,7 +350,7 @@ fn invitation<'a>(secret: &'a RecipientSecret, registry: &'a TrustRegistry)
     }
 }
 async fn alice_confirm(tampered: bool) {
-    let mut reply = read_exact("return.meta", return_key()).await;
+    let mut reply = read_signed("return.pin", return_scope(), &public_sign("peer.sign")).await;
     let secret = secret_hpke();
     let registry = trust("alice");
     let mut alice = Journal::open(&state("journal.sqlite")).unwrap();
@@ -357,6 +389,8 @@ fn main() {
             ("alice", "assert-final") => alice_assert_final(),
             ("bob", "precommit-pause") => bob_precommit_pause().await,
             ("bob", "check-none") => bob_check_none(),
+            ("bob", "pin-negative") => verify_adversarial_pin("bob"),
+            ("alice", "pin-negative") => verify_adversarial_pin("alice"),
             ("bob", "commit-pause") => bob_commit_pause().await,
             ("bob", "offline-receipt") => bob_verify_durable_offline(),
             ("bob", "verify-duplicate") => bob_verify_duplicate().await,
