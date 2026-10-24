@@ -19,6 +19,11 @@ name = "w7_rogue_custodian"
 path = "src/bin/w7_rogue_custodian.rs"
 required-features = ["iroh-transport"]
 
+[[bin]]
+name = "w7_interhost_lab"
+path = "src/bin/w7_interhost_lab.rs"
+required-features = ["iroh-transport"]
+
 [features]
 default = []
 iroh-transport = ["dep:iroh", "dep:tokio"]
