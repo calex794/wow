@@ -203,9 +203,13 @@ async fn audit_and_record_granted_over_alpn(
     payload.push(5); // AUDIT_WITH_GRANT: never STORE, FETCH or W4.
     payload.extend_from_slice(request.signed_grant);
     audit_frame(
-        store, ctx, request.client, request.address,
-        request.expected_pinned_endpoint, request.trusted_reference,
-        &payload, alpn,
+        store, ctx, request.trusted_reference, &payload,
+        AuditTransport {
+            client: request.client,
+            address: request.address,
+            pinned_endpoint: request.expected_pinned_endpoint,
+            alpn,
+        },
     ).await
 }
 
@@ -224,27 +228,36 @@ pub async fn audit_and_record(
     wire[0] = 2; // Legacy W7 lab AUDIT with private 16-byte capability.
     wire[1..].copy_from_slice(&request.audit_cap);
     audit_frame(
-        store, ctx, request.client, request.address,
-        request.expected_pinned_endpoint, request.trusted_reference,
-        &wire, LAB_W7_ALPN,
+        store, ctx, request.trusted_reference, &wire,
+        AuditTransport {
+            client: request.client,
+            address: request.address,
+            pinned_endpoint: request.expected_pinned_endpoint,
+            alpn: LAB_W7_ALPN,
+        },
     ).await
+}
+
+struct AuditTransport<'a> {
+    client: &'a Endpoint,
+    address: EndpointAddr,
+    pinned_endpoint: EndpointId,
+    alpn: &'a [u8],
 }
 
 async fn audit_frame(
     store: &mut LocalObservationStore,
     ctx: &LocalEvidenceContext<'_>,
-    client: &Endpoint,
-    address: EndpointAddr,
-    pinned_endpoint: EndpointId,
     reference: &AuditReference,
-    payload: &[u8], alpn: &[u8],
+    payload: &[u8],
+    transport: AuditTransport<'_>,
 ) -> Result<LabAuditOutcome, LabAuditError> {
     let connection = tokio::time::timeout(
         Duration::from_secs(10),
-        client.connect(address, alpn),
+        transport.client.connect(transport.address, transport.alpn),
     ).await.map_err(|_| LabAuditError::TransportUnknown)?
         .map_err(|_| LabAuditError::TransportUnknown)?;
-    if connection.remote_id() != pinned_endpoint {
+    if connection.remote_id() != transport.pinned_endpoint {
         connection.close(0u32.into(), b"pinned endpoint mismatch");
         return Err(LabAuditError::WrongEndpoint);
     }
