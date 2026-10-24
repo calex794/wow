@@ -266,7 +266,34 @@ impl LocalObservationStore {
                 UNIQUE(service_key,service_epoch,role,observer_key,operation_alias,kind)
              );
              CREATE INDEX IF NOT EXISTS custodian_service_event_v0_window
-             ON custodian_service_event_v0(service_key,service_epoch,role,observed_at_ms);"
+             ON custodian_service_event_v0(service_key,service_epoch,role,observed_at_ms);
+             -- Only verified bridge events enter the trusted metrics. Proofs
+             -- and operations are deduplicated across all observer aliases.
+             CREATE TABLE IF NOT EXISTS custodian_verified_event_v0(
+                service_key BLOB NOT NULL CHECK(length(service_key)=32),
+                service_epoch INTEGER NOT NULL CHECK(service_epoch>0),
+                role INTEGER NOT NULL CHECK(role BETWEEN 1 AND 3),
+                kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 17),
+                proof_key BLOB NOT NULL CHECK(length(proof_key)=32),
+                operation_alias BLOB NOT NULL CHECK(length(operation_alias)=16),
+                observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>0),
+                PRIMARY KEY(service_key,service_epoch,role,kind,proof_key),
+                UNIQUE(service_key,service_epoch,role,kind,operation_alias)
+             );
+             CREATE INDEX IF NOT EXISTS custodian_verified_event_v0_window
+             ON custodian_verified_event_v0(service_key,service_epoch,role,observed_at_ms);
+             -- W10 is a separately verified chain anchor, never a metric of
+             -- custodian storage, fetch success, or recipient W4 delivery.
+             CREATE TABLE IF NOT EXISTS custodian_w10_anchor_v0(
+                service_key BLOB NOT NULL CHECK(length(service_key)=32),
+                service_epoch INTEGER NOT NULL CHECK(service_epoch>0),
+                role INTEGER NOT NULL CHECK(role BETWEEN 1 AND 3),
+                witness_id BLOB NOT NULL CHECK(length(witness_id)=16),
+                witness_epoch INTEGER NOT NULL CHECK(witness_epoch>0),
+                sequence INTEGER NOT NULL CHECK(sequence>0),
+                checkpoint_digest BLOB NOT NULL CHECK(length(checkpoint_digest)=32),
+                PRIMARY KEY(service_key,service_epoch,role,witness_id,witness_epoch)
+             );"
         )?;
         Ok(Self { db })
     }
@@ -274,12 +301,49 @@ impl LocalObservationStore {
     /// Durable and idempotent local append. The journal never silently deletes
     /// incident evidence. This is not a public remotely writable API.
     pub fn record(&mut self, event: ServiceEvent) -> Result<AppendResult, ObservationError> {
+        self.record_inner(event, None)
+    }
+
+    /// Privileged local ingestion from the cryptographic W7/W8/W9 bridge.
+    /// A public raw record() can NEVER retroactively become a verified event.
+    pub(crate) fn record_verified(
+        &mut self, event: ServiceEvent, proof_key: [u8; 32],
+    ) -> Result<AppendResult, ObservationError> {
+        if proof_key == [0; 32] { return Err(ObservationError::Invalid); }
+        self.record_inner(event, Some(proof_key))
+    }
+
+    fn record_inner(
+        &mut self, event: ServiceEvent, proof_key: Option<[u8; 32]>,
+    ) -> Result<AppendResult, ObservationError> {
         event.validate()?;
         let hash = event.commitment();
         let role = event.scope.role as i64;
         let epoch = event.scope.epoch as i64;
         let seq = event.event_seq as i64;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(proof) = proof_key {
+            // The exact signed proof or W7 daily-bucket commitment may be
+            // presented by 100 different claimed observers; count it once.
+            let exists: Option<i64> = tx.query_row(
+                "SELECT 1 FROM custodian_verified_event_v0
+                 WHERE service_key=?1 AND service_epoch=?2 AND role=?3
+                   AND kind=?4 AND proof_key=?5",
+                params![event.scope.service_key.as_slice(), epoch, role,
+                        event.kind as i64, proof.as_slice()],
+                |row| row.get(0),
+            ).optional()?;
+            if exists.is_some() { return Ok(AppendResult::ExactReplay); }
+            let same_operation: Option<i64> = tx.query_row(
+                "SELECT 1 FROM custodian_verified_event_v0
+                 WHERE service_key=?1 AND service_epoch=?2 AND role=?3
+                   AND kind=?4 AND operation_alias=?5",
+                params![event.scope.service_key.as_slice(), epoch, role,
+                        event.kind as i64, event.operation_alias.as_slice()],
+                |row| row.get(0),
+            ).optional()?;
+            if same_operation.is_some() { return Err(ObservationError::Conflict); }
+        }
         let prior: Option<Vec<u8>> = tx.query_row(
             "SELECT event_hash FROM custodian_service_event_v0
              WHERE service_key=?1 AND service_epoch=?2 AND role=?3
@@ -289,7 +353,8 @@ impl LocalObservationStore {
             |row| row.get(0),
         ).optional()?;
         if let Some(existing) = prior {
-            return if existing.as_slice() == hash.as_slice() {
+            // A raw claim must never be upgraded to verified retrospectively.
+            return if proof_key.is_none() && existing.as_slice() == hash.as_slice() {
                 Ok(AppendResult::ExactReplay)
             } else {
                 Err(ObservationError::Conflict)
@@ -323,24 +388,57 @@ impl LocalObservationStore {
                     event.evidence_digest.as_ref().map(|d| d.as_slice()),
                     hash.as_slice()],
         )?;
+        if let Some(proof) = proof_key {
+            tx.execute(
+                "INSERT INTO custodian_verified_event_v0
+                 (service_key,service_epoch,role,kind,proof_key,
+                  operation_alias,observed_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![event.scope.service_key.as_slice(), epoch, role,
+                        event.kind as i64, proof.as_slice(),
+                        event.operation_alias.as_slice(), event.observed_at_ms as i64],
+            )?;
+        }
         tx.commit()?;
         Ok(AppendResult::Stored)
     }
 
     /// Local observation windows, not globally agreed UTC or uptime.
     /// Fail closed if the caller's clock appears to have moved backward.
+    /// The legacy/raw lab tally, including caller-claimed evidence. Never use
+    /// this report alone to rank untrusted custodians or issue rights.
     pub fn report(&self, scope: ServiceScope, now_ms: u64)
+        -> Result<ServiceReport, ObservationError>
+    {
+        self.aggregate(scope, now_ms, false)
+    }
+
+    /// Only events accepted by the verifying W7/W8/W9 bridge are counted.
+    /// These are still local observations/claims, NOT a global reputation or
+    /// proof of independent fault domains, uptime, or future W3 retention.
+    pub fn verified_report(&self, scope: ServiceScope, now_ms: u64)
+        -> Result<ServiceReport, ObservationError>
+    {
+        self.aggregate(scope, now_ms, true)
+    }
+
+    fn aggregate(&self, scope: ServiceScope, now_ms: u64, verified: bool)
         -> Result<ServiceReport, ObservationError>
     {
         if scope.service_key == [0; 32] || scope.epoch == 0
             || scope.epoch > i64::MAX as u64 || now_ms == 0
             || now_ms > i64::MAX as u64
         { return Err(ObservationError::Invalid); }
-        let mut stmt = self.db.prepare(
+        let sql = if verified {
+            "SELECT kind,observed_at_ms FROM custodian_verified_event_v0
+             WHERE service_key=?1 AND service_epoch=?2 AND role=?3
+             ORDER BY observed_at_ms"
+        } else {
             "SELECT kind,observed_at_ms FROM custodian_service_event_v0
              WHERE service_key=?1 AND service_epoch=?2 AND role=?3
              ORDER BY observed_at_ms"
-        )?;
+        };
+        let mut stmt = self.db.prepare(sql)?;
         let mut rows = stmt.query(params![
             scope.service_key.as_slice(), scope.epoch as i64, scope.role as i64
         ])?;
@@ -361,5 +459,57 @@ impl LocalObservationStore {
             }
         }
         Ok(report)
+    }
+
+    /// Remember a W10-verified private pin, without converting a witness
+    /// checkpoint into evidence of custodian availability/delivery.
+    pub(crate) fn store_witness_anchor(
+        &mut self, scope: ServiceScope, witness_id: [u8; 16],
+        witness_epoch: u64, sequence: u64, checkpoint_digest: [u8; 32],
+    ) -> Result<AppendResult, ObservationError> {
+        if scope.service_key == [0; 32] || scope.epoch == 0
+            || scope.epoch > i64::MAX as u64 || witness_id == [0; 16]
+            || witness_epoch == 0 || witness_epoch > i64::MAX as u64
+            || sequence == 0 || sequence > i64::MAX as u64
+            || checkpoint_digest == [0; 32]
+        { return Err(ObservationError::Invalid); }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<(i64, Vec<u8>)> = tx.query_row(
+            "SELECT sequence,checkpoint_digest FROM custodian_w10_anchor_v0
+             WHERE service_key=?1 AND service_epoch=?2 AND role=?3
+               AND witness_id=?4 AND witness_epoch=?5",
+            params![scope.service_key.as_slice(), scope.epoch as i64, scope.role as i64,
+                    witness_id.as_slice(), witness_epoch as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((old_seq, old_digest)) = previous {
+            if sequence < old_seq as u64 { return Err(ObservationError::Conflict); }
+            if sequence == old_seq as u64 {
+                return if old_digest.as_slice() == checkpoint_digest.as_slice() {
+                    Ok(AppendResult::ExactReplay)
+                } else {
+                    Err(ObservationError::Conflict)
+                };
+            }
+            tx.execute(
+                "UPDATE custodian_w10_anchor_v0 SET sequence=?6,checkpoint_digest=?7
+                 WHERE service_key=?1 AND service_epoch=?2 AND role=?3
+                   AND witness_id=?4 AND witness_epoch=?5",
+                params![scope.service_key.as_slice(), scope.epoch as i64, scope.role as i64,
+                        witness_id.as_slice(), witness_epoch as i64,
+                        sequence as i64, checkpoint_digest.as_slice()],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO custodian_w10_anchor_v0
+                 (service_key,service_epoch,role,witness_id,witness_epoch,sequence,checkpoint_digest)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![scope.service_key.as_slice(), scope.epoch as i64, scope.role as i64,
+                        witness_id.as_slice(), witness_epoch as i64,
+                        sequence as i64, checkpoint_digest.as_slice()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(AppendResult::Stored)
     }
 }
