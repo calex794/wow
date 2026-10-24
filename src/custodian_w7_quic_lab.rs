@@ -6,8 +6,8 @@
 //! A custodian signature is a claim of endpoint ownership, NOT evidence of
 //! independent hosts, honest disk retention, delivery or recipient W4.
 //! All network errors and malformed replies remain unknown, not accusations.
-use crate::custodian_evidence_bridge::LocalEvidenceContext;
-use crate::custodian_observation::{AppendResult, LocalObservationStore, ObservationError};
+use crate::custodian_evidence_bridge::{BridgeError, LocalEvidenceContext};
+use crate::custodian_observation::{AppendResult, LocalObservationStore};
 use crate::custody_audit_w7::{AuditError, AuditReference};
 use crate::trust_w3::TrustRegistry;
 use ed25519_dalek::Signature;
@@ -46,10 +46,10 @@ pub enum LabAuditError {
     WrongEndpoint,
     TransportUnknown,
     MalformedResponse,
-    Observation(ObservationError),
+    Bridge(BridgeError),
 }
-impl From<ObservationError> for LabAuditError {
-    fn from(value: ObservationError) -> Self { Self::Observation(value) }
+impl From<BridgeError> for LabAuditError {
+    fn from(value: BridgeError) -> Self { Self::Bridge(value) }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,8 +148,7 @@ pub async fn audit_and_record(
                 Some(bytes), ctx.observed_at_ms(),
             ) {
                 Ok(observed) => Ok(LabAuditOutcome::ExactBytes(
-                    store.record_w7_exact(ctx, &observed)
-                        .map_err(|_| LabAuditError::MalformedResponse)?,
+                    store.record_w7_exact(ctx, &observed)?,
                 )),
                 Err(AuditError::WrongLength | AuditError::WrongCiphertext) => {
                     Ok(LabAuditOutcome::UnattributedMismatch)
