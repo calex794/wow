@@ -113,7 +113,12 @@ impl Journal {
         // misidentified / malformed W3 bytes. No W3 sender authority inferred.
         let hint=private_route_w3::inspect_route(w3)
             .map_err(|_|CausalError::Invalid)?;
-        if hint.message_id != req.message { return Err(CausalError::Invalid); }
+        // A W12/v0 claim signs exact W3 bytes, not a separate retention lease.
+        // Keep the local retry deadline identical to the W3 header included
+        // in those bytes; never silently commit a different expiry policy.
+        if hint.message_id != req.message || hint.expires_at_ms != req.expiry_ms as u64 {
+            return Err(CausalError::Invalid);
+        }
         let packet_hash=*blake3::hash(w3).as_bytes();
         self.ensure_w12_schema()?;
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -240,6 +245,8 @@ impl Journal {
                 custodian_epoch:epoch as u64,
                 recipient:recipient.as_slice().try_into().map_err(|_|CausalError::Corrupt)?,
                 message:message.as_slice().try_into().map_err(|_|CausalError::Corrupt)?,
+                // W12/v0 signed bytes intentionally omit expiry. The effective
+                // local outbox expiry is checked against the stored W3 below.
                 expiry_ms:1,
             };
             if bytes(req,seq as u64,&prev,&fixed32(&packet_hash)?)!=signed_body {
@@ -252,13 +259,23 @@ impl Journal {
             if fixed32(&commitment)? != digest_of(&signed_body,&signature){
                 return Err(CausalError::Corrupt);
             }
-            let packet:Option<(Vec<u8>,Vec<u8>)>=self.db.query_row(
-                "SELECT packet,digest FROM outbox WHERE recipient=?1 AND message=?2",
+            let packet:Option<(Vec<u8>,Vec<u8>,i64)>=self.db.query_row(
+                "SELECT packet,digest,expiry FROM outbox WHERE recipient=?1 AND message=?2",
                 params![recipient.as_slice(),message.as_slice()],
                 |r|Ok((r.get(0)?,r.get(1)?)),
             ).optional()?;
-            let Some((packet,dbhash))=packet else {return Err(CausalError::Corrupt)};
+            let Some((packet,dbhash,local_expiry))=packet else {return Err(CausalError::Corrupt)};
             if dbhash!=packet_hash || blake3::hash(&packet).as_bytes()!=packet_hash.as_slice() {
+                return Err(CausalError::Corrupt);
+            }
+            // A valid W12 signature alone does not protect outbox.expiry.
+            // Audit the effective retry deadline against the unchanged
+            // original W3 header, already covered by the signed digest.
+            let hint=private_route_w3::inspect_route(&packet)
+                .map_err(|_|CausalError::Corrupt)?;
+            if local_expiry<=0 || hint.expires_at_ms!=local_expiry as u64
+                || hint.message_id.as_slice()!=message.as_slice()
+            {
                 return Err(CausalError::Corrupt);
             }
             prev=fixed32(&commitment)?;
