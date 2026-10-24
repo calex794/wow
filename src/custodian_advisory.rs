@@ -143,6 +143,7 @@ fn eligibility(c: &Candidate, intent: &StoreIntent, trust: &TrustRegistry)
     -> Result<ServiceScope, GateReason>
 {
     if c.service_id == [0; 16] || c.service_epoch == 0
+        || c.service_epoch > i64::MAX as u64
         || trust.key_for(c.service_id, c.service_epoch).is_err()
     { return Err(GateReason::UntrustedOrRevokedKey); }
     if c.role != intent.role { return Err(GateReason::WrongRole); }
@@ -255,8 +256,11 @@ pub fn recommend(
             }
         };
         let tier = if matches!(quality, Some(Quality {
-            evidence: EvidenceClass::RepeatedLocalObservation, ..
-        })) {
+            evidence: EvidenceClass::RepeatedLocalObservation,
+            storage_wilson_last_7d: Some(bound), ..
+        }) if bound >= 0.5) {
+            // Four verified failures across two windows must NOT outrank an
+            // untested custodian merely because the evidence is abundant.
             AdvisoryTier::LocallyObserved
         } else {
             AdvisoryTier::Probation
