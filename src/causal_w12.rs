@@ -64,7 +64,7 @@ fn fixed32(v: &[u8]) -> Result<[u8;32],CausalError> {
     v.try_into().map_err(|_|CausalError::Corrupt)
 }
 impl Journal {
-    fn ensure_w12_schema(&self) -> Result<(),CausalError> {
+    pub(crate) fn ensure_w12_schema(&self) -> Result<(),CausalError> {
         self.db.execute_batch(
             "CREATE TABLE IF NOT EXISTS causal_w12_event(
                private_scope BLOB NOT NULL CHECK(length(private_scope)=16),
@@ -96,8 +96,33 @@ impl Journal {
     /// Caller first validates *separate* rights to accept/store under
     /// private_scope. The returned commitment is available only after durable
     /// local SQLite commit, and never impersonates recipient's W4.
+    /// LOW-LEVEL laboratory primitive: caller must authorize mailbox STORE.
+    /// Networked custodians must instead use the guarded reserved-store API.
     pub fn enqueue_w3_with_causal(
         &mut self, req: CausalRequest, w3: &[u8],
+        signer: &SigningKey, trust: &TrustRegistry,
+    ) -> Result<CausalCommitment,CausalError> {
+        self.ensure_w12_schema()?;
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result=Self::enqueue_w3_with_causal_tx(&tx,req,w3,signer,trust)?;
+        // Abort around the ACTUAL W12 transaction, not a reconstructed clone.
+        #[cfg(feature="causal-lab-fault")]
+        if std::env::var_os("LABO_W12_ABORT_BEFORE_COMMIT").is_some() {
+            std::process::abort();
+        }
+        tx.commit()?;
+        #[cfg(feature="causal-lab-fault")]
+        if std::env::var_os("LABO_W12_ABORT_AFTER_COMMIT").is_some() {
+            std::process::abort();
+        }
+        Ok(result)
+    }
+
+    /// Does not begin or commit a transaction. The caller owns the SQLite
+    /// IMMEDIATE write boundary, allowing a guarded mailbox reservation and
+    /// W12 ciphertext/causal evidence to be persisted atomically.
+    pub(crate) fn enqueue_w3_with_causal_tx(
+        tx: &rusqlite::Transaction<'_>, req: CausalRequest, w3: &[u8],
         signer: &SigningKey, trust: &TrustRegistry,
     ) -> Result<CausalCommitment,CausalError> {
         if req.private_scope == [0;16] || req.custodian_id == [0;16]
@@ -120,8 +145,6 @@ impl Journal {
             return Err(CausalError::Invalid);
         }
         let packet_hash=*blake3::hash(w3).as_bytes();
-        self.ensure_w12_schema()?;
-        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old:Option<(Vec<u8>,i64)>=tx.query_row(
             "SELECT digest,expiry FROM outbox WHERE recipient=?1 AND message=?2",
             params![req.recipient.as_slice(),req.message.as_slice()],
@@ -149,7 +172,6 @@ impl Journal {
             let sig=Signature::from_slice(&sig).map_err(|_|CausalError::Corrupt)?;
             signer.verifying_key().verify(&body,&sig)
                 .map_err(|_|CausalError::Corrupt)?;
-            tx.commit()?;
             return Ok(CausalCommitment{seq:seq as u64,digest:fixed32(&commitment)?});
         }
 
@@ -193,18 +215,6 @@ impl Journal {
                 seq,commitment.as_slice()],
         )?;
 
-        // Intentionally crash the ACTUAL production-shaped transaction,
-        // not a separate SQL reimplementation; only available to opt-in lab
-        // feature and never a product build.
-        #[cfg(feature="causal-lab-fault")]
-        if std::env::var_os("LABO_W12_ABORT_BEFORE_COMMIT").is_some() {
-            std::process::abort();
-        }
-        tx.commit()?;
-        #[cfg(feature="causal-lab-fault")]
-        if std::env::var_os("LABO_W12_ABORT_AFTER_COMMIT").is_some() {
-            std::process::abort();
-        }
         Ok(CausalCommitment{seq:seq as u64,digest:commitment})
     }
 
