@@ -14,6 +14,10 @@
 //! Frames are test-only; no invitation, real RelayGrant or W4 return privacy.
 use akula_wire_lab::custody_receipt_w6;
 use akula_wire_lab::custodian_w7_quic_lab::{endpoint_binding_message, LAB_W7_ALPN};
+use akula_wire_lab::custodian_audit_grant_w7::{
+    verify_for_audit, AuditGrantExpectation, SIGNED_AUDIT_GRANT_LEN,
+};
+use akula_wire_lab::trust_w3::TrustRegistry;
 use akula_wire_lab::mailbox_w5::{Mailbox, MailboxLimits};
 use akula_wire_lab::private_route_w3;
 use akula_wire_lab::receipt_w4;
@@ -29,10 +33,11 @@ const ALPN: &[u8] = LAB_W7_ALPN;
 const AUDIT_CAP: [u8; 16] = [22; 16];
 const RECIPIENT_CAP: [u8; 16] = [23; 16];
 const MAX_REQUEST: usize = MAX_MESSAGE_BYTES + 64;
+const LAB_TRUSTED_TIME_MS: u64 = 100_010;
 fn id(n: u8) -> [u8; 16] { [n; 16] }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode { Fake, Delete, Censor, Honest, Corrupt, DropAck }
+enum Mode { Fake, Delete, Censor, Honest, Corrupt, DropAck, Grant }
 impl FromStr for Mode {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -43,6 +48,7 @@ impl FromStr for Mode {
             "honest" => Ok(Self::Honest),
             "corrupt" => Ok(Self::Corrupt),
             "drop-ack" => Ok(Self::DropAck),
+            "grant" => Ok(Self::Grant),
             _ => Err("invalid laboratory mode"),
         }
     }
@@ -130,11 +136,14 @@ fn respond(
     remote: EndpointId,
     packet: &[u8],
     signer: &SigningKey,
+    local_endpoint: EndpointId,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if packet.is_empty() { return Ok(vec![255]); }
     match packet[0] {
         1 if remote == config.sender => store(config, signer, packet),
-        2 if remote == config.auditor && packet.get(1..) == Some(AUDIT_CAP.as_slice()) => {
+        2 if config.mode != Mode::Grant
+            && remote == config.auditor
+            && packet.get(1..) == Some(AUDIT_CAP.as_slice()) => {
             if let Some(mut bytes) = read_stored(&config.db) {
                 if config.mode == Mode::Corrupt {
                     if let Some(last) = bytes.last_mut() { *last ^= 1; }
@@ -143,6 +152,34 @@ fn respond(
                 result.extend_from_slice(&bytes);
                 Ok(result)
             } else { Ok(vec![0]) }
+        }
+        5 if config.mode == Mode::Grant && remote == config.auditor
+            && packet.len() == SIGNED_AUDIT_GRANT_LEN + 1 => {
+            // The issuer's Ed25519 root is independently pinned by the
+            // test server. The request chooses neither trust root nor scope.
+            let mut issuers = TrustRegistry::new();
+            issuers.enroll(id(9), 4,
+                SigningKey::from_bytes(&[9; 32]).verifying_key())?;
+            let Some(bytes) = read_stored(&config.db) else {
+                return Ok(vec![0]);
+            };
+            let expected = AuditGrantExpectation {
+                issuer_id: id(9),
+                service_id: id(13), service_epoch: 7,
+                service_endpoint: local_endpoint,
+                auditor_endpoint: config.auditor,
+                route_token: id(4), message_id: id(5),
+                ciphertext_len: bytes.len() as u32,
+                ciphertext_digest: *blake3::hash(&bytes).as_bytes(),
+            };
+            if verify_for_audit(
+                &packet[1..], expected, &issuers, LAB_TRUSTED_TIME_MS
+            ).is_err() {
+                return Ok(vec![255]);
+            }
+            let mut result = vec![2];
+            result.extend_from_slice(&bytes);
+            Ok(result)
         }
         3 if remote == config.recipient && packet.get(1..) == Some(RECIPIENT_CAP.as_slice()) => {
             if config.mode == Mode::Censor {
@@ -174,6 +211,7 @@ async fn serve_connection(
     connection: Connection,
     config: &Config,
     signer: &SigningKey,
+    local_endpoint: EndpointId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let remote = connection.remote_id();
     let (mut send, mut recv) = tokio::time::timeout(
@@ -184,7 +222,7 @@ async fn serve_connection(
         std::time::Duration::from_secs(5),
         recv.read_to_end(MAX_REQUEST),
     ).await??;
-    let response = respond(config, remote, &packet, signer)?;
+    let response = respond(config, remote, &packet, signer, local_endpoint)?;
     if !response.is_empty() {
         send.write_all(&response).await?;
     }
@@ -232,7 +270,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(incoming) = endpoint.accept().await {
         match incoming.await {
             Ok(connection) => {
-                if let Err(error) = serve_connection(connection, &config, &signer).await {
+                if let Err(error) = serve_connection(
+                    connection, &config, &signer, endpoint.id(),
+                ).await {
                     eprintln!("w7 rogue test connection error: {error}");
                 }
             }
