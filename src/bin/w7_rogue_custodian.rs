@@ -160,22 +160,38 @@ fn respond(
             let mut issuers = TrustRegistry::new();
             issuers.enroll(id(9), 4,
                 SigningKey::from_bytes(&[9; 32]).verifying_key())?;
-            let Some(bytes) = read_stored(&config.db) else {
-                return Ok(vec![0]);
-            };
+            // Verify the grant BEFORE looking up the mailbox. Otherwise an
+            // unauthenticated caller could distinguish "no W3" from a valid
+            // stored W3 using error differences (existence metadata oracle).
+            // Scope/digest/length are fixed by the signed issuer grant, then
+            // exact bytes are independently matched against local storage.
+            let claims = &packet[1..];
+            let ciphertext_len = u32::from_be_bytes(
+                claims[145..149].try_into().expect("exact grant length"),
+            );
+            let ciphertext_digest: [u8; 32] = claims[149..181]
+                .try_into().expect("exact grant length");
             let expected = AuditGrantExpectation {
                 issuer_id: id(9),
                 service_id: id(13), service_epoch: 7,
                 service_endpoint: local_endpoint,
                 auditor_endpoint: config.auditor,
                 route_token: id(4), message_id: id(5),
-                ciphertext_len: bytes.len() as u32,
-                ciphertext_digest: *blake3::hash(&bytes).as_bytes(),
+                ciphertext_len, ciphertext_digest,
             };
             if verify_for_audit(
-                &packet[1..], expected, &issuers, LAB_TRUSTED_TIME_MS
+                claims, expected, &issuers, LAB_TRUSTED_TIME_MS
             ).is_err() {
                 return Ok(vec![255]);
+            }
+            let Some(bytes) = read_stored(&config.db) else {
+                return Ok(vec![0]);
+            };
+            if bytes.len() != ciphertext_len as usize
+                || *blake3::hash(&bytes).as_bytes() != ciphertext_digest
+            {
+                // A valid token cannot make this server return the wrong W3.
+                return Ok(vec![0]);
             }
             let mut result = vec![2];
             result.extend_from_slice(&bytes);
