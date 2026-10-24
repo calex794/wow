@@ -4,12 +4,19 @@
 This tests a genuine network-level lost ACK *after* server-side commit.
 Never deploy this helper in production; loopback addresses are intentional.
 """
+import os
 import socket
 import socketserver
 import threading
 
-UPSTREAM = ("127.0.0.1", 9000)
-LISTEN = ("127.0.0.1", 9001)
+# No arbitrary upstream addresses are accepted. The second mode is used
+# solely by the isolated CI Docker network, never an externally exposed port.
+if os.environ.get("WOW_PROXY_DOCKER_LAB") == "1":
+    UPSTREAM = ("wow-cloud02-minio", 9000)
+    LISTEN = ("0.0.0.0", 9001)
+else:
+    UPSTREAM = ("127.0.0.1", 9000)
+    LISTEN = ("127.0.0.1", 9001)
 CHUNK = 65536
 HEADER_LIMIT = 65536
 

@@ -34,6 +34,7 @@ jobs:
           set -euo pipefail
           cargo test --manifest-path labs/cloud_s3/Cargo.toml --all-targets --no-run
           cargo clippy --manifest-path labs/cloud_s3/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml --lib
       - name: Start disposable single-node MinIO
         run: |
           set -euo pipefail
@@ -123,6 +124,31 @@ jobs:
           set -euo pipefail
           cargo build --manifest-path labs/cloud_s3/Cargo.toml --bin cloud06_node
           bash labs/cloud_s3/ci/cloud06_isolated_containers.sh
+      - name: CLOUD-07 authenticated W3/W4 isolated crash recovery
+        env:
+          WOW_ALICE_ACCESS: wow_alice_ci
+          WOW_ALICE_SECRET: wow_alice_disposable_pass_20261023
+          WOW_BOB_ACCESS: wow_bob_ci
+          WOW_BOB_SECRET: wow_bob_disposable_pass_20261023
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path labs/cloud_s3/Cargo.toml --bin cloud07_actor
+          bash labs/cloud_s3/ci/cloud07_crash_recovery.sh
+      - name: CLOUD-07 audit single W4 revision after lost ACK
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud07_version_audit -- --ignored --nocapture --test-threads=1
+      - name: CLOUD-08 discover signed control pin using only MinIO
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud08_s3_control -- --ignored --nocapture --test-threads=1
+      - name: CLOUD-08 encrypted signed control discovery
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud08_sealed_control -- --ignored --nocapture --test-threads=1
       - name: Execute real conditional PUT and exact-version GET
         run: |
           set -euo pipefail
