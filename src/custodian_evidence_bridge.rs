@@ -18,6 +18,7 @@ use ed25519_dalek::SigningKey;
 
 const W7_DOMAIN: &[u8] = b"WOW/Custodian/P02/W7/scoped-day-bucket/v0\0";
 const W8_DOMAIN: &[u8] = b"WOW/Custodian/P02/W8/signed-ack/v0\0";
+const W8_SLOT_DOMAIN: &[u8] = b"WOW/Custodian/P02/W8/issuer-slot/v0\0";
 const W9_DOMAIN: &[u8] = b"WOW/Custodian/P02/W9/issuer-slot-fork/v0\0";
 const W10_DOMAIN: &[u8] = b"WOW/Custodian/P02/W10/pinned-checkpoint/v0\0";
 const DAY_MS: u64 = 86_400_000;
@@ -169,9 +170,15 @@ impl LocalObservationStore {
             || accepted.offer_digest != *blake3::hash(offer).as_bytes()
         { return Err(BridgeError::ScopeMismatch); }
         let proof = scoped_hash(W8_DOMAIN, ctx.scope, acceptance);
+        // One source-issued C-slot is one logical custody operation even if
+        // a malicious issuer signs another offer_id for the same slot.
+        let mut slot_binding = [0; 32];
+        slot_binding[..16].copy_from_slice(&accepted.source_id);
+        slot_binding[16..].copy_from_slice(&accepted.slot_alias);
+        let slot_key = scoped_hash(W8_SLOT_DOMAIN, ctx.scope, &slot_binding);
         let event = ctx.event(
             EventKind::HandoffAccepted, EvidenceLevel::SignedExchange,
-            accepted.offer_id, accepted.slot_alias, proof,
+            alias(slot_key), accepted.slot_alias, proof,
         );
         Ok(self.record_verified(event, proof)?)
     }
