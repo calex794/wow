@@ -22,6 +22,7 @@ pub mod causal_w12;
 pub mod causal_pin_w13;
 pub mod custody_witness_w9;
 pub mod witness_pin_w10;
+pub mod cloud_mail_store;
 pub mod receipt_w4;
 pub mod private_return_w4;
 pub mod sim_w5;
