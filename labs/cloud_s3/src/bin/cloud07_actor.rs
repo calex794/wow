@@ -77,7 +77,7 @@ fn init() {
     fs::write(state("public.sign"), sign.verifying_key().to_bytes()).unwrap();
     let (hpke_secret, hpke_public) = new_recipient();
     secret_write(&state("private.hpke"), hpke_secret.to_bytes().as_ref());
-    fs::write(state("public.hpke"), hpke_public.to_bytes().as_ref()).unwrap();
+    fs::write(state("public.hpke"), hpke_public.to_bytes().as_slice()).unwrap();
 }
 
 fn store() -> S3Lab {
