@@ -1,8 +1,8 @@
-pub mod signed_pin;
 //! CLOUD-02: S3-compatible laboratory adapter. Not production credentials,
 //! signed grants, W4, custody transfer, or a version-independent data store.
 //! The bucket must have S3 VERSIONING ENABLED before test execution.
 //! Offline custodian read is tested with an independently instantiated client.
+pub mod signed_pin;
 use akula_wire_lab::cloud_mail_store::{CloudKey, CloudRevision, CloudError, MAX_CLOUD_MAIL_BYTES};
 use aws_sdk_s3::{Client, config::{retry::RetryConfig, Builder as S3ConfigBuilder, Credentials, Region}, primitives::ByteStream};
 
