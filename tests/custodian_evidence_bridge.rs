@@ -4,7 +4,7 @@
 use akula_wire_lab::crypto_identity_w3::SignedHeader;
 use akula_wire_lab::crypto_w3::new_recipient;
 use akula_wire_lab::custodian_evidence_bridge::{
-    BridgeError, LocalEvidenceContext,
+    BridgeError, LocalEvidenceContext, ServiceIdentity,
 };
 use akula_wire_lab::custodian_observation::{
     AppendResult, EvidenceLevel, EventKind, LocalObservationStore,
@@ -44,8 +44,8 @@ fn ctx<'a>(
     seq: u64, observed_at: u64, trust: &TrustRegistry,
 ) -> LocalEvidenceContext<'a> {
     LocalEvidenceContext::bind(
-        id(node), epoch, ServiceRole::Public, owner, seq,
-        id(90), observed_at, trust,
+        ServiceIdentity { id: id(node), epoch, role: ServiceRole::Public },
+        owner, seq, id(90), observed_at, trust,
     ).unwrap()
 }
 fn packet() -> Vec<u8> {
