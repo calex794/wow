@@ -1,5 +1,12 @@
 name: WOW CLOUD-02 standalone MinIO laboratory
 on:
+  # A green PR check alone does not validate the final merge commit.
+  # Re-run the complete MinIO/SQLite fault matrix on changes to main.
+  push:
+    branches: [main]
+    paths:
+      - 'labs/cloud_s3/**'
+      - '.github/workflows/cloud02-minio.yml'
   pull_request:
     paths:
       - 'labs/cloud_s3/**'
@@ -10,7 +17,8 @@ permissions:
   contents: read
 concurrency:
   group: wow-cloud02-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Supersede stale PR builds, never discard validation of a merged main SHA.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   minio:
