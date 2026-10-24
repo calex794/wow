@@ -273,7 +273,9 @@ pub fn recommend(
             service_id: candidate.service_id,
             service_epoch: candidate.service_epoch,
             gate, tier, quality, failure_domain: candidate.failure_domain,
-            suggested_new_store_ceiling: ceiling.min(candidate.max_new_stores),
+            suggested_new_store_ceiling: ceiling.min(
+                candidate.max_new_stores.saturating_sub(candidate.pending_new_stores)
+            ),
         });
     }
 
