@@ -294,6 +294,23 @@ fn a_claimed_asn_or_same_operator_is_not_independent_for_critical_mail() {
     assert_eq!(r.assessments[0].gate, Ok(()));
 }
 #[test]
+fn suggested_probation_quota_counts_existing_pending_assignments() {
+    let (_dir, evidence) = store();
+    let t = trust();
+    let mut c = candidate(12, 2);
+    c.max_new_stores = 2;
+    c.pending_new_stores = 1;
+    let r = recommend(&evidence, &t, intent(), &[c]).unwrap();
+    assert_eq!(r.assessments[0].suggested_new_store_ceiling, 1);
+    assert_eq!(r.assessments[0].gate, Ok(()));
+    c.pending_new_stores = 2;
+    let r = recommend(&evidence, &t, intent(), &[c]).unwrap();
+    assert_eq!(r.assessments[0].gate, Err(GateReason::NewStoreQuotaExhausted));
+    assert_eq!(r.assessments[0].suggested_new_store_ceiling, 0);
+    assert!(r.suggestion_indices.is_empty());
+}
+
+#[test]
 fn advisory_is_deterministic_read_only_and_restart_safe() {
     let (dir, evidence) = store();
     let path = dir.path().join("evidence.sqlite");
