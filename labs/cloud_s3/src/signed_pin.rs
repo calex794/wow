@@ -218,7 +218,7 @@ mod tests {
         );
         assert_eq!(
             verify(&encoded[..encoded.len() - 1], &signer.verifying_key(), scope(), 100),
-            Err(CloudError::InvalidGrant),
+            Err(CloudError::Corrupt),
         );
     }
 }
