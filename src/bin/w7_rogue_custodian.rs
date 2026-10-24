@@ -67,6 +67,9 @@ fn mail_error(error: impl std::fmt::Debug) -> io::Error {
 }
 
 fn read_stored(db: &Path) -> Option<Vec<u8>> {
+    // A read-only AUDIT of an absent mailbox must not create new SQLite
+    // state. Authorization is already checked before entering this helper.
+    if !db.is_file() { return None; }
     let mailbox = Mailbox::open(db, MailboxLimits::default()).ok()?;
     mailbox.get_page(id(4), 101, None, 1).ok()?.into_iter()
         .find(|msg| msg.id == id(5))
