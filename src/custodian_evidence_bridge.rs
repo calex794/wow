@@ -44,6 +44,14 @@ impl From<PinError> for BridgeError {
     fn from(value: PinError) -> Self { Self::Pin(value) }
 }
 
+/// Local binding of a service's pinned Ed25519 identity and role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceIdentity {
+    pub id: [u8; 16],
+    pub epoch: u64,
+    pub role: ServiceRole,
+}
+
 /// This context is created by the *local* authorized observer, never from
 /// untrusted packet metadata. A pinned key in TrustRegistry identifies a
 /// service; it does not by itself prove a current authenticated QUIC session.
@@ -58,11 +66,11 @@ pub struct LocalEvidenceContext<'a> {
 }
 impl<'a> LocalEvidenceContext<'a> {
     pub fn bind(
-        service_id: [u8; 16], epoch: u64, role: ServiceRole,
-        observer: &'a SigningKey, event_seq: u64,
-        session_nonce: [u8; 16], observed_at_ms: u64,
-        trust: &TrustRegistry,
+        service: ServiceIdentity, observer: &'a SigningKey,
+        event_seq: u64, session_nonce: [u8; 16],
+        observed_at_ms: u64, trust: &TrustRegistry,
     ) -> Result<Self, BridgeError> {
+        let ServiceIdentity { id: service_id, epoch, role } = service;
         if service_id == [0; 16] || epoch == 0 || epoch > i64::MAX as u64
             || event_seq == 0 || event_seq > i64::MAX as u64
             || session_nonce == [0; 16] || observed_at_ms == 0
