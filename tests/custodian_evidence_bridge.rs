@@ -337,3 +337,77 @@ fn one_hundred_fake_e4_reporters_cannot_inflate_the_verified_report() {
         1
     );
 }
+
+#[test]
+fn adversarial_child() {
+    let Some(root) = std::env::var_os("WOW_CUSTODIAN_P02_ATTACK_DIR") else {
+        return;
+    };
+    let folder = std::path::PathBuf::from(root);
+    // Deliberately altered bytes from an isolated OS process. The child
+    // cannot create a verified local event or forge the target signature.
+    let mut packet = std::fs::read(folder.join("w3.bin")).unwrap();
+    packet[0] ^= 1;
+    std::fs::write(folder.join("forged_w3.bin"), packet).unwrap();
+    let mut ack = std::fs::read(folder.join("signed_ack.bin")).unwrap();
+    let last = ack.len() - 1;
+    ack[last] ^= 1;
+    std::fs::write(folder.join("forged_ack.bin"), ack).unwrap();
+}
+
+#[test]
+fn independent_attacker_process_cannot_turn_corruption_into_a_verified_event() {
+    let folder = tempdir().unwrap();
+    let trusted = registry();
+    let w3 = packet();
+    let offer = signed_offer(&w3, 12, 55, 66);
+    let custodian_key = signer(12);
+    let mut receiver = PeerCustodyStore::open(&folder.path().join("peer.db")).unwrap();
+    let valid_ack = receiver.accept(
+        &offer, &w3, PeerConsent {
+            expected_source: id(11), target_id: id(12), target_epoch: 2,
+            signer: &custodian_key, trust: &trusted, now_ms: NOW as i64,
+        },
+    ).unwrap();
+    std::fs::write(folder.path().join("w3.bin"), &w3).unwrap();
+    std::fs::write(folder.path().join("signed_ack.bin"), &valid_ack).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("adversarial_child")
+        .env("WOW_CUSTODIAN_P02_ATTACK_DIR", folder.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the independent attacker process must complete");
+    let corrupted_w3 = std::fs::read(folder.path().join("forged_w3.bin")).unwrap();
+    let corrupted_ack = std::fs::read(folder.path().join("forged_ack.bin")).unwrap();
+
+    let reference = AuditReference::from_trusted_ciphertext(&w3).unwrap();
+    assert!(matches!(
+        reference.observe(Some(&corrupted_w3), NOW),
+        Err(AuditError::WrongCiphertext)
+    ));
+    let owner = signer(30);
+    let bound = ctx(12, 2, &owner, 1, NOW, &trusted);
+    let mut store = LocalObservationStore::open(
+        &folder.path().join("observer.db"),
+    ).unwrap();
+    assert!(matches!(
+        store.record_w8_acceptance(&bound, &offer, &corrupted_ack, &trusted),
+        Err(BridgeError::Transfer(_))
+    ));
+    let untouched = store.verified_report(bound.scope(), NOW).unwrap();
+    assert_eq!(untouched.last_24h.storage.eligible, 0);
+    assert_eq!(untouched.last_24h.handoff.eligible, 0);
+    assert_eq!(untouched.last_24h.checkpoint_conflicts, 0);
+    // An attacker cannot poison the local journal so that the same legitimate
+    // signed acceptance later fails.
+    assert_eq!(
+        store.record_w8_acceptance(&bound, &offer, &valid_ack, &trusted).unwrap(),
+        AppendResult::Stored
+    );
+    assert_eq!(
+        store.verified_report(bound.scope(), NOW).unwrap()
+            .last_24h.handoff.successes,
+        1
+    );
+}
