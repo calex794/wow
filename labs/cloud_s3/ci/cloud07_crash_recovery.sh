@@ -35,7 +35,8 @@ cp "$b/public.sign" "$a/peer.sign"
 cp "$a/public.hpke" "$b/peer.hpke"
 cp "$b/public.hpke" "$a/peer.hpke"
 actor alice send
-cp "$a/forward.meta" "$b/forward.meta"
+cp "$a/forward.pin" "$b/forward.pin"
+actor bob pin-negative
 # Actual process is killed BEFORE SQLite commit: no W4 survives.
 docker run -d --name wow-cloud07-pre --network "$net" --read-only \
   --cap-drop ALL --security-opt no-new-privileges \
@@ -79,7 +80,7 @@ docker pause wow-cloud02-minio >/dev/null
 actor bob offline-receipt
 actor alice verify-pending
 # Confirm that network loss did not accidentally produce a remote receipt.
-test ! -e "$b/return.meta"
+test ! -e "$b/return.pin"
 docker unpause wow-cloud02-minio >/dev/null
 # The endpoint must be responsive before replay; readiness is not publication.
 for _ in $(seq 1 100); do
@@ -125,8 +126,10 @@ docker stop wow-cloud07-proxy >/dev/null
 # return prefix; the test conductor passes opaque bytes, not credentials.
 cp "$b/return.envelope" "$a/return.envelope"
 actor alice reconcile-return
-cp "$a/return.meta" "$b/return.meta"
+cp "$a/return.proof" "$b/return.proof"
 actor bob accept-pin
+cp "$b/return.pin" "$a/return.pin"
+actor alice pin-negative
 cmp "$b/return.envelope" "$RUNNER_TEMP/cloud07_saved_w4"
 actor alice reject-corrupt
 actor alice confirm
