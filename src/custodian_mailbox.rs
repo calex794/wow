@@ -419,7 +419,8 @@ impl Journal {
     /// The signer is the separately enrolled custodian, never the mailbox owner.
     pub fn commit_custodian_store(
         &mut self, mailbox: [u8; 16], offer: [u8; 16], w3: &[u8],
-        custodian_signer: &SigningKey, trust: &TrustRegistry, now: i64,
+        custodian_signer: &SigningKey, custodian_epoch: u64,
+        trust: &TrustRegistry, now: i64,
     ) -> Result<CausalCommitment, AuthError> {
         if w3.is_empty() || w3.len() > MAX_MESSAGE_BYTES { return Err(AuthError::Invalid); }
         self.ensure_custodian_mailbox_schema()?;
@@ -442,17 +443,14 @@ impl Journal {
         let req = CausalRequest {
             private_scope: claims.scope,
             custodian_id: claims.custodian,
-            custodian_epoch: policy.policy.issuer_epoch.min(i64::MAX as u64),
+            custodian_epoch,
             recipient: claims.recipient,
             message: claims.message,
             expiry_ms: claims.expires_at,
         };
-        // Custodian signing epoch is a separate trust identity from owner
-        // grant epoch. Do not treat the issuer's epoch as custodian's epoch.
-        let req = CausalRequest {
-            custodian_epoch: trust_epoch_custodian(trust, claims.custodian, custodian_signer)?,
-            ..req
-        };
+        // Custodian identity and epoch are separate from owner STORE authority.
+        trust.verify(claims.custodian, custodian_epoch, &custodian_signer.verifying_key())
+            .map_err(|_|AuthError::Unauthorized)?;
         let result = Self::enqueue_w3_with_causal_tx(
             &tx, req, w3, custodian_signer, trust,
         )?;
@@ -490,7 +488,7 @@ impl Journal {
             return Ok(None);
         };
         let (original, _) = decode_store(&original_grant).map_err(|_|AuthError::Corrupt)?;
-        if original.digest != claims.digest || dbhash.as_slice() != claims.digest
+        if original.digest != claims.digest || dbhash.as_slice() != claims.digest.as_slice()
             || blake3::hash(&packet).as_bytes() != &claims.digest
             || expiry != original.expires_at
         { return Err(AuthError::Corrupt); }
@@ -504,15 +502,3 @@ impl Journal {
     }
 }
 
-/// TrustRegistry intentionally does not export an epoch-enumeration API.
-/// The caller must bind the custodian signature to exactly one pinned epoch.
-/// The lab currently requires the custodian to be enrolled at epoch 1;
-/// future transport/operator integration must supply a separately checked
-/// custodian epoch, not infer it from a mailbox issuer.
-fn trust_epoch_custodian(
-    trust: &TrustRegistry, custodian: [u8; 16], signer: &SigningKey,
-) -> Result<u64, AuthError> {
-    trust.verify(custodian, 1, &signer.verifying_key())
-        .map_err(|_|AuthError::Unauthorized)?;
-    Ok(1)
-}
