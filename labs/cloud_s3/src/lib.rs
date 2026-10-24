@@ -100,6 +100,53 @@ impl S3Lab {
             .presigned(config).await.map_err(|_| CloudError::Unavailable)?;
         Ok(grant.uri().to_owned())
     }
+    /// Bounded discovery for a *known, preauthorized* control-object key.
+    /// Results are UNTRUSTED until an independent trusted signing key verifies
+    /// the Ed25519 locator. Only used for small control objects in CLOUD-08
+    /// and ciphertext observation after an ambiguous W4 upload. This does not
+    /// prevent rollback by an untrusted S3 provider.
+    pub async fn discover_control(
+        &self, key: CloudKey, max_bytes: usize,
+    ) -> Result<(CloudRevision, Vec<u8>), CloudError> {
+        if max_bytes == 0 || max_bytes > MAX_CLOUD_MAIL_BYTES {
+            return Err(CloudError::TooLarge);
+        }
+        let path = object_key(key);
+        let head = self.client.head_object().bucket(&self.bucket)
+            .key(&path).send().await.map_err(|_| CloudError::Unavailable)?;
+        let len = head.content_length().unwrap_or(-1);
+        if len <= 0 || len > max_bytes as i64 {
+            return Err(CloudError::TooLarge);
+        }
+        let version = head.version_id().ok_or(CloudError::InvalidRevision)?;
+        if version.is_empty() || version == "null" || version.len() > 128 ||
+            !version.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        {
+            return Err(CloudError::InvalidRevision);
+        }
+        let revision = CloudRevision::S3VersionId(version.to_owned());
+        let response = self.client.get_object().bucket(&self.bucket)
+            .key(&path).version_id(version).send().await
+            .map_err(|_| CloudError::Unavailable)?;
+        if response.content_length() != Some(len) {
+            return Err(CloudError::Corrupt);
+        }
+        let mut data = Vec::with_capacity(len as usize);
+        let mut body = response.body;
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk.map_err(|_| CloudError::Unavailable)?;
+            let n = data.len().checked_add(bytes.len()).ok_or(CloudError::TooLarge)?;
+            if n > max_bytes || n > len as usize {
+                return Err(CloudError::TooLarge);
+            }
+            data.extend_from_slice(&bytes);
+        }
+        if data.len() != len as usize {
+            return Err(CloudError::Corrupt);
+        }
+        Ok((revision, data))
+    }
+
     /// A pinned version is necessary; NEVER silently fetch latest.
     /// A HEAD size bound is followed by a per-chunk bounded stream. This still
     /// does NOT authorize the caller or pin a trusted remote endpoint.
