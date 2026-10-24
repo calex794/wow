@@ -171,6 +171,29 @@ fn signed_w8_acceptance_is_bound_to_exact_offer_scope_and_single_slot() {
     assert_eq!(report.last_24h.handoff.successes, 1);
     assert_eq!(report.last_24h.storage.eligible, 0);
     assert_eq!(report.last_24h.recipient_w4_observations, 0);
+    // Two independent SQLite databases can both sign valid receipts for
+    // conflicting offers on one issuer-slot. This is NOT two handoffs.
+    let second_offer = signed_offer(&w3, 12, 55, 67);
+    let mut cloned_peer = PeerCustodyStore::open(
+        &folder.path().join("cloned_custodian.db"),
+    ).unwrap();
+    let second_ack = cloned_peer.accept(
+        &second_offer, &w3, PeerConsent {
+            expected_source: id(11), target_id: id(12), target_epoch: 2,
+            signer: &custodian_key, trust: &trusted, now_ms: NOW as i64,
+        },
+    ).unwrap();
+    let fork_reporter = signer(32);
+    let fork_ctx = ctx(12, 2, &fork_reporter, 4, NOW, &trusted);
+    assert!(matches!(
+        store.record_w8_acceptance(&fork_ctx, &second_offer, &second_ack, &trusted),
+        Err(BridgeError::Observation(ObservationError::Conflict))
+    ));
+    assert_eq!(
+        store.verified_report(context.scope(), NOW).unwrap()
+            .last_24h.handoff.eligible,
+        1
+    );
     let wrong_service = ctx(13, 3, &owner, 3, NOW, &trusted);
     assert!(matches!(
         store.record_w8_acceptance(&wrong_service, &offer, &ack, &trusted),
