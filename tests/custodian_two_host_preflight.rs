@@ -194,6 +194,35 @@ fn revoked_service_and_wrong_epoch_fail_instead_of_demoting() {
         Err(PreflightError::UntrustedOrRevokedService));
 }
 #[test]
+fn service_and_operator_must_not_share_keys_within_or_across_hosts() {
+    let a = statement(1);
+    assert_eq!(sign_for_lab(a, &key(11), &key(11)),
+        Err(PreflightError::ReusedKeyAcrossRoles));
+    let s1 = signed(1);
+    let mut second = statement(2);
+    second.operator_id = id(32);
+    let s2 = sign_for_lab(second, &key(12), &key(11)).unwrap();
+    let op1 = key(31).verifying_key();
+    let cross_role = key(11).verifying_key();
+    assert_eq!(verify_pair(challenge(), NOW, &s1, &s2,
+        &expected(1, &op1), &expected(2, &cross_role), &trusted()),
+        Err(PreflightError::ReusedKeyAcrossRoles));
+    // A separately pinned signing key is required even if a claimed
+    // independent operator uses a brand-new label.
+}
+
+#[test]
+fn verifier_generates_fresh_nonzero_challenges_from_system_csprng() {
+    let a = RunChallenge::generate(1_000, 10_000).unwrap();
+    let b = RunChallenge::generate(1_000, 10_000).unwrap();
+    assert_ne!(a.nonce, [0; 32]);
+    assert_ne!(a.nonce, b.nonce);
+    assert_eq!(a.validate(5_000), Ok(()));
+    assert_eq!(RunChallenge::generate(1_000, 1_000 + 700_000),
+        Err(PreflightError::InvalidChallenge));
+}
+
+#[test]
 fn invalid_nonce_expiry_zero_identity_and_long_window_are_rejected() {
     let mut run = challenge();
     run.nonce = [0; 32];
