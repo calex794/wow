@@ -291,7 +291,7 @@ impl Journal {
                mailbox BLOB NOT NULL CHECK(length(mailbox)=16),
                recipient BLOB NOT NULL CHECK(length(recipient)=16),
                message BLOB NOT NULL CHECK(length(message)=16),
-               signed_grant BLOB NOT NULL CHECK(length(signed_grant)=245),
+               signed_grant BLOB NOT NULL CHECK(length(signed_grant)=253),
                state INTEGER NOT NULL CHECK(state IN (0,1)),
                UNIQUE(mailbox,recipient,message),
                FOREIGN KEY(mailbox) REFERENCES custodian_mailbox_policy(mailbox)
