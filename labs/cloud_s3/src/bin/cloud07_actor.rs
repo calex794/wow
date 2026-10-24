@@ -216,10 +216,18 @@ async fn bob_verify_duplicate() {
     assert_eq!(again, saved);
 }
 
-/// Recovery is journal-first: a valid signed W4 survives and can be sent
-/// without redownloading W3. This is essential when the forward object
-/// or its read capability is no longer available after local commit.
-async fn bob_resume() {
+/// Preserve the immutable encrypted W4 locally BEFORE attempting S3.
+/// Each actor invocation is a separate process; this also reuses identical
+/// bytes after a crash between durable preparation and remote publication.
+/// The standalone lab runs a single Bob writer; production needs an atomic
+/// cross-process create-only reservation and durable upload-reconciliation.
+fn bob_prepared_envelope() -> Vec<u8> {
+    let final_path = state("return.envelope");
+    if final_path.exists() {
+        let stored = fs::read(&final_path).unwrap();
+        assert!(!stored.is_empty());
+        return stored;
+    }
     let receipt = {
         let bob = Journal::open(&state("journal.sqlite")).unwrap();
         bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().unwrap()
@@ -227,6 +235,40 @@ async fn bob_resume() {
     let encrypted = private_return_w4::seal_signed_receipt(
         &receipt, &peer_hpke(), RETURN_TAG,
     ).unwrap();
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).unwrap();
+    let tmp_name = format!(
+        "return.envelope.tmp.{}",
+        nonce.iter().map(|n| format!("{n:02x}")).collect::<String>()
+    );
+    let tmp_path = state(&tmp_name);
+    secret_write(&tmp_path, &encrypted); // mode 0600 and sync_all on file
+    fs::rename(&tmp_path, &final_path).unwrap();
+    fs::File::open("/state").unwrap().sync_all().unwrap();
+    encrypted
+}
+
+fn bob_prepare_pause() -> ! {
+    let ciphertext = bob_prepared_envelope();
+    assert!(!ciphertext.is_empty());
+    marker("envelope_prepared.marker");
+    pause_until_killed()
+}
+
+fn bob_prepare_check() {
+    let original = fs::read(state("return.envelope")).unwrap();
+    assert!(!original.is_empty());
+    assert_eq!(original, bob_prepared_envelope());
+    assert!(!state("return.meta").exists());
+    let bob = Journal::open(&state("journal.sqlite")).unwrap();
+    assert!(bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().is_some());
+}
+
+/// Journal-first, with a durable return ciphertext envelope. MinIO does not
+/// have to be available when the envelope is first prepared. A lost ACK
+/// AFTER remote commit still requires an independently authorized reconciler.
+async fn bob_resume() {
+    let encrypted = bob_prepared_envelope();
     let rev = store().put_once(return_key(), &encrypted).await.unwrap();
     write_meta("return.meta", rev, &encrypted);
 }
@@ -286,6 +328,8 @@ fn main() {
             ("bob", "commit-pause") => bob_commit_pause().await,
             ("bob", "offline-receipt") => bob_verify_durable_offline(),
             ("bob", "verify-duplicate") => bob_verify_duplicate().await,
+            ("bob", "prepare-pause") => bob_prepare_pause(),
+            ("bob", "prepare-check") => bob_prepare_check(),
             ("bob", "resume") => bob_resume().await,
             ("alice", "verify-pending") => alice_verify_pending_offline(),
             _ => panic!("unsupported CLOUD-07 actor command"),
