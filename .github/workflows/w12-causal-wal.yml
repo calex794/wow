@@ -3,11 +3,13 @@ on:
   pull_request:
     paths:
       - 'src/causal_w12.rs'
+      - 'src/custodian_mailbox.rs'
       - 'src/bin/w12_causal_crash_worker.rs'
       - 'src/lib.rs'
       - 'Cargo.toml'
       - 'tests/causal_w12_crash.rs'
       - 'tests/causal_w12_expiry.rs'
+      - 'tests/custodian_mailbox_auth.rs'
       - '.github/workflows/w12-causal-wal.yml'
   workflow_dispatch:
 permissions:
@@ -22,5 +24,7 @@ jobs:
         run: cargo test --test causal_w12_crash --features causal-lab-fault
       - name: Check W12 expiry integrity and compatibility
         run: cargo test --test causal_w12_expiry
+      - name: Check distinct custodian STORE/FETCH authorization
+        run: cargo test --test custodian_mailbox_auth
       - name: Build W12 child process
         run: cargo build --bin w12_causal_crash_worker --features causal-lab-fault
