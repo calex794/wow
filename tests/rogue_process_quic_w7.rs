@@ -7,6 +7,16 @@
 use akula_wire_lab::crypto_identity_w3::{SignedHeader, TrustedRecipient};
 use akula_wire_lab::crypto_w3::new_recipient;
 use akula_wire_lab::custody_audit_w7::{AuditError, AuditReference};
+use akula_wire_lab::custodian_evidence_bridge::{
+    LocalEvidenceContext, ServiceIdentity,
+};
+use akula_wire_lab::custodian_observation::{
+    AppendResult, LocalObservationStore, ServiceRole,
+};
+use akula_wire_lab::custodian_w7_quic_lab::{
+    audit_and_record, LabAuditError, LabAuditOutcome, LabAuditRequest,
+    SignedEndpointBinding, LAB_W7_ALPN,
+};
 use akula_wire_lab::custody_receipt_w6::{self, ExpectedCustody};
 use akula_wire_lab::journal_w4::{Delivery, Insert, Journal};
 use akula_wire_lab::private_route_w3::{open_authenticated, seal_private};
@@ -21,7 +31,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 
-const ALPN: &[u8] = b"akula-wow/w7-hostile-custodian-local-only/1";
+const ALPN: &[u8] = LAB_W7_ALPN;
 const AUDIT_CAP: [u8; 16] = [22; 16];
 const RECIPIENT_CAP: [u8; 16] = [23; 16];
 fn id(n: u8) -> [u8; 16] { [n; 16] }
@@ -37,6 +47,7 @@ async fn bind_client() -> Endpoint {
 struct Rogue {
     process: Child,
     addr: EndpointAddr,
+    binding: SignedEndpointBinding,
     _dir: TempDir,
 }
 impl Rogue {
@@ -57,12 +68,24 @@ impl Rogue {
             .expect("custodian must announce ready endpoint");
         let fields = line.split_whitespace().collect::<Vec<_>>();
         assert_eq!(fields.first().copied(), Some("READY"), "{mode}: {line}");
-        assert_eq!(fields.len(), 3, "{mode}: {line}");
-        let id: EndpointId = fields[1].parse().unwrap();
+        assert_eq!(fields.len(), 4, "{mode}: {line}");
+        let endpoint_id: EndpointId = fields[1].parse().unwrap();
         let socket: SocketAddr = fields[2].parse().unwrap();
         assert!(socket.ip().is_loopback());
-        let addr = EndpointAddr::new(id).with_ip_addr(socket);
-        Self { process, addr, _dir: dir }
+        let hex = fields[3].as_bytes();
+        assert_eq!(hex.len(), 128, "signed TLS binding must contain 64 bytes");
+        let mut signature = [0u8; 64];
+        for (position, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
+            signature[position] = u8::from_str_radix(
+                std::str::from_utf8(pair).unwrap(), 16,
+            ).unwrap();
+        }
+        let binding = SignedEndpointBinding {
+            service_id: id(13), service_epoch: 7,
+            endpoint_id, signature,
+        };
+        let addr = EndpointAddr::new(endpoint_id).with_ip_addr(socket);
+        Self { process, addr, binding, _dir: dir }
     }
 
     fn db_path(&self) -> &Path {
@@ -207,6 +230,111 @@ async fn separate_hostile_process_over_real_quic_does_not_steal_recipient_author
             "censor" | "honest" | "drop-ack" => assert!(availability.is_ok()),
             _ => unreachable!(),
         }
+        // P0-4: the separately authenticated network response, rather than
+        // arbitrary locally supplied bytes, enters the VERIFIED journal.
+        let observer_key = key(31);
+        let context = LocalEvidenceContext::bind(
+            ServiceIdentity {
+                id: id(13), epoch: 7, role: ServiceRole::Public,
+            },
+            &observer_key, 1, id(91), 100_010, &trust,
+        ).unwrap();
+        let mut service_events = LocalObservationStore::open(
+            &work.path().join("private-audit.sqlite"),
+        ).unwrap();
+
+        // An altered custodian->EndpointId signature or wrong locally pinned
+        // TLS endpoint must be rejected BEFORE issuing a QUIC request.
+        let mut forged_binding = rogue.binding.clone();
+        forged_binding.signature[0] ^= 1;
+        let bad_signature = audit_and_record(
+            &mut service_events, &context, &trust,
+            LabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &forged_binding,
+                audit_cap: AUDIT_CAP,
+                trusted_reference: &reference,
+            },
+        ).await;
+        assert!(matches!(bad_signature, Err(LabAuditError::InvalidBinding)));
+        let wrong_pin = audit_and_record(
+            &mut service_events, &context, &trust,
+            LabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: stranger.id(),
+                signed_binding: &rogue.binding,
+                audit_cap: AUDIT_CAP,
+                trusted_reference: &reference,
+            },
+        ).await;
+        assert!(matches!(wrong_pin, Err(LabAuditError::InvalidBinding)));
+
+        // Even the correct private AUDIT cap is rejected when the TLS client
+        // has a different EndpointId; source cannot impersonate the auditor.
+        let wrong_client = audit_and_record(
+            &mut service_events, &context, &trust,
+            LabAuditRequest {
+                client: &source, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                audit_cap: AUDIT_CAP,
+                trusted_reference: &reference,
+            },
+        ).await.unwrap();
+        assert_eq!(wrong_client, LabAuditOutcome::Rejected);
+
+        let real = audit_and_record(
+            &mut service_events, &context, &trust,
+            LabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                audit_cap: AUDIT_CAP,
+                trusted_reference: &reference,
+            },
+        ).await.unwrap();
+        match mode {
+            "fake" | "delete" =>
+                assert_eq!(real, LabAuditOutcome::Unavailable),
+            "corrupt" =>
+                assert_eq!(real, LabAuditOutcome::UnattributedMismatch),
+            "censor" | "honest" | "drop-ack" =>
+                assert_eq!(real, LabAuditOutcome::ExactBytes(AppendResult::Stored)),
+            _ => unreachable!(),
+        }
+        let score = service_events.verified_report(
+            context.scope(), 100_010,
+        ).unwrap();
+        let successes = u64::from(matches!(real, LabAuditOutcome::ExactBytes(_)));
+        assert_eq!(score.last_24h.storage.successes, successes);
+        assert_eq!(score.last_24h.storage.failures, 0);
+        assert_eq!(score.last_24h.recipient_w4_observations, 0);
+
+        // Repeated authenticated observations of the same W3 in one local
+        // day are idempotent, even with a new event sequence and TLS session.
+        if successes == 1 {
+            let second_ctx = LocalEvidenceContext::bind(
+                ServiceIdentity { id: id(13), epoch: 7, role: ServiceRole::Public },
+                &observer_key, 2, id(92), 100_012, &trust,
+            ).unwrap();
+            assert_eq!(
+                audit_and_record(
+                    &mut service_events, &second_ctx, &trust,
+                    LabAuditRequest {
+                        client: &auditor, address: rogue.addr.clone(),
+                        expected_pinned_endpoint: rogue.addr.id,
+                        signed_binding: &rogue.binding,
+                        audit_cap: AUDIT_CAP, trusted_reference: &reference,
+                    },
+                ).await.unwrap(),
+                LabAuditOutcome::ExactBytes(AppendResult::ExactReplay)
+            );
+            assert_eq!(service_events.verified_report(
+                context.scope(), 100_012,
+            ).unwrap().last_24h.storage.eligible, 1);
+        }
+
         // Even a successful independent audit cannot advance Alice to W4.
         assert_eq!(alice.state(id(8), id(5)).unwrap(), Delivery::Queued);
 
