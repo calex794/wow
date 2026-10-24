@@ -144,6 +144,11 @@ jobs:
           set -euo pipefail
           cargo test --manifest-path labs/cloud_s3/Cargo.toml \
             --test cloud08_s3_control -- --ignored --nocapture --test-threads=1
+      - name: CLOUD-08 encrypted signed control discovery
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud08_sealed_control -- --ignored --nocapture --test-threads=1
       - name: Execute real conditional PUT and exact-version GET
         run: |
           set -euo pipefail
