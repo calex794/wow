@@ -295,3 +295,86 @@ impl Journal {
         }
     }
 }
+
+
+/// Private wire evidence for a W12 signed causal *claim*, not W4 or proof
+/// of actual retention. Stable v0 encoding: canonical signed body || Ed25519.
+pub const W12_SIGNED_CLAIM_LEN: usize = DOMAIN.len() + 16 + 16 + 8 + 8
+    + 32 + 16 + 16 + 32 + 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedW12Claim {
+    pub private_scope: [u8;16],
+    pub custodian_id: [u8;16],
+    pub custodian_epoch: u64,
+    pub seq: u64,
+    pub predecessor: [u8;32],
+    pub packet_digest: [u8;32],
+    pub commitment: CausalCommitment,
+}
+
+/// Only validates a custodian-signed W12 statement. An altered custodian can
+/// sign a false STORE claim; the witness must not interpret this as W4.
+pub fn verify_w12_signed_claim(
+    raw: &[u8], trust: &TrustRegistry,
+) -> Result<VerifiedW12Claim,CausalError> {
+    if raw.len()!=W12_SIGNED_CLAIM_LEN || !raw.starts_with(DOMAIN) {
+        return Err(CausalError::Invalid);
+    }
+    let body=&raw[..raw.len()-64];
+    let mut pos=DOMAIN.len();
+    let scope:[u8;16]=body[pos..pos+16].try_into().map_err(|_|CausalError::Invalid)?;
+    pos+=16;
+    let actor:[u8;16]=body[pos..pos+16].try_into().map_err(|_|CausalError::Invalid)?;
+    pos+=16;
+    let epoch=u64::from_be_bytes(body[pos..pos+8].try_into().map_err(|_|CausalError::Invalid)?);
+    pos+=8;
+    let seq=u64::from_be_bytes(body[pos..pos+8].try_into().map_err(|_|CausalError::Invalid)?);
+    pos+=8;
+    let predecessor:[u8;32]=body[pos..pos+32].try_into().map_err(|_|CausalError::Invalid)?;
+    pos+=32;
+    let recipient=&body[pos..pos+16];
+    pos+=16;
+    let message=&body[pos..pos+16];
+    pos+=16;
+    let packet_digest:[u8;32]=body[pos..pos+32].try_into().map_err(|_|CausalError::Invalid)?;
+    if scope==[0;16] || actor==[0;16] || epoch==0
+        || epoch>i64::MAX as u64 || seq==0 || seq>i64::MAX as u64
+        || recipient==[0;16] || message==[0;16]
+        || (seq==1 && predecessor!=EMPTY) || (seq>1 && predecessor==EMPTY)
+    {return Err(CausalError::Invalid);}
+    let key=trust.key_for(actor,epoch).map_err(|_|CausalError::Unauthorized)?;
+    let sig=Signature::from_slice(&raw[body.len()..]).map_err(|_|CausalError::Corrupt)?;
+    key.verify(body,&sig).map_err(|_|CausalError::Unauthorized)?;
+    Ok(VerifiedW12Claim {
+        private_scope:scope,custodian_id:actor,custodian_epoch:epoch,seq,
+        predecessor,packet_digest,commitment:CausalCommitment{
+            seq,digest:digest_of(body,&raw[body.len()..]),
+        }
+    })
+}
+
+impl Journal {
+    /// Export a verified *signed head claim* from the real W12 journal. W13
+    /// observers must keep it private; it contains mailbox message aliases.
+    /// Future network transport must authenticate and encrypt this evidence.
+    pub fn export_w12_signed_head(
+        &self,scope:[u8;16],actor:[u8;16],trust:&TrustRegistry,
+    )->Result<Option<Vec<u8>>,CausalError> {
+        let Some(head)=self.audit_w12(scope,actor,trust)? else {return Ok(None)};
+        let pair:Option<(Vec<u8>,Vec<u8>)>=self.db.query_row(
+            "SELECT body,signature FROM causal_w12_event
+             WHERE private_scope=?1 AND custodian_id=?2 AND seq=?3",
+            params![scope.as_slice(),actor.as_slice(),head.seq as i64],
+            |r|Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let Some((mut body,sig))=pair else {return Err(CausalError::Corrupt)};
+        if body.len()+sig.len()!=W12_SIGNED_CLAIM_LEN{return Err(CausalError::Corrupt)}
+        body.extend_from_slice(&sig);
+        let v=verify_w12_signed_claim(&body,trust)?;
+        if v.commitment!=head || v.private_scope!=scope || v.custodian_id!=actor {
+            return Err(CausalError::Corrupt);
+        }
+        Ok(Some(body))
+    }
+}
