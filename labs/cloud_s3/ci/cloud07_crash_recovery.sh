@@ -109,9 +109,25 @@ docker kill wow-cloud07-prepared >/dev/null
 docker rm wow-cloud07-prepared >/dev/null
 actor bob prepare-check
 cp "$b/return.envelope" "$RUNNER_TEMP/cloud07_saved_w4"
-actor bob resume
+# Network fault proxy sees real 2xx PUT from MinIO but drops Bob's ACK.
+# It is reachable solely on this CI-created internal Docker network.
+docker run -d --rm --name wow-cloud07-proxy --network "$net" \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v "$(pwd)/labs/cloud_s3/ci/lost_put_ack_proxy.py:/opt/fault.py:ro" \
+  -e WOW_PROXY_DOCKER_LAB=1 python:3.12-slim python /opt/fault.py >/dev/null
+for _ in $(seq 1 80); do
+  if docker exec wow-cloud07-proxy python -c 'import socket; socket.create_connection(("127.0.0.1",9001),1).close()' >/dev/null 2>&1; then break; fi
+  sleep 0.1
+done
+actor bob lost-ack
+docker stop wow-cloud07-proxy >/dev/null
+# Metadata is NOT forged from an upload response. Alice can only read Bob's
+# return prefix; the test conductor passes opaque bytes, not credentials.
+cp "$b/return.envelope" "$a/return.envelope"
+actor alice reconcile-return
+cp "$a/return.meta" "$b/return.meta"
+actor bob accept-pin
 cmp "$b/return.envelope" "$RUNNER_TEMP/cloud07_saved_w4"
-cp "$b/return.meta" "$a/return.meta"
 actor alice reject-corrupt
 actor alice confirm
 actor alice assert-final
