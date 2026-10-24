@@ -24,7 +24,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
-use wow_cloud_s3_lab::{signed_pin::{self, Direction, PinScope, VerifiedPin}, S3Lab};
+use wow_cloud_s3_lab::{sealed_control, signed_pin::{self, Direction, PinScope, VerifiedPin}, S3Lab};
 
 const MSG: [u8; 16] = [5; 16];
 const ALICE_ID: [u8; 16] = [9; 16];
@@ -32,6 +32,7 @@ const BOB_ID: [u8; 16] = [8; 16];
 const ROUTE: [u8; 16] = [31; 16];
 const RETURN_TAG: [u8; 16] = [41; 16];
 const EXPIRY: u64 = 500_000;
+const MAX_W4_ENVELOPE_BYTES: usize = 2_048;
 const NOW: u64 = 100_000;
 
 fn state(name: &str) -> PathBuf { PathBuf::from("/state").join(name) }
@@ -95,6 +96,29 @@ fn forward_key() -> CloudKey {
 }
 fn return_key() -> CloudKey {
     CloudKey { namespace: [61; 16], object: [108; 16] }
+}
+// Fixed keys are disposable LAB fixtures, not production invitations.
+// Existing reciprocal IAM: Alice PUT forward, Bob GET forward;
+// Bob PUT return, Alice GET return. No extra S3 permissions are needed.
+fn forward_control_key() -> CloudKey {
+    CloudKey { namespace: [21; 16], object: [109; 16] }
+}
+fn proof_control_key() -> CloudKey {
+    CloudKey { namespace: [21; 16], object: [110; 16] }
+}
+fn return_control_key() -> CloudKey {
+    CloudKey { namespace: [61; 16], object: [111; 16] }
+}
+async fn publish_sealed_control(key: CloudKey, pin: &[u8]) {
+    let cipher = sealed_control::seal(&peer_hpke(), key, pin).unwrap();
+    // Create-only, never infer final W4 from S3 upload.
+    store().put_once(key, &cipher).await.unwrap();
+}
+async fn read_sealed_control(key: CloudKey) -> Vec<u8> {
+    let (_, cipher) = store().discover_control(
+        key, sealed_control::ENVELOPE_LEN,
+    ).await.unwrap();
+    sealed_control::open(&secret_hpke(), key, &cipher).unwrap()
 }
 // Signed exact-version locators replace the old unauthenticated .meta files.
 // The keys in peer.sign are pre-pinned by the CI test harness. Production
@@ -161,6 +185,16 @@ async fn alice_send() {
     }
     let revision = store().put_once(forward_key(), &signed).await.unwrap();
     issue_pin("forward.pin", forward_scope(), &revision, &signed);
+    publish_sealed_control(
+        forward_control_key(), &fs::read(state("forward.pin")).unwrap(),
+    ).await;
+}
+
+async fn bob_fetch_forward() {
+    let pin = read_sealed_control(forward_control_key()).await;
+    signed_pin::verify(&pin, &public_sign("peer.sign"), forward_scope(), NOW + 5)
+        .unwrap();
+    secret_write(&state("forward.pin"), &pin);
 }
 
 async fn bob_wire() -> Vec<u8> {
@@ -319,22 +353,45 @@ async fn bob_lost_ack() {
 /// independently verify the exact ciphertext/version and share a pin back.
 /// In production, this proof needs an authenticated invitation/notification.
 async fn alice_reconcile_return() {
-    let opaque = fs::read(state("return.envelope")).unwrap();
-    let pin = store().reconcile_unknown_put(return_key(), &opaque).await.unwrap();
-    // Alice can only read W4, not upload it; her signed recovery proof
-    // tells Bob the exact version observed without sharing any S3 secret.
-    issue_pin("return.proof", return_scope(), &pin, &opaque);
+    // Alice has GET, but not PUT, on Bob's return namespace.
+    // She discovers the exact W4 ciphertext from MinIO, NOT from runner.
+    let (_, opaque) = store().discover_control(return_key(), MAX_W4_ENVELOPE_BYTES)
+        .await.unwrap();
+    // Fail closed unless the ciphertext decrypts to Bob's valid signed W4.
+    let recipient_secret = secret_hpke();
+    let registry = trust("alice");
+    private_return_w4::open_verified(
+        &opaque, invitation(&recipient_secret, &registry),
+    ).unwrap();
+    let version = store().reconcile_unknown_put(return_key(), &opaque).await.unwrap();
+    issue_pin("return.proof", return_scope(), &version, &opaque);
+    publish_sealed_control(
+        proof_control_key(), &fs::read(state("return.proof")).unwrap(),
+    ).await;
 }
 
-/// Bob confirms a pin supplied by the authorized reader, without any second PUT.
-fn bob_accept_return_pin() {
+/// Recover Alice's proof using only Bob's scoped READ privilege.
+/// The verified proof cannot authorize a second PUT for the W4 itself.
+async fn bob_accept_return_pin() {
+    let proof = read_sealed_control(proof_control_key()).await;
+    let verified = signed_pin::verify(
+        &proof, &public_sign("peer.sign"), return_scope(), NOW + 5,
+    ).unwrap();
     let bytes = fs::read(state("return.envelope")).unwrap();
-    let verified = verify_pin("return.proof", return_scope(), &public_sign("peer.sign"));
     assert_eq!(verified.length, bytes.len());
     assert_eq!(verified.digest, *blake3::hash(&bytes).as_bytes());
     assert!(state("ambiguous_upload.marker").exists());
-    // Bob, the sender of the W4 ciphertext, authenticates its final locator.
     issue_pin("return.pin", return_scope(), &verified.revision, &bytes);
+    publish_sealed_control(
+        return_control_key(), &fs::read(state("return.pin")).unwrap(),
+    ).await;
+}
+
+async fn alice_fetch_return() {
+    let pin = read_sealed_control(return_control_key()).await;
+    signed_pin::verify(&pin, &public_sign("peer.sign"), return_scope(), NOW + 5)
+        .unwrap();
+    secret_write(&state("return.pin"), &pin);
 }
 
 fn alice_verify_pending_offline() {
@@ -389,6 +446,7 @@ fn main() {
             ("alice", "assert-final") => alice_assert_final(),
             ("bob", "precommit-pause") => bob_precommit_pause().await,
             ("bob", "check-none") => bob_check_none(),
+            ("bob", "fetch-forward") => bob_fetch_forward().await,
             ("bob", "pin-negative") => verify_adversarial_pin("bob"),
             ("alice", "pin-negative") => verify_adversarial_pin("alice"),
             ("bob", "commit-pause") => bob_commit_pause().await,
@@ -398,7 +456,8 @@ fn main() {
             ("bob", "prepare-check") => bob_prepare_check(),
             ("bob", "resume") => bob_resume().await,
             ("bob", "lost-ack") => bob_lost_ack().await,
-            ("bob", "accept-pin") => bob_accept_return_pin(),
+            ("bob", "accept-pin") => bob_accept_return_pin().await,
+            ("alice", "fetch-return") => alice_fetch_return().await,
             ("alice", "reconcile-return") => alice_reconcile_return().await,
             ("alice", "verify-pending") => alice_verify_pending_offline(),
             _ => panic!("unsupported CLOUD-07 actor command"),
