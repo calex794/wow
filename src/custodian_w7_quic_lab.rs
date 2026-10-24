@@ -148,6 +148,32 @@ pub async fn audit_and_record_granted(
     trust: &TrustRegistry,
     request: GrantedLabAuditRequest<'_>,
 ) -> Result<LabAuditOutcome, LabAuditError> {
+    audit_and_record_granted_over_alpn(
+        store, ctx, trust, request, LAB_W7_ALPN,
+    ).await
+}
+
+/// Opt-in P0-7 private overlay lab: a different ALPN than the deliberately
+/// malicious P0-4 server. The signed grant and TLS pin checks are identical.
+/// Does not certify independent operators or physical machines.
+pub async fn audit_and_record_private_overlay(
+    store: &mut LocalObservationStore,
+    ctx: &LocalEvidenceContext<'_>,
+    trust: &TrustRegistry,
+    request: GrantedLabAuditRequest<'_>,
+) -> Result<LabAuditOutcome, LabAuditError> {
+    audit_and_record_granted_over_alpn(
+        store, ctx, trust, request, crate::custodian_p07_overlay::P07_ALPN,
+    ).await
+}
+
+async fn audit_and_record_granted_over_alpn(
+    store: &mut LocalObservationStore,
+    ctx: &LocalEvidenceContext<'_>,
+    trust: &TrustRegistry,
+    request: GrantedLabAuditRequest<'_>,
+    alpn: &[u8],
+) -> Result<LabAuditOutcome, LabAuditError> {
     verify_binding_parts(
         ctx, trust, request.signed_binding,
         request.expected_pinned_endpoint, &request.address,
@@ -179,7 +205,7 @@ pub async fn audit_and_record_granted(
     audit_frame(
         store, ctx, request.client, request.address,
         request.expected_pinned_endpoint, request.trusted_reference,
-        &payload,
+        &payload, alpn,
     ).await
 }
 
@@ -200,7 +226,7 @@ pub async fn audit_and_record(
     audit_frame(
         store, ctx, request.client, request.address,
         request.expected_pinned_endpoint, request.trusted_reference,
-        &wire,
+        &wire, LAB_W7_ALPN,
     ).await
 }
 
@@ -211,11 +237,11 @@ async fn audit_frame(
     address: EndpointAddr,
     pinned_endpoint: EndpointId,
     reference: &AuditReference,
-    payload: &[u8],
+    payload: &[u8], alpn: &[u8],
 ) -> Result<LabAuditOutcome, LabAuditError> {
     let connection = tokio::time::timeout(
         Duration::from_secs(10),
-        client.connect(address, LAB_W7_ALPN),
+        client.connect(address, alpn),
     ).await.map_err(|_| LabAuditError::TransportUnknown)?
         .map_err(|_| LabAuditError::TransportUnknown)?;
     if connection.remote_id() != pinned_endpoint {
