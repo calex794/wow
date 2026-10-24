@@ -17,6 +17,7 @@ pub mod custody_receipt_w6;
 pub mod custody_audit_w7;
 pub mod custodian_observation;
 pub mod custodian_evidence_bridge;
+pub mod custodian_advisory;
 pub mod journal_w4;
 pub mod multipath_w5;
 pub mod custody_transfer_w8;
