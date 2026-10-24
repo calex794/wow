@@ -572,3 +572,38 @@ async fn signed_w7_audit_grant_on_real_quic_is_not_a_store_or_public_fetch_capab
         1,
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthenticated_auditor_cannot_probe_missing_w3_metadata() {
+    let source = bind_client().await;
+    let auditor = bind_client().await;
+    let recipient = bind_client().await;
+    let stranger = bind_client().await;
+    let rogue = Rogue::start("grant", source.id(), auditor.id(), recipient.id());
+    // Deliberately NEVER STORE W3 in the service's SQLite.
+    let (packet, _secret) = make_packet();
+    let valid = sign_read_grant(&key(9), AuditGrantClaims {
+        issuer_id: id(9), issuer_epoch: 4,
+        service_id: id(13), service_epoch: 7,
+        service_endpoint: rogue.addr.id,
+        auditor_endpoint: auditor.id(),
+        route_token: id(4), message_id: id(5),
+        ciphertext_len: packet.len() as u32,
+        ciphertext_digest: *blake3::hash(&packet).as_bytes(),
+        expires_at_ms: 100_100, nonce: id(60),
+    }).unwrap();
+    let mut forged = valid.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    let mut forged_request = vec![5];
+    forged_request.extend_from_slice(&forged);
+    assert_eq!(rpc(&auditor, &rogue, &forged_request).await, vec![255]);
+
+    // A genuine signed AUDIT may observe Unavailable, but a stolen grant
+    // presented by another TLS identity must yield a policy reject instead.
+    let mut valid_request = vec![5];
+    valid_request.extend_from_slice(&valid);
+    assert_eq!(rpc(&stranger, &rogue, &valid_request).await, vec![255]);
+    assert_eq!(rpc(&auditor, &rogue, &valid_request).await, vec![0]);
+    assert!(!rogue.db_path().join("custodian.sqlite").exists());
+}
