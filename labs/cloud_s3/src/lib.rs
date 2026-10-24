@@ -1,3 +1,4 @@
+pub mod signed_pin;
 //! CLOUD-02: S3-compatible laboratory adapter. Not production credentials,
 //! signed grants, W4, custody transfer, or a version-independent data store.
 //! The bucket must have S3 VERSIONING ENABLED before test execution.
