@@ -1,0 +1,77 @@
+name: WOW CLOUD-02 standalone MinIO laboratory
+on:
+  pull_request:
+    paths:
+      - 'labs/cloud_s3/**'
+      - '.github/workflows/cloud02-minio.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: wow-cloud02-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  minio:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_MAX_ATTEMPTS: '1'
+      WOW_MINIO_ENDPOINT: http://127.0.0.1:9000
+      WOW_MINIO_BUCKET: wow-mail-lab
+      WOW_MINIO_ACCESS: wow_ci_test_user
+      WOW_MINIO_SECRET: wow_disposable_ci_only_20261023
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile isolated S3 lab and tests
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml --all-targets --no-run
+          cargo clippy --manifest-path labs/cloud_s3/Cargo.toml --all-targets -- -D warnings
+      - name: Start disposable single-node MinIO
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name wow-cloud02-minio \
+            -p 127.0.0.1:9000:9000 \
+            --tmpfs /data:rw,uid=65532,gid=65532,mode=0700 \
+            -e MINIO_ROOT_USER="$WOW_MINIO_ACCESS" \
+            -e MINIO_ROOT_PASSWORD="$WOW_MINIO_SECRET" \
+            cgr.dev/chainguard/minio:latest server /data
+          for i in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+      - name: Prepare disposable versioned bucket via AWS CLI
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --disable-pip-version-check 'awscli==1.42.70'
+          export PATH="$HOME/.local/bin:$PATH"
+          export AWS_ACCESS_KEY_ID="$WOW_MINIO_ACCESS"
+          export AWS_SECRET_ACCESS_KEY="$WOW_MINIO_SECRET"
+          aws --endpoint-url "$WOW_MINIO_ENDPOINT" s3api create-bucket --bucket "$WOW_MINIO_BUCKET"
+          aws --endpoint-url "$WOW_MINIO_ENDPOINT" s3api put-bucket-versioning \
+            --bucket "$WOW_MINIO_BUCKET" --versioning-configuration Status=Enabled
+          status="$(aws --endpoint-url "$WOW_MINIO_ENDPOINT" s3api get-bucket-versioning \
+            --bucket "$WOW_MINIO_BUCKET" --query Status --output text)"
+          test "$status" = Enabled
+      - name: Execute real conditional PUT and exact-version GET
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test minio_offline -- --ignored --nocapture --test-threads=1
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud_w3_w4_e2e -- --ignored --nocapture --test-threads=1
+      - name: Stop isolated MinIO
+        if: always()
+        run: |
+          docker logs wow-cloud02-minio --tail 50 2>/dev/null || true
+          docker stop wow-cloud02-minio >/dev/null 2>&1 || true
