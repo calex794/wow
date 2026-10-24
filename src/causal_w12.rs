@@ -262,7 +262,7 @@ impl Journal {
             let packet:Option<(Vec<u8>,Vec<u8>,i64)>=self.db.query_row(
                 "SELECT packet,digest,expiry FROM outbox WHERE recipient=?1 AND message=?2",
                 params![recipient.as_slice(),message.as_slice()],
-                |r|Ok((r.get(0)?,r.get(1)?)),
+                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
             ).optional()?;
             let Some((packet,dbhash,local_expiry))=packet else {return Err(CausalError::Corrupt)};
             if dbhash!=packet_hash || blake3::hash(&packet).as_bytes()!=packet_hash.as_slice() {
