@@ -139,6 +139,11 @@ jobs:
           set -euo pipefail
           cargo test --manifest-path labs/cloud_s3/Cargo.toml \
             --test cloud07_version_audit -- --ignored --nocapture --test-threads=1
+      - name: CLOUD-08 discover signed control pin using only MinIO
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud08_s3_control -- --ignored --nocapture --test-threads=1
       - name: Execute real conditional PUT and exact-version GET
         run: |
           set -euo pipefail
