@@ -7,6 +7,10 @@
 use akula_wire_lab::crypto_identity_w3::{SignedHeader, TrustedRecipient};
 use akula_wire_lab::crypto_w3::new_recipient;
 use akula_wire_lab::custody_audit_w7::{AuditError, AuditReference};
+use akula_wire_lab::custodian_audit_grant_w7::{
+    sign_for_lab as sign_read_grant, AuditGrantClaims, AuditGrantError,
+};
+use akula_wire_lab::route_grant_w5::{sign_for_lab as sign_store_grant, RelayGrantClaims};
 use akula_wire_lab::custodian_evidence_bridge::{
     LocalEvidenceContext, ServiceIdentity,
 };
@@ -14,7 +18,8 @@ use akula_wire_lab::custodian_observation::{
     AppendResult, LocalObservationStore, ServiceRole,
 };
 use akula_wire_lab::custodian_w7_quic_lab::{
-    audit_and_record, LabAuditError, LabAuditOutcome, LabAuditRequest,
+    audit_and_record, audit_and_record_granted,
+    GrantedLabAuditRequest, LabAuditError, LabAuditOutcome, LabAuditRequest,
     SignedEndpointBinding, LAB_W7_ALPN,
 };
 use akula_wire_lab::custody_receipt_w6::{self, ExpectedCustody};
@@ -394,4 +399,176 @@ async fn separate_hostile_process_over_real_quic_does_not_steal_recipient_author
         }
         drop(rogue); // Kill the separate intentionally modified OS process.
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_w7_audit_grant_on_real_quic_is_not_a_store_or_public_fetch_capability() {
+    let source = bind_client().await;
+    let auditor = bind_client().await;
+    let recipient = bind_client().await;
+    let stranger = bind_client().await;
+    let rogue = Rogue::start("grant", source.id(), auditor.id(), recipient.id());
+    let (packet, _secret) = make_packet();
+    let reference = AuditReference::from_trusted_ciphertext(&packet).unwrap();
+    let trusted = trust();
+    assert_eq!(
+        rpc(&source, &rogue, &store_frame(&packet)).await.first().copied(),
+        Some(1),
+    );
+
+    let signed = sign_read_grant(&key(9), AuditGrantClaims {
+        issuer_id: id(9), issuer_epoch: 4,
+        service_id: id(13), service_epoch: 7,
+        service_endpoint: rogue.addr.id,
+        auditor_endpoint: auditor.id(),
+        route_token: id(4), message_id: id(5),
+        ciphertext_len: packet.len() as u32,
+        ciphertext_digest: *blake3::hash(&packet).as_bytes(),
+        expires_at_ms: 100_100,
+        nonce: id(84),
+    }).unwrap();
+    let observer = key(31);
+    let local = LocalEvidenceContext::bind(
+        ServiceIdentity { id: id(13), epoch: 7, role: ServiceRole::Public },
+        &observer, 1, id(91), 100_010, &trusted,
+    ).unwrap();
+    let work = tempdir().unwrap();
+    let mut metrics = LocalObservationStore::open(
+        &work.path().join("local-verified.sqlite"),
+    ).unwrap();
+
+    // A W3 public route tag, legacy W7 test AUDIT_CAP or W6 STORE grant
+    // MUST NOT authorize reading W3 in the scoped-grant mode.
+    let mut old_audit = vec![2];
+    old_audit.extend_from_slice(&AUDIT_CAP);
+    assert_eq!(rpc(&auditor, &rogue, &old_audit).await, vec![255]);
+    let mut store_grant_as_read = vec![5];
+    store_grant_as_read.extend_from_slice(&sign_store_grant(
+        &key(9), RelayGrantClaims {
+            issuer_id: id(9), issuer_epoch: 4,
+            relay_id: id(13), namespace: id(42),
+            route_token: id(4), message_id: id(5),
+            ciphertext_len: packet.len() as u32,
+            ciphertext_digest: *blake3::hash(&packet).as_bytes(),
+            expires_at: 100_100,
+        },
+    ).unwrap());
+    assert_eq!(rpc(&auditor, &rogue, &store_grant_as_read).await, vec![255]);
+    let mut grant_frame = vec![5];
+    grant_frame.extend_from_slice(&signed);
+    assert_eq!(rpc(&stranger, &rogue, &grant_frame).await, vec![255]);
+    let mut forged_sig = signed.clone();
+    let last = forged_sig.len() - 1;
+    forged_sig[last] ^= 1;
+    assert!(matches!(
+        audit_and_record_granted(
+            &mut metrics, &local, &trusted,
+            GrantedLabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                signed_grant: &forged_sig, trusted_issuer_id: id(9),
+                route_token: id(4), message_id: id(5),
+                trusted_reference: &reference, now_ms: 100_010,
+            }
+        ).await,
+        Err(LabAuditError::Grant(AuditGrantError::BadSignature)),
+    ));
+    assert!(matches!(
+        audit_and_record_granted(
+            &mut metrics, &local, &trusted,
+            GrantedLabAuditRequest {
+                client: &stranger, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                signed_grant: &signed, trusted_issuer_id: id(9),
+                route_token: id(4), message_id: id(5),
+                trusted_reference: &reference, now_ms: 100_010,
+            }
+        ).await,
+        Err(LabAuditError::Grant(AuditGrantError::WrongEndpoint)),
+    ));
+    assert_eq!(
+        metrics.verified_report(local.scope(), 100_010).unwrap()
+            .last_24h.storage.eligible,
+        0,
+    );
+
+    // Only exact W3 fetched through the authenticated authorized AUDIT
+    // session becomes one local E1 record (never recipient-signed W4).
+    assert_eq!(
+        audit_and_record_granted(
+            &mut metrics, &local, &trusted,
+            GrantedLabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                signed_grant: &signed, trusted_issuer_id: id(9),
+                route_token: id(4), message_id: id(5),
+                trusted_reference: &reference, now_ms: 100_010,
+            }
+        ).await.unwrap(),
+        LabAuditOutcome::ExactBytes(AppendResult::Stored),
+    );
+    let repeated = LocalEvidenceContext::bind(
+        ServiceIdentity { id: id(13), epoch: 7, role: ServiceRole::Public },
+        &observer, 2, id(92), 100_012, &trusted,
+    ).unwrap();
+    assert_eq!(
+        audit_and_record_granted(
+            &mut metrics, &repeated, &trusted,
+            GrantedLabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                signed_grant: &signed, trusted_issuer_id: id(9),
+                route_token: id(4), message_id: id(5),
+                trusted_reference: &reference, now_ms: 100_012,
+            }
+        ).await.unwrap(),
+        LabAuditOutcome::ExactBytes(AppendResult::ExactReplay),
+    );
+    let report = metrics.verified_report(local.scope(), 100_012).unwrap();
+    assert_eq!(report.last_24h.storage.successes, 1);
+    assert_eq!(report.last_24h.storage.failures, 0);
+    assert_eq!(report.last_24h.authorized_fetch.eligible, 0);
+    assert_eq!(report.last_24h.recipient_w4_observations, 0);
+
+    // A signed grant expires on BOTH sides; an issuer revocation must be
+    // checked again even when this same TLS client reconnects.
+    assert!(matches!(
+        audit_and_record_granted(
+            &mut metrics, &repeated, &trusted,
+            GrantedLabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                signed_grant: &signed, trusted_issuer_id: id(9),
+                route_token: id(4), message_id: id(5),
+                trusted_reference: &reference, now_ms: 100_100,
+            }
+        ).await,
+        Err(LabAuditError::Grant(AuditGrantError::Expired)),
+    ));
+    let mut revoked = trust();
+    revoked.revoke(id(9)).unwrap();
+    assert!(matches!(
+        audit_and_record_granted(
+            &mut metrics, &repeated, &revoked,
+            GrantedLabAuditRequest {
+                client: &auditor, address: rogue.addr.clone(),
+                expected_pinned_endpoint: rogue.addr.id,
+                signed_binding: &rogue.binding,
+                signed_grant: &signed, trusted_issuer_id: id(9),
+                route_token: id(4), message_id: id(5),
+                trusted_reference: &reference, now_ms: 100_012,
+            }
+        ).await,
+        Err(LabAuditError::Grant(AuditGrantError::UntrustedIssuer)),
+    ));
+    assert_eq!(
+        metrics.verified_report(local.scope(), 100_012).unwrap()
+            .last_24h.storage.eligible,
+        1,
+    );
 }
