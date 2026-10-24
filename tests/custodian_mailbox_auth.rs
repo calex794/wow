@@ -48,7 +48,7 @@ impl Fixture {
                 sender_id: [7; 16],
                 recipient_id: RECIPIENT,
                 message_id: MESSAGE,
-                expiry: EXPIRY,
+                expiry: EXPIRY as u64,
                 epoch: 1,
             },
             b"independent signed mailbox STORE authorization",
