@@ -35,7 +35,7 @@ cp "$b/public.sign" "$a/peer.sign"
 cp "$a/public.hpke" "$b/peer.hpke"
 cp "$b/public.hpke" "$a/peer.hpke"
 actor alice send
-cp "$a/forward.pin" "$b/forward.pin"
+actor bob fetch-forward
 actor bob pin-negative
 # Actual process is killed BEFORE SQLite commit: no W4 survives.
 docker run -d --name wow-cloud07-pre --network "$net" --read-only \
@@ -124,11 +124,9 @@ actor bob lost-ack
 docker stop wow-cloud07-proxy >/dev/null
 # Metadata is NOT forged from an upload response. Alice can only read Bob's
 # return prefix; the test conductor passes opaque bytes, not credentials.
-cp "$b/return.envelope" "$a/return.envelope"
 actor alice reconcile-return
-cp "$a/return.proof" "$b/return.proof"
 actor bob accept-pin
-cp "$b/return.pin" "$a/return.pin"
+actor alice fetch-return
 actor alice pin-negative
 cmp "$b/return.envelope" "$RUNNER_TEMP/cloud07_saved_w4"
 actor alice reject-corrupt
