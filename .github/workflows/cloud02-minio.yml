@@ -63,6 +63,66 @@ jobs:
           status="$(aws --endpoint-url "$WOW_MINIO_ENDPOINT" s3api get-bucket-versioning \
             --bucket "$WOW_MINIO_BUCKET" --query Status --output text)"
           test "$status" = Enabled
+      - name: Download pinned MinIO admin client
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --silent --show-error \
+            --output "$RUNNER_TEMP/mc" \
+            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z
+          printf '%s  %s\n' \
+            '01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891' \
+            "$RUNNER_TEMP/mc" | sha256sum --check -
+          chmod 0700 "$RUNNER_TEMP/mc"
+      - name: Provision independent mail principals
+        run: |
+          set -euo pipefail
+          mc="$RUNNER_TEMP/mc"
+          export MC_HOST_lab="http://${WOW_MINIO_ACCESS}:${WOW_MINIO_SECRET}@127.0.0.1:9000"
+          "$mc" admin user add lab wow_alice_ci wow_alice_disposable_pass_20261023
+          "$mc" admin user add lab wow_bob_ci wow_bob_disposable_pass_20261023
+          for policy in alice bob; do
+            "$mc" admin policy create lab "wow-${policy}-ci" \
+              "$GITHUB_WORKSPACE/labs/cloud_s3/ci/${policy}-policy.json"
+            "$mc" admin policy attach lab "wow-${policy}-ci" --user "wow_${policy}_ci"
+          done
+      - name: Test scoped account permissions on real MinIO
+        env:
+          WOW_ALICE_ACCESS: wow_alice_ci
+          WOW_ALICE_SECRET: wow_alice_disposable_pass_20261023
+          WOW_BOB_ACCESS: wow_bob_ci
+          WOW_BOB_SECRET: wow_bob_disposable_pass_20261023
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud05_scoped_accounts -- --ignored --nocapture --test-threads=1
+      - name: Drop real successful MinIO PUT response at TCP proxy
+        run: |
+          set -euo pipefail
+          python3 labs/cloud_s3/ci/lost_put_ack_proxy.py &
+          proxy_pid=$!
+          echo "WOW_CLOUD_PROXY_PID=$proxy_pid" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do
+            if (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          cargo test --manifest-path labs/cloud_s3/Cargo.toml \
+            --test cloud05_lost_ack -- --ignored --nocapture --test-threads=1
+      - name: Stop network fault proxy
+        if: always()
+        run: |
+          if [[ -n "${WOW_CLOUD_PROXY_PID:-}" ]]; then
+            kill "$WOW_CLOUD_PROXY_PID" 2>/dev/null || true
+          fi
+      - name: CLOUD-06 isolated Alice and Bob Docker workers
+        env:
+          WOW_ALICE_ACCESS: wow_alice_ci
+          WOW_ALICE_SECRET: wow_alice_disposable_pass_20261023
+          WOW_BOB_ACCESS: wow_bob_ci
+          WOW_BOB_SECRET: wow_bob_disposable_pass_20261023
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path labs/cloud_s3/Cargo.toml --bin cloud06_node
+          bash labs/cloud_s3/ci/cloud06_isolated_containers.sh
       - name: Execute real conditional PUT and exact-version GET
         run: |
           set -euo pipefail
