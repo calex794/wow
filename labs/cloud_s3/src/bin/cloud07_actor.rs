@@ -188,31 +188,52 @@ async fn bob_commit_pause() -> ! {
     marker("committed.marker");
     pause_until_killed()
 }
-async fn bob_resume() {
+/// Offline-after-commit check: no MinIO client, DNS or network access.
+fn bob_verify_durable_offline() {
+    let bob = Journal::open(&state("journal.sqlite")).unwrap();
+    let receipt = bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().unwrap();
+    assert!(!receipt.is_empty());
+    assert!(!state("return.meta").exists(),
+           "receipt must not be marked remotely published during outage");
+}
+
+/// After MinIO returns, re-fetching the original W3 must not create new W4.
+async fn bob_verify_duplicate() {
     let packet = bob_wire().await;
     let secret = secret_hpke();
     let registry = trust("bob");
+    let mut bob = Journal::open(&state("journal.sqlite")).unwrap();
+    let saved = bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().unwrap();
+    let (kind, again) = bob.accept_private_authenticated_and_queue_receipt(
+        &packet,
+        TrustedRecipient {
+            secret: &secret, recipient_id: BOB_ID, now: NOW + 1,
+            registry: &registry,
+        },
+        ROUTE, &signing(), 6,
+    ).unwrap();
+    assert_eq!(kind, Insert::Duplicate);
+    assert_eq!(again, saved);
+}
+
+/// Recovery is journal-first: a valid signed W4 survives and can be sent
+/// without redownloading W3. This is essential when the forward object
+/// or its read capability is no longer available after local commit.
+async fn bob_resume() {
     let receipt = {
-        let mut bob = Journal::open(&state("journal.sqlite")).unwrap();
-        let saved = bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().unwrap();
-        let (kind, retransmitted) =
-            bob.accept_private_authenticated_and_queue_receipt(
-                &packet,
-                TrustedRecipient {
-                    secret: &secret, recipient_id: BOB_ID, now: NOW + 1,
-                    registry: &registry,
-                },
-                ROUTE, &signing(), 6,
-            ).unwrap();
-        assert_eq!(kind, Insert::Duplicate);
-        assert_eq!(retransmitted, saved);
-        saved
+        let bob = Journal::open(&state("journal.sqlite")).unwrap();
+        bob.queued_recipient_receipt(ALICE_ID, MSG).unwrap().unwrap()
     };
     let encrypted = private_return_w4::seal_signed_receipt(
         &receipt, &peer_hpke(), RETURN_TAG,
     ).unwrap();
     let rev = store().put_once(return_key(), &encrypted).await.unwrap();
     write_meta("return.meta", rev, &encrypted);
+}
+
+fn alice_verify_pending_offline() {
+    let alice = Journal::open(&state("journal.sqlite")).unwrap();
+    assert_eq!(alice.state(BOB_ID, MSG).unwrap(), Delivery::Queued);
 }
 fn invitation<'a>(secret: &'a RecipientSecret, registry: &'a TrustRegistry)
     -> ReturnInvitation<'a>
@@ -263,7 +284,10 @@ fn main() {
             ("bob", "precommit-pause") => bob_precommit_pause().await,
             ("bob", "check-none") => bob_check_none(),
             ("bob", "commit-pause") => bob_commit_pause().await,
+            ("bob", "offline-receipt") => bob_verify_durable_offline(),
+            ("bob", "verify-duplicate") => bob_verify_duplicate().await,
             ("bob", "resume") => bob_resume().await,
+            ("alice", "verify-pending") => alice_verify_pending_offline(),
             _ => panic!("unsupported CLOUD-07 actor command"),
         }
     });
