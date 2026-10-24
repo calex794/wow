@@ -125,13 +125,13 @@ fn public(args: &[String]) -> LabResult<()> {
 fn generate(args: &[String]) -> LabResult<()> {
     if args.len() != 2 { return Err(fail("generate KEYFILE")); }
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret)?;
+    getrandom::fill(&mut secret).map_err(|e| format!("entropy failed: {e:?}"))?;
     create_private(&args[1], &secret)?;
     println!("CREATED private-key-file (secret never printed)");
     Ok(())
 }
 fn issue(args: &[String]) -> LabResult<()> {
-    if args.len() != 13 {
+    if args.len() != 14 {
         return Err(fail("issue ISSUER_KEY ISSUER_ID ISSUER_EPOCH SERVICE_ID SERVICE_EPOCH SERVICE_TLS_ID AUDITOR_TLS_ID ROUTE MESSAGE W3_FIXTURE EXPIRES_MS NONCE_HEX GRANT_OUT"));
     }
     let sender = SigningKey::from_bytes(&seed(&args[1])?);
@@ -187,7 +187,7 @@ fn host_config(args: &[String]) -> LabResult<HostConfig> {
     trust_key(&mut trust, issuer_id, issuer_epoch, &args[8])?;
     let service_signer = SigningKey::from_bytes(&seed(&args[4])?);
     let tls_secret = SecretKey::from_bytes(&seed(&args[5])?);
-    if service_signer.verifying_key().to_bytes() == tls_secret.public().as_bytes()[..] {
+    if service_signer.verifying_key().to_bytes() == *tls_secret.public().as_bytes() {
         return Err(fail("reuse of service signing key as TLS key forbidden"));
     }
     Ok(HostConfig {
@@ -291,7 +291,7 @@ async fn probe(args: &[String]) -> LabResult<()> {
         signature: byte_array(&args[5])?,
     };
     let mut observer_key = [0u8; 32];
-    getrandom::fill(&mut observer_key)?;
+    getrandom::fill(&mut observer_key).map_err(|e| format!("entropy failed: {e:?}"))?;
     let observer = SigningKey::from_bytes(&observer_key);
     let started_ms = local_wall_clock_ms().map_err(|e| format!("clock: {e:?}"))?;
     let context = LocalEvidenceContext::bind(
