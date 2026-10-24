@@ -3,6 +3,7 @@
 //! The bucket must have S3 VERSIONING ENABLED before test execution.
 //! Offline custodian read is tested with an independently instantiated client.
 pub mod signed_pin;
+pub mod sealed_control;
 use akula_wire_lab::cloud_mail_store::{CloudKey, CloudRevision, CloudError, MAX_CLOUD_MAIL_BYTES};
 use aws_sdk_s3::{Client, config::{retry::RetryConfig, Builder as S3ConfigBuilder, Credentials, Region}, primitives::ByteStream};
 
