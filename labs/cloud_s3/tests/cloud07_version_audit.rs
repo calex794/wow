@@ -15,10 +15,24 @@ fn reverse_w4_has_one_version_and_both_parties_pin_the_same_revision() {
     );
     let dir = std::path::Path::new(&std::env::var("RUNNER_TEMP").unwrap())
         .join("wow-cloud07");
-    let alice = std::fs::read_to_string(dir.join("alice/return.meta")).unwrap();
-    let bob = std::fs::read_to_string(dir.join("bob/return.meta")).unwrap();
-    assert_eq!(alice, bob, "authenticated participants must receive the same version pin");
-    let expected_version = alice.lines().next().unwrap().to_owned();
+    use wow_cloud_s3_lab::signed_pin::{self, PinScope, Direction};
+    use ed25519_dalek::VerifyingKey;
+    let alice = std::fs::read(dir.join("alice/return.pin")).unwrap();
+    let bob = std::fs::read(dir.join("bob/return.pin")).unwrap();
+    assert_eq!(alice, bob, "participants must agree on signed version pin");
+    let key_id = akula_wire_lab::cloud_mail_store::CloudKey {
+        namespace: [61; 16], object: [108; 16],
+    };
+    let scope = PinScope {
+        direction: Direction::ReturnW4, key: key_id,
+        recipient: [9; 16], message: [5; 16], expires_at_ms: 500_000,
+    };
+    let signer_bytes: [u8; 32] = std::fs::read(dir.join("bob/public.sign"))
+        .unwrap().try_into().unwrap();
+    let key = VerifyingKey::from_bytes(&signer_bytes).unwrap();
+    let verified = signed_pin::verify(&alice, &key, scope, 100_005).unwrap();
+    let akula_wire_lab::cloud_mail_store::CloudRevision::S3VersionId(expected_version) =
+        verified.revision else { panic!("expected exact S3 version") };
     assert!(!expected_version.is_empty() && expected_version != "null");
 
     let key = format!("wow-mail/{}/{}", "3d".repeat(16), "6c".repeat(16));
