@@ -273,6 +273,38 @@ async fn bob_resume() {
     write_meta("return.meta", rev, &encrypted);
 }
 
+/// Bob's write-only account sees an ambiguous failed HTTP response.
+async fn bob_lost_ack() {
+    let encrypted = bob_prepared_envelope();
+    let proxied = S3Lab::new(
+        "http://wow-cloud07-proxy:9001", "us-east-1",
+        &env::var("WOW_MINIO_BUCKET").unwrap(),
+        &env::var("WOW_SELF_ACCESS").unwrap(),
+        &env::var("WOW_SELF_SECRET").unwrap(),
+    );
+    let err = proxied.put_once(return_key(), &encrypted).await.unwrap_err();
+    assert_eq!(err, akula_wire_lab::cloud_mail_store::CloudError::Ambiguous);
+    assert!(!state("return.meta").exists());
+    marker("ambiguous_upload.marker");
+}
+
+/// Alice has only scoped GET permission on Bob's return prefix. She can
+/// independently verify the exact ciphertext/version and share a pin back.
+/// In production, this proof needs an authenticated invitation/notification.
+async fn alice_reconcile_return() {
+    let opaque = fs::read(state("return.envelope")).unwrap();
+    let pin = store().reconcile_unknown_put(return_key(), &opaque).await.unwrap();
+    write_meta("return.meta", pin, &opaque);
+}
+
+/// Bob confirms a pin supplied by the authorized reader, without any second PUT.
+fn bob_accept_return_pin() {
+    let bytes = fs::read(state("return.envelope")).unwrap();
+    let (_, digest) = read_meta("return.meta");
+    assert_eq!(digest, *blake3::hash(&bytes).as_bytes());
+    assert!(state("ambiguous_upload.marker").exists());
+}
+
 fn alice_verify_pending_offline() {
     let alice = Journal::open(&state("journal.sqlite")).unwrap();
     assert_eq!(alice.state(BOB_ID, MSG).unwrap(), Delivery::Queued);
@@ -331,6 +363,9 @@ fn main() {
             ("bob", "prepare-pause") => bob_prepare_pause(),
             ("bob", "prepare-check") => bob_prepare_check(),
             ("bob", "resume") => bob_resume().await,
+            ("bob", "lost-ack") => bob_lost_ack().await,
+            ("bob", "accept-pin") => bob_accept_return_pin(),
+            ("alice", "reconcile-return") => alice_reconcile_return().await,
             ("alice", "verify-pending") => alice_verify_pending_offline(),
             _ => panic!("unsupported CLOUD-07 actor command"),
         }
