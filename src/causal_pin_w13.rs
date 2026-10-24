@@ -26,7 +26,13 @@ impl ExternalCausalPin{
     PRIMARY KEY(private_scope,custodian));")?;
   Ok(Self{db})
  }
+ /// Trusted genesis provisioning only: unsigned raw observations cannot
+ /// advance an existing causal head. Signed remote claims use pin_signed_claim.
  pub fn pin_observed(&mut self,scope:[u8;16],actor:[u8;16],observed:CausalCommitment)->Result<(),PinError>{
+  self.pin_checked(scope,actor,observed,None)
+ }
+ fn pin_checked(&mut self,scope:[u8;16],actor:[u8;16],observed:CausalCommitment,
+                signed_predecessor:Option<[u8;32]>)->Result<(),PinError>{
   if scope==[0;16]||actor==[0;16]||observed.seq==0||observed.seq>i64::MAX as u64{return Err(PinError::Invalid)}
   let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
   let prev:Option<(i64,Vec<u8>,i64)>=tx.query_row(
@@ -40,6 +46,17 @@ impl ExternalCausalPin{
       tx.commit()?;return Err(PinError::Conflict)
    }
    Some((seq,d,_)) if observed.seq==seq as u64&&d.as_slice()==observed.digest.as_slice()=>return Ok(()),
+   Some((seq,d,_)) => {
+      // Every advance must be a directly consecutive, authenticated W12 claim
+      // whose signed predecessor is the exact independently pinned digest.
+      // A signed head at seq+2 (or a raw unsigned advance) is not continuity.
+      if observed.seq != seq as u64 + 1 ||
+         signed_predecessor.as_ref().is_none_or(|p|p.as_slice()!=d.as_slice()) {
+          return Err(PinError::Missing);
+      }
+   }
+   None if observed.seq!=1 || signed_predecessor.is_some_and(|p|p!=[0;32]) =>
+       return Err(PinError::Missing),
    _=>{}
   }
   tx.execute("INSERT INTO causal_pin(private_scope,custodian,seq,digest,frozen)
@@ -76,13 +93,11 @@ impl ExternalCausalPin {
    if verified.private_scope!=expected_scope || verified.custodian_id!=expected_actor {
       return Err(PinError::Invalid);
    }
-   let prior=self.compare(expected_scope,expected_actor,Some(verified.commitment))?;
-   match prior {
-     Check::Rollback|Check::Conflict=>return Err(PinError::Conflict),
-     _=>{}
-   }
-   // Fail closed on missing continuity rather than trusting a new higher seq.
-   self.pin_observed(expected_scope,expected_actor,verified.commitment)?;
+   // The signature authenticates the predecessor as part of the W12 body.
+   // Check and commit that link in the same SQLite IMMEDIATE transaction:
+   // a separate compare() before the write would be vulnerable to races.
+   self.pin_checked(expected_scope,expected_actor,verified.commitment,
+                    Some(verified.predecessor))?;
    Ok(verified.commitment)
  }
 }

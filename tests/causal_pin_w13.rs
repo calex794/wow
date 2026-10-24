@@ -7,14 +7,17 @@ fn independent_pin_survives_simulated_source_rollback(){
  let scope=[7;16];let node=[8;16];
  let mut pin=ExternalCausalPin::open(&path).unwrap();
  assert_eq!(pin.compare(scope,node,None).unwrap(),Check::NoPin);
+ assert!(matches!(pin.pin_observed(scope,node,c(2,12)),Err(PinError::Missing)),
+         "a missing genesis must not accept a later unverified head");
  pin.pin_observed(scope,node,c(1,11)).unwrap();
- pin.pin_observed(scope,node,c(2,12)).unwrap();
+ assert!(matches!(pin.pin_observed(scope,node,c(2,12)),Err(PinError::Missing)),
+         "unsigned raw observations must not bypass signed continuation");
  drop(pin);
  let mut pin=ExternalCausalPin::open(&path).unwrap();
- assert_eq!(pin.compare(scope,node,Some(c(1,11))).unwrap(),Check::Rollback);
+ assert_eq!(pin.compare(scope,node,Some(c(1,11))).unwrap(),Check::Match);
  assert_eq!(pin.compare(scope,node,None).unwrap(),Check::Rollback);
- assert_eq!(pin.compare(scope,node,Some(c(2,12))).unwrap(),Check::Match);
- assert!(matches!(pin.pin_observed(scope,node,c(1,11)),Err(PinError::Rollback)));
+ assert!(matches!(pin.compare(scope,node,Some(c(2,12))),Err(PinError::Missing)));
+ assert!(matches!(pin.pin_observed(scope,node,c(2,12)),Err(PinError::Missing)));
 }
 #[test]
 fn same_sequence_evidence_forks_freeze(){
@@ -68,23 +71,59 @@ fn real_w3_w12_signed_head_is_verified_and_pinned(){
  let mut trust=TrustRegistry::new();
  trust.enroll([8;16],1,custodian.verifying_key()).unwrap();
  let (_,pk)=crypto_w3::new_recipient();
- let packet=private_route_w3::seal_private(&sender,&pk,[9;16],SignedHeader{
-    sender_id:[7;16],recipient_id:[3;16],message_id:[4;16],
-    expiry:10_000_000,epoch:1
- },b"actual opaque W3 and attested causal head").unwrap();
- let req=CausalRequest{private_scope:[5;16],custodian_id:[8;16],custodian_epoch:1,
-     recipient:[3;16],message:[4;16],expiry_ms:10_000_000};
  let mut j=Journal::open(&t.path().join("custodian.sqlite")).unwrap();
- let head=j.enqueue_w3_with_causal(req,&packet,&custodian,&trust).unwrap();
- let proof=j.export_w12_signed_head([5;16],[8;16],&trust).unwrap().unwrap();
- let parsed=verify_w12_signed_claim(&proof,&trust).unwrap();
- assert_eq!(parsed.commitment,head);
+ let mut append=|id:u8| {
+    let packet=private_route_w3::seal_private(&sender,&pk,[9;16],SignedHeader{
+       sender_id:[7;16],recipient_id:[3;16],message_id:[id;16],
+       expiry:10_000_000,epoch:1
+    },b"actual opaque W3 and attested causal head").unwrap();
+    let req=CausalRequest{private_scope:[5;16],custodian_id:[8;16],custodian_epoch:1,
+        recipient:[3;16],message:[id;16],expiry_ms:10_000_000};
+    let head=j.enqueue_w3_with_causal(req,&packet,&custodian,&trust).unwrap();
+    let signed=j.export_w12_signed_head([5;16],[8;16],&trust).unwrap().unwrap();
+    assert_eq!(verify_w12_signed_claim(&signed,&trust).unwrap().commitment,head);
+    (head,signed)
+ };
+ let (head1,proof1)=append(4);
+ let (head2,proof2)=append(5);
+ let (head3,proof3)=append(6);
+ assert_eq!((head1.seq,head2.seq,head3.seq),(1,2,3));
+
+ let mut no_genesis=ExternalCausalPin::open(&t.path().join("no-genesis.sqlite")).unwrap();
+ assert!(matches!(
+    no_genesis.pin_signed_claim(&proof2,[5;16],[8;16],&trust),
+    Err(PinError::Missing)
+ ),"even a valid seq=2 signature cannot bootstrap a missing genesis");
+
  let mut witness=ExternalCausalPin::open(&t.path().join("witness.sqlite")).unwrap();
- assert_eq!(witness.pin_signed_claim(&proof,[5;16],[8;16],&trust).unwrap(),head);
- let mut corrupt=proof.clone(); *corrupt.last_mut().unwrap()^=1;
+ assert_eq!(witness.pin_signed_claim(&proof1,[5;16],[8;16],&trust).unwrap(),head1);
+ assert!(matches!(
+    witness.pin_signed_claim(&proof3,[5;16],[8;16],&trust),
+    Err(PinError::Missing)
+ ),"an authenticated seq=3 cannot skip missing seq=2");
+ assert_eq!(witness.compare([5;16],[8;16],Some(head1)).unwrap(),Check::Match);
+
+ let mut wrong=ExternalCausalPin::open(&t.path().join("wrong-parent.sqlite")).unwrap();
+ wrong.pin_observed([5;16],[8;16],c(1,99)).unwrap();
+ assert!(matches!(
+    wrong.pin_signed_claim(&proof2,[5;16],[8;16],&trust),
+    Err(PinError::Missing)
+ ),"the signed seq=2 predecessor must match the independent pin");
+
+ assert_eq!(witness.pin_signed_claim(&proof2,[5;16],[8;16],&trust).unwrap(),head2);
+ assert_eq!(witness.pin_signed_claim(&proof3,[5;16],[8;16],&trust).unwrap(),head3);
+ assert_eq!(witness.pin_signed_claim(&proof3,[5;16],[8;16],&trust).unwrap(),head3);
+ assert!(matches!(
+    witness.pin_signed_claim(&proof1,[5;16],[8;16],&trust),
+    Err(PinError::Rollback)
+ ));
+ let mut corrupt=proof3.clone(); *corrupt.last_mut().unwrap()^=1;
  assert!(matches!(witness.pin_signed_claim(&corrupt,[5;16],[8;16],&trust),Err(PinError::Invalid)));
- assert!(matches!(witness.pin_signed_claim(&proof,[6;16],[8;16],&trust),Err(PinError::Invalid)));
+ assert!(matches!(witness.pin_signed_claim(&proof3,[6;16],[8;16],&trust),Err(PinError::Invalid)));
  let mut revoked=trust;revoked.revoke([8;16]).unwrap();
- assert!(witness.pin_signed_claim(&proof,[5;16],[8;16],&revoked).is_err());
- assert_eq!(witness.compare([5;16],[8;16],Some(head)).unwrap(),Check::Match);
+ assert!(witness.pin_signed_claim(&proof3,[5;16],[8;16],&revoked).is_err());
+ drop(witness);
+ let witness=ExternalCausalPin::open(&t.path().join("witness.sqlite")).unwrap();
+ assert_eq!(witness.compare([5;16],[8;16],Some(head3)).unwrap(),Check::Match);
+ assert_eq!(witness.compare([5;16],[8;16],Some(head1)).unwrap(),Check::Rollback);
 }

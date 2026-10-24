@@ -33,6 +33,8 @@ fn real_sqlite_custodian_snapshot_rollback_detected_by_separate_observer(){
   let mut j=Journal::open(&db).unwrap();
   let h=save(&mut j,[4;16],packet(&sender,&pk,[4;16]));
   assert_eq!(h.seq,1);
+  let first_signed=j.export_w12_signed_head([5;16],[8;16],&trust).unwrap().unwrap();
+  witness.pin_signed_claim(&first_signed,[5;16],[8;16],&trust).unwrap();
   h
  };
  fs::copy(&db,&snapshot).unwrap();
