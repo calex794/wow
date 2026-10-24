@@ -17,7 +17,7 @@ const MESSAGE: [u8; 16] = [4; 16];
 
 fn fixture() -> (SigningKey, TrustRegistry, Vec<u8>, CausalRequest) {
     let sender = SigningKey::from_bytes(&[7; 32]);
-    let custodian = SigningKey::from_bytes(&CUSTODIAN);
+    let custodian = SigningKey::from_bytes(&[8; 32]);
     let mut trust = TrustRegistry::new();
     trust.enroll(CUSTODIAN, 1, custodian.verifying_key()).unwrap();
     let (_, public) = crypto_w3::new_recipient();
