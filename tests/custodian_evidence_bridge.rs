@@ -115,7 +115,8 @@ fn w7_exact_bytes_are_e1_and_repeat_spam_is_one_daily_observation() {
     assert_eq!(report.last_24h.authorized_fetch.eligible, 0);
     assert_eq!(report.last_24h.recipient_w4_observations, 0);
     let mut bad = w3.clone();
-    bad[bad.len() / 2] ^= 1;
+    let midpoint = bad.len() / 2;
+    bad[midpoint] ^= 1;
     assert_eq!(
         reference.observe(Some(&bad), NOW).unwrap_err(),
         AuditError::WrongCiphertext
@@ -297,11 +298,11 @@ fn one_hundred_fake_e4_reporters_cannot_inflate_the_verified_report() {
     let folder = tempdir().unwrap();
     let trusted = registry();
     let owner = signer(30);
-    let ctx = ctx(12, 2, &owner, 1, NOW, &trusted);
+    let bound = ctx(12, 2, &owner, 1, NOW, &trusted);
     let mut store = LocalObservationStore::open(&folder.path().join("obs.db")).unwrap();
     for i in 1..=100_u8 {
         let raw = ServiceEvent {
-            scope: ctx.scope(),
+            scope: bound.scope(),
             observer_key: [i; 32],
             event_seq: 1,
             operation_alias: [i; 16],
@@ -314,9 +315,9 @@ fn one_hundred_fake_e4_reporters_cannot_inflate_the_verified_report() {
         };
         assert_eq!(store.record(raw).unwrap(), AppendResult::Stored);
     }
-    let raw = store.report(ctx.scope(), NOW).unwrap();
+    let raw = store.report(bound.scope(), NOW).unwrap();
     assert_eq!(raw.last_24h.storage.successes, 100);
-    let verified = store.verified_report(ctx.scope(), NOW).unwrap();
+    let verified = store.verified_report(bound.scope(), NOW).unwrap();
     assert_eq!(verified.last_24h.storage.successes, 0);
     assert!(verified.last_24h.storage.wilson_lower_bound().is_none());
     // Authenticated local W7 check is the only route to this tally.
@@ -331,7 +332,7 @@ fn one_hundred_fake_e4_reporters_cannot_inflate_the_verified_report() {
         AppendResult::Stored
     );
     assert_eq!(
-        store.verified_report(ctx.scope(), NOW).unwrap()
+        store.verified_report(bound.scope(), NOW).unwrap()
             .last_24h.storage.successes,
         1
     );
