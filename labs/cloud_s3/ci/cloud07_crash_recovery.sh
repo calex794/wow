@@ -73,10 +73,25 @@ done
 test -f "$b/committed.marker"
 docker kill wow-cloud07-post >/dev/null
 docker rm wow-cloud07-post >/dev/null
+# Crash happened after Bob's atomic W4 commit. Stop the storage endpoint,
+# then check local receipt durability without touching the network.
+docker stop wow-cloud02-minio >/dev/null
+actor bob offline-receipt
+actor alice verify-pending
+# Confirm that network loss did not accidentally produce a remote receipt.
+test ! -e "$b/return.meta"
+docker start wow-cloud02-minio >/dev/null
+# The endpoint must be responsive before replay; readiness is not publication.
+for _ in $(seq 1 100); do
+  if curl --fail --silent --max-time 2 http://127.0.0.1:9000/minio/health/live >/dev/null; then break; fi
+  sleep 0.1
+done
+curl --fail --silent --max-time 2 http://127.0.0.1:9000/minio/health/live >/dev/null
+actor bob verify-duplicate
 actor bob resume
 cp "$b/return.meta" "$a/return.meta"
 actor alice reject-corrupt
 actor alice confirm
 actor alice assert-final
 actor alice confirm
-echo "CLOUD-07: real MinIO W3/W4, pre/post SQLite SIGKILL, replay PASS"
+echo "CLOUD-07: MinIO outage, journal-first W4, SIGKILL and replay PASS"
