@@ -40,6 +40,11 @@ impl AuditReference {
         self.digest
     }
 
+    /// Trusted exact ciphertext length, for grant scope checks.
+    pub fn ciphertext_len(&self) -> usize {
+        self.length
+    }
+
     /// Treat missing, refused or timed-out reads as *unavailable*, not fraud.
     /// The trusted observer supplies its own local time; nothing in the
     /// custodian's reply proves what time it was or where it was stored.
