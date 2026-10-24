@@ -87,6 +87,7 @@ impl<'a> LocalEvidenceContext<'a> {
 
     pub fn scope(&self) -> ServiceScope { self.scope }
 
+    #[cfg(feature = "iroh-transport")]
     pub(crate) fn observed_at_ms(&self) -> u64 { self.observed_at_ms }
 
     fn event(
