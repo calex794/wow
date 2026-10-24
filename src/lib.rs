@@ -20,6 +20,8 @@ pub mod custodian_evidence_bridge;
 pub mod custodian_advisory;
 #[cfg(feature = "iroh-transport")]
 pub mod custodian_w7_quic_lab;
+#[cfg(feature = "iroh-transport")]
+pub mod custodian_audit_grant_w7;
 pub mod journal_w4;
 pub mod multipath_w5;
 pub mod custody_transfer_w8;
