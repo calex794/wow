@@ -7,6 +7,7 @@ use crate::custodian_mailbox::{
     decode_store, verify_custodian_stored_claim, AuthError, CustodianStoredClaim,
     FETCH_GRANT_BYTES, STORE_GRANT_BYTES,
 };
+use crate::custodian_discovery::{ListedEntry, LIST_GRANT_BYTES, MAX_LIST_ITEMS};
 use crate::journal_w4::Journal;
 use crate::trust_w3::TrustRegistry;
 use crate::MAX_MESSAGE_BYTES;
@@ -18,9 +19,12 @@ use std::time::Duration;
 const VERSION: u8 = 1;
 const STORE: u8 = 1;
 const FETCH: u8 = 2;
+const LIST: u8 = 4;
+const FETCH_LISTED: u8 = 5;
 const STORED: u8 = 17;
 const FETCHED: u8 = 18;
 const MISSING: u8 = 19;
+const LISTED: u8 = 20;
 const FAILED: u8 = 254;
 const DENIED: u8 = 255;
 const FRAME_LIMIT: usize = MAX_MESSAGE_BYTES + 512;
@@ -116,6 +120,47 @@ fn handle_request(
         }
         FETCH if request.len() == 2 + FETCH_GRANT_BYTES => {
             let packet = journal.fetch_custodian_authorized(&request[2..], trust, now_ms)?;
+            match packet {
+                Some(packet) => {
+                    let mut reply = Vec::with_capacity(packet.len() + 2);
+                    reply.extend_from_slice(&[VERSION, FETCHED]);
+                    reply.extend_from_slice(&packet);
+                    Ok(reply)
+                }
+                None => Ok(vec![VERSION, MISSING]),
+            }
+        }
+        LIST if request.len() == 2 + LIST_GRANT_BYTES => {
+            let entries = journal.list_custodian_authorized(&request[2..], trust, now_ms)?;
+            let mut reply = Vec::with_capacity(3 + entries.len() * 64);
+            reply.extend_from_slice(&[VERSION, LISTED, entries.len() as u8]);
+            for entry in entries {
+                reply.extend_from_slice(&entry.seq.to_be_bytes());
+                reply.extend_from_slice(&entry.message);
+                reply.extend_from_slice(&entry.digest);
+                reply.extend_from_slice(&entry.expires_at_ms.to_be_bytes());
+            }
+            Ok(reply)
+        }
+        FETCH_LISTED if request.len() == 2 + LIST_GRANT_BYTES + 64 => {
+            let mut pos = 2 + LIST_GRANT_BYTES;
+            let seq = u64::from_be_bytes(
+                request[pos..pos + 8].try_into().map_err(|_| AuthError::Invalid)?,
+            );
+            pos += 8;
+            let message: [u8; 16] = request[pos..pos + 16]
+                .try_into().map_err(|_| AuthError::Invalid)?;
+            pos += 16;
+            let digest: [u8; 32] = request[pos..pos + 32]
+                .try_into().map_err(|_| AuthError::Invalid)?;
+            pos += 32;
+            let expiry = i64::from_be_bytes(
+                request[pos..pos + 8].try_into().map_err(|_| AuthError::Invalid)?,
+            );
+            let wanted = ListedEntry { seq, message, digest, expires_at_ms: expiry };
+            let packet = journal.fetch_custodian_listed(
+                &request[2..2 + LIST_GRANT_BYTES], wanted, trust, now_ms,
+            )?;
             match packet {
                 Some(packet) => {
                     let mut reply = Vec::with_capacity(packet.len() + 2);
@@ -243,6 +288,84 @@ pub fn client_fetch(
         || packet.len() > MAX_MESSAGE_BYTES
         || blake3::hash(packet).as_bytes() != &expected_digest
     {
+        return Err(WireError::Invalid);
+    }
+    Ok(Some(packet.to_vec()))
+}
+
+
+/// Read the enrolled recipient's private mailbox listing. Entries are
+/// metadata hints, not storage proofs or proofs of completeness.
+pub fn client_list(
+    stream: &mut TcpStream,
+    signed_list: &[u8],
+) -> Result<Vec<ListedEntry>, WireError> {
+    if signed_list.len() != LIST_GRANT_BYTES {
+        return Err(WireError::Invalid);
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::with_capacity(2 + LIST_GRANT_BYTES);
+    request.extend_from_slice(&[VERSION, LIST]);
+    request.extend_from_slice(signed_list);
+    write_frame(stream, &request)?;
+    let reply = read_frame(stream)?;
+    let body = parse_reply(&reply, LISTED)?;
+    if body.is_empty() || body[0] > MAX_LIST_ITEMS
+        || body.len() != 1 + usize::from(body[0]) * 64
+    {
+        return Err(WireError::Invalid);
+    }
+    let mut entries = Vec::with_capacity(usize::from(body[0]));
+    let mut prev_seq = 0u64;
+    for chunk in body[1..].chunks_exact(64) {
+        let seq = u64::from_be_bytes(chunk[..8].try_into().map_err(|_| WireError::Invalid)?);
+        let message = chunk[8..24].try_into().map_err(|_| WireError::Invalid)?;
+        let digest = chunk[24..56].try_into().map_err(|_| WireError::Invalid)?;
+        let expires_at_ms = i64::from_be_bytes(
+            chunk[56..64].try_into().map_err(|_| WireError::Invalid)?,
+        );
+        if seq == 0 || seq <= prev_seq || expires_at_ms <= 0 {
+            return Err(WireError::Invalid);
+        }
+        entries.push(ListedEntry { seq, message, digest, expires_at_ms });
+        prev_seq = seq;
+    }
+    Ok(entries)
+}
+
+/// A recipient-signed LIST grant permits FETCH of a specific listed tuple.
+/// Neither LIST nor this FETCH can authorize STORE or recipient W4.
+pub fn client_fetch_listed(
+    stream: &mut TcpStream,
+    signed_list: &[u8],
+    wanted: ListedEntry,
+) -> Result<Option<Vec<u8>>, WireError> {
+    if signed_list.len() != LIST_GRANT_BYTES || wanted.seq == 0 {
+        return Err(WireError::Invalid);
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::with_capacity(2 + LIST_GRANT_BYTES + 64);
+    request.extend_from_slice(&[VERSION, FETCH_LISTED]);
+    request.extend_from_slice(signed_list);
+    request.extend_from_slice(&wanted.seq.to_be_bytes());
+    request.extend_from_slice(&wanted.message);
+    request.extend_from_slice(&wanted.digest);
+    request.extend_from_slice(&wanted.expires_at_ms.to_be_bytes());
+    write_frame(stream, &request)?;
+    let reply = read_frame(stream)?;
+    if reply.as_slice() == [VERSION, MISSING] {
+        return Ok(None);
+    }
+    let packet = parse_reply(&reply, FETCHED)?;
+    if packet.is_empty() || packet.len() > MAX_MESSAGE_BYTES
+        || blake3::hash(packet).as_bytes() != &wanted.digest
+    {
+        return Err(WireError::Invalid);
+    }
+    let route = crate::private_route_w3::inspect_route(packet).map_err(|_| WireError::Invalid)?;
+    if route.message_id != wanted.message || route.expires_at_ms != wanted.expires_at_ms as u64 {
         return Err(WireError::Invalid);
     }
     Ok(Some(packet.to_vec()))
