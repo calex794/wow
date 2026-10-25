@@ -385,8 +385,7 @@ impl Journal {
         signed_invitation: &[u8],
         signed_store: &[u8],
         w3: &[u8],
-        signer: &SigningKey,
-        signer_epoch: u64,
+        custodian_signer: (&SigningKey, u64),
         trust: &TrustRegistry,
         now_ms: i64,
     ) -> Result<CustodianStoredClaim, AuthError> {
@@ -410,7 +409,7 @@ impl Journal {
         )?;
         self.commit_custodian_store_with_claim(
             StoreLocator { mailbox: claims.mailbox, offer: claims.offer },
-            w3, signer, signer_epoch, trust, now_ms,
+            w3, custodian_signer.0, custodian_signer.1, trust, now_ms,
         )
     }
 }
