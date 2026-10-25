@@ -208,9 +208,11 @@ fn unauthenticated_or_tampered_requests_never_reserve_or_read() {
     assert_eq!(count(&path, "custodian_mailbox_offer"), 0);
 
     // STORE and FETCH do not share a signing domain or a wire command.
+    let mut invalid_read = f.fetch();
+    *invalid_read.last_mut().unwrap() ^= 1;
     assert!(matches!(
-        fetch_exchange(&f, &path, &f.store()),
-        Err(WireError::Invalid)
+        fetch_exchange(&f, &path, &invalid_read),
+        Err(WireError::Denied)
     ));
     assert!(matches!(
         fetch_exchange(&f, &path, &f.fetch()),
