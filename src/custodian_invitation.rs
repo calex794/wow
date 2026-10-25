@@ -240,6 +240,21 @@ pub(crate) fn verify_delegated_store(
     Ok(claims)
 }
 
+/// Verify the unauthenticated public W3 route hint against the signed
+/// invitation at the same commit boundary; the recipient later authenticates
+/// the encrypted W3 sender before it can issue a final W4.
+pub(crate) fn verify_invited_route(
+    signed_invitation: &[u8],
+    w3: &[u8],
+) -> Result<(), AuthError> {
+    let (invite, _) = decode(signed_invitation)?;
+    let hint = private_route_w3::inspect_route(w3).map_err(|_| AuthError::Invalid)?;
+    if hint.token != invite.route_token {
+        return Err(AuthError::Unauthorized);
+    }
+    Ok(())
+}
+
 /// Historical cryptographic signature check. This does not evaluate the
 /// current revocation state or prove continuous physical storage. Retain the
 /// original invitation alongside the signed offer when validating old claims.
@@ -277,7 +292,10 @@ pub fn verify_delegated_stored_claim(
         return Err(AuthError::Invalid);
     }
     let route = private_route_w3::inspect_route(w3).map_err(|_| AuthError::Invalid)?;
-    if route.message_id != claims.message || route.expires_at_ms != claims.expires_at as u64 {
+    if route.token != invite.route_token
+        || route.message_id != claims.message
+        || route.expires_at_ms != claims.expires_at as u64
+    {
         return Err(AuthError::Invalid);
     }
     let custodian = trust.key_for(invite.custodian, claim.custodian_epoch)
