@@ -5,6 +5,7 @@ use akula_wire_lab::{
     crypto_identity_w3::{SignedHeader, TrustedRecipient},
     crypto_w3,
     custodian_invitation::{sign_invitation_for_lab, MailboxInvitation},
+    custodian_discovery::{sign_list_for_lab, ListClaims},
     custodian_mailbox::{sign_store_for_lab, MailboxPolicy, StoreClaims},
     custodian_return::{
         sign_return_deposit_for_lab, sign_return_read_for_lab,
@@ -12,7 +13,8 @@ use akula_wire_lab::{
     },
     custodian_wire::{
         bind_test_loopback, client_deposit_return, client_fetch_return,
-        client_register_return, client_store_delegated, serve_one_loopback, WireError,
+        client_register_return, client_store_delegated, client_list,
+        client_fetch_listed, serve_one_loopback, WireError,
     },
     journal_w4::{Delivery, Insert, Journal},
     private_return_w4::{self, ReturnInvitation},
@@ -182,10 +184,25 @@ fn encrypted_recipient_w4_survives_custodian_restart_and_updates_sender_only_aft
         client_fetch_return(s,&signed_read,RETURN_TAG)).unwrap().is_none());
     assert_eq!(alice_journal.state(RECIPIENT,MESSAGE).unwrap(),Delivery::Queued);
 
-    // Bob opens his own SQLite later and decrypts/validates the W3 first.
+    // Bob was offline while Alice sent. Bob discovers the letter through
+    // recipient-signed LIST and downloads exactly those bytes via network.
+    let signed_list=sign_list_for_lab(&c.bob,ListClaims {
+        issuer:OWNER,issuer_epoch:1,custodian:CUSTODIAN,mailbox:MAILBOX,
+        scope:SCOPE,recipient:RECIPIENT,recipient_epoch:1,
+        since_seq:0,grant_until_ms:100_000,nonce:[99;16],max_items:2,
+    });
+    let entries=on_socket(&c,&server,4,|s|client_list(s,&signed_list)).unwrap();
+    assert_eq!(entries.len(),1);
+    assert_eq!(entries[0].message,MESSAGE);
+    assert_eq!(entries[0].digest,c.digest);
+    let bob_packet=on_socket(&c,&server,4,|s|
+        client_fetch_listed(s,&signed_list,entries[0])).unwrap()
+        .expect("encrypted W3 must be retrievable after Alice disconnects");
+    assert_eq!(bob_packet,c.w3);
+
     let mut bob_journal=Journal::open(&recipient).unwrap();
     let verified=private_route_w3::open_authenticated(
-        &c.w3,TrustedRecipient {
+        &bob_packet,TrustedRecipient {
             secret:&c.bob_hpke_secret,recipient_id:RECIPIENT,now:4,
             registry:&c.trust,
         },TOKEN,
@@ -195,7 +212,7 @@ fn encrypted_recipient_w4_survives_custodian_restart_and_updates_sender_only_aft
     let reply_pub=crypto_w3::RecipientPublic::from_bytes(&payload[16..48]).unwrap();
     assert_eq!(&payload[48..],b"private 3-party custodian receipt");
     let (insert,w4)=bob_journal.accept_private_authenticated_and_queue_receipt(
-        &c.w3,TrustedRecipient {
+        &bob_packet,TrustedRecipient {
             secret:&c.bob_hpke_secret,recipient_id:RECIPIENT,now:4,
             registry:&c.trust,
         },TOKEN,&c.bob,1,
