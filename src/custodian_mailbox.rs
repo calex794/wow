@@ -99,6 +99,50 @@ pub struct FetchClaims {
     pub grant_until: i64,
     pub digest: [u8; 32],
 }
+/// Independently verified owner/operator mail role, anchored by the
+/// Akula Node root policy. Never accept its fields from a network peer.
+/// This is a lab-only runtime + SQLite authorization boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MailRoleGate {
+    pub mailbox_policy: MailboxPolicy,
+    pub policy_epoch: u64,
+    pub signed_policy_digest: [u8; 32],
+}
+fn valid_mail_role_gate(gate: &MailRoleGate) -> bool {
+    valid_policy(&gate.mailbox_policy)
+        && gate.policy_epoch > 0
+        && gate.policy_epoch <= i64::MAX as u64
+        && gate.signed_policy_digest != [0; 32]
+}
+/// The SAME BEGIN IMMEDIATE transaction that commits W12 also checks the
+/// owner policy digest, epoch, current SQLite policy and local revocation.
+fn enforce_mail_role_tx(
+    tx: &Transaction<'_>,
+    policy: &MailboxPolicy,
+    gate: Option<MailRoleGate>,
+) -> Result<(), AuthError> {
+    let Some(gate) = gate else { return Ok(()); };
+    if !valid_mail_role_gate(&gate) || *policy != gate.mailbox_policy {
+        return Err(AuthError::Unauthorized);
+    }
+    let row: Option<(i64, Vec<u8>, i64)> = tx.query_row(
+        "SELECT policy_epoch,signed_digest,revoked
+         FROM custodian_mail_role_guard WHERE mailbox=?1",
+        params![policy.mailbox.as_slice()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional()?;
+    let Some((epoch,digest,revoked)) = row else {
+        return Err(AuthError::Unauthorized);
+    };
+    if epoch != gate.policy_epoch as i64
+        || digest.as_slice() != gate.signed_policy_digest.as_slice()
+        || revoked != 0
+    {
+        return Err(AuthError::Unauthorized);
+    }
+    Ok(())
+}
+
 /// A signer assertion bound to the exact owner STORE grant and W12 head.
 /// This does NOT prove continuous physical storage or recipient delivery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,7 +349,7 @@ pub fn verify_custodian_stored_claim(
 fn id16(v: Vec<u8>) -> Result<[u8; 16], AuthError> {
     v.try_into().map_err(|_|AuthError::Corrupt)
 }
-pub(crate) fn load_policy(tx: &Transaction<'_>, mailbox: [u8; 16]) -> Result<Option<SavedPolicy>, AuthError> {
+pub(crate) fn load_policy(tx: &Transaction<'_>, mailbox: [u8; 16], role_gate: Option<MailRoleGate>) -> Result<Option<SavedPolicy>, AuthError> {
     type Row = (Vec<u8>, i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64, i64);
     let row: Option<Row> = tx.query_row(
         "SELECT issuer,issuer_epoch,custodian,scope,recipient,max_bytes,max_offers,store_revoked,fetch_revoked
@@ -330,6 +374,7 @@ pub(crate) fn load_policy(tx: &Transaction<'_>, mailbox: [u8; 16]) -> Result<Opt
     if !valid_policy(&p) || (s != 0 && s != 1) || (f != 0 && f != 1) {
         return Err(AuthError::Corrupt);
     }
+    enforce_mail_role_tx(tx, &p, role_gate)?;
     Ok(Some(SavedPolicy { policy: p, store_revoked: s == 1, fetch_revoked: f == 1 }))
 }
 
@@ -363,6 +408,13 @@ impl Journal {
                offer BLOB PRIMARY KEY CHECK(length(offer)=16),
                signed_invitation BLOB NOT NULL CHECK(length(signed_invitation)=269),
                FOREIGN KEY(offer) REFERENCES custodian_mailbox_offer(offer)
+             );
+             CREATE TABLE IF NOT EXISTS custodian_mail_role_guard(
+               mailbox BLOB PRIMARY KEY CHECK(length(mailbox)=16),
+               policy_epoch INTEGER NOT NULL CHECK(policy_epoch>0),
+               signed_digest BLOB NOT NULL CHECK(length(signed_digest)=32),
+               revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)),
+               FOREIGN KEY(mailbox) REFERENCES custodian_mailbox_policy(mailbox)
              );",
         )?;
         Ok(())
@@ -378,7 +430,7 @@ impl Journal {
             .map_err(|_|AuthError::Unauthorized)?;
         self.ensure_custodian_mailbox_schema()?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(old) = load_policy(&tx, policy.mailbox)? {
+        if let Some(old) = load_policy(&tx, policy.mailbox, self.mail_role_gate)? {
             if old.policy == policy {
                 tx.commit()?;
                 return Ok(());
@@ -441,7 +493,7 @@ impl Journal {
         let (claims, _) = decode_store(signed_store)?;
         self.ensure_custodian_mailbox_schema()?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy = load_policy(&tx, claims.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy = load_policy(&tx, claims.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let claims = verify_store(signed_store, policy, trust, now)?;
         let old: Option<(Vec<u8>, i64)> = tx.query_row(
             "SELECT signed_grant,state FROM custodian_mailbox_offer WHERE offer=?1",
@@ -495,7 +547,7 @@ impl Journal {
         self.ensure_custodian_mailbox_schema()?;
         self.ensure_w12_schema()?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy = load_policy(&tx, mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy = load_policy(&tx, mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let row: Option<(Vec<u8>, i64)> = tx.query_row(
             "SELECT signed_grant,state FROM custodian_mailbox_offer
              WHERE mailbox=?1 AND offer=?2",
@@ -626,7 +678,7 @@ impl Journal {
         let (claims, _) = decode_fetch(signed_fetch)?;
         self.ensure_custodian_mailbox_schema()?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy = load_policy(&tx, claims.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy = load_policy(&tx, claims.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let claims = verify_fetch(signed_fetch, policy, trust, now)?;
         type Row = (Vec<u8>, Vec<u8>, Vec<u8>, i64);
         let row: Option<Row> = tx.query_row(
