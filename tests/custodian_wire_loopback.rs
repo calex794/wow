@@ -678,3 +678,53 @@ fn delegated_store_is_fenced_by_invitation_limits_and_current_revocation() {
     ));
     assert_eq!(count(&path, "outbox"), 0);
 }
+
+
+#[test]
+fn invitation_binds_hpke_public_key_and_w3_route_to_one_mailbox() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recipient_invitation_binding.sqlite");
+    let f = Fixture::new();
+    f.provision(&path);
+    let invitation = invitation(&f, 1024);
+    let (packet, claims) = future_message(&f, &invitation);
+    let grant = sign_store_for_lab(&f.sender_signer, claims);
+
+    // Owner's signature also covers the HPKE recipient public key and route.
+    let mut replaced_key = invitation.clone();
+    replaced_key[170] ^= 1;
+    assert!(verify_invitation_for_sender(
+        &replaced_key, ISSUER, CUSTODIAN, [7; 16], &f.trust, 2,
+    ).is_err());
+    assert!(matches!(
+        delegated_exchange(&f, &path, &replaced_key, &grant, &packet),
+        Err(WireError::Denied)
+    ));
+    let mut replaced_route = invitation.clone();
+    replaced_route[195] ^= 1;
+    assert!(verify_invitation_for_sender(
+        &replaced_route, ISSUER, CUSTODIAN, [7; 16], &f.trust, 2,
+    ).is_err());
+
+    // A legitimate sender's signed digest is not enough if W3's public route
+    // contradicts the mailbox owner's authenticated invitation.
+    let foreign_route_packet = private_route_w3::seal_private(
+        &f.sender_signer, &f.recipient_public, [42; 16],
+        SignedHeader {
+            sender_id: [7; 16], recipient_id: RECIPIENT,
+            message_id: claims.message, expiry: EXPIRY as u64, epoch: 1,
+        },
+        b"correct sender signature but unrelated invitation route",
+    ).unwrap();
+    let mut foreign_claims = claims;
+    foreign_claims.packet_len = foreign_route_packet.len() as u32;
+    foreign_claims.digest = *blake3::hash(&foreign_route_packet).as_bytes();
+    assert!(matches!(
+        delegated_exchange(&f, &path, &invitation,
+            &sign_store_for_lab(&f.sender_signer, foreign_claims),
+            &foreign_route_packet),
+        Err(WireError::Denied)
+    ));
+    assert_eq!(count(&path, "custodian_mailbox_offer"), 0);
+    assert_eq!(count(&path, "outbox"), 0);
+}
