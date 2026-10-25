@@ -24,6 +24,9 @@ const FETCH_BODY: usize = 1 + 16 * 6 + 8 * 2 + 32;
 const SIG_BYTES: usize = 64;
 const MAX_OFFERS: u32 = 64;
 
+pub const STORE_GRANT_BYTES: usize = STORE_BODY + SIG_BYTES;
+pub const FETCH_GRANT_BYTES: usize = FETCH_BODY + SIG_BYTES;
+
 #[derive(Debug)]
 pub enum AuthError {
     Db(rusqlite::Error),
