@@ -151,7 +151,7 @@ fn encode_store(c: StoreClaims) -> Vec<u8> {
     debug_assert_eq!(b.len(), STORE_BODY);
     b
 }
-pub(crate) pub(crate) fn decode_store(raw: &[u8]) -> Result<(StoreClaims, Signature), AuthError> {
+pub(crate) fn decode_store(raw: &[u8]) -> Result<(StoreClaims, Signature), AuthError> {
     if raw.len() != STORE_BODY + SIG_BYTES || raw[0] != VERSION { return Err(AuthError::Invalid); }
     let mut offset = 1;
     let c = StoreClaims {
