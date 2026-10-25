@@ -319,7 +319,7 @@ impl Journal {
         let (untrusted, _) = decode(signed_invitation)?;
         self.ensure_custodian_mailbox_schema()?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy = load_policy(&tx, untrusted.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy = load_policy(&tx, untrusted.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let claims = verify_delegated_store(
             signed_store, signed_invitation, policy, trust, now_ms,
         )?;
