@@ -20,6 +20,7 @@ pub mod multipath_w5;
 pub mod custody_transfer_w8;
 pub mod causal_w12;
 pub mod custodian_mailbox;
+pub mod custodian_wire;
 pub mod custody_witness_w9;
 pub mod witness_pin_w10;
 pub mod cloud_mail_store;
