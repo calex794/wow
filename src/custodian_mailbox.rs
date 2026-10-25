@@ -15,11 +15,11 @@ use crate::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
-const STORE_DOMAIN: &[u8] = b"Akula/WOW/Custodian/STORE/lab-v0\0";
+pub(crate) const STORE_DOMAIN: &[u8] = b"Akula/WOW/Custodian/STORE/lab-v0\0";
 const FETCH_DOMAIN: &[u8] = b"Akula/WOW/Custodian/FETCH/lab-v0\0";
 const STORED_DOMAIN: &[u8] = b"Akula/WOW/Custodian/STORED-CLAIM/lab-v0\0";
 const VERSION: u8 = 1;
-const STORE_BODY: usize = 1 + 16 * 8 + 8 * 3 + 4 + 32;
+pub(crate) const STORE_BODY: usize = 1 + 16 * 8 + 8 * 3 + 4 + 32;
 const FETCH_BODY: usize = 1 + 16 * 6 + 8 * 2 + 32;
 const SIG_BYTES: usize = 64;
 const MAX_OFFERS: u32 = 64;
@@ -256,7 +256,7 @@ fn verify_fetch(
         .map_err(|_|AuthError::Unauthorized)?;
     Ok(c)
 }
-fn stored_claim_body(claim: &CustodianStoredClaim) -> Vec<u8> {
+pub(crate) fn stored_claim_body(claim: &CustodianStoredClaim) -> Vec<u8> {
     let mut body = signed(STORED_DOMAIN, &encode_store(claim.store));
     body.extend_from_slice(&claim.custodian_epoch.to_be_bytes());
     body.extend_from_slice(&claim.causal.seq.to_be_bytes());
