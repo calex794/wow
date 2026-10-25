@@ -4,7 +4,7 @@ use akula_wire_lab::{
     crypto_identity_w3::SignedHeader,
     crypto_w3,
     custodian_discovery::{sign_list_for_lab, ListClaims, ListedEntry},
-    custodian_invitation::{sign_invitation_for_lab, MailboxInvitation},
+    custodian_invitation::{sign_invitation_for_lab, verify_invitation_for_sender, MailboxInvitation},
     custodian_mailbox::{
         sign_fetch_for_lab, sign_store_for_lab, CustodianStoredClaim, FetchClaims, MailboxPolicy,
         StoreClaims,
@@ -17,6 +17,7 @@ use akula_wire_lab::{
     MAX_MESSAGE_BYTES,
 };
 use ed25519_dalek::SigningKey;
+use hpke::Serializable;
 use rusqlite::Connection;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -36,6 +37,8 @@ struct Fixture {
     custodian: SigningKey,
     sender_signer: SigningKey,
     recipient_signer: SigningKey,
+    recipient_secret: crypto_w3::RecipientSecret,
+    recipient_public: crypto_w3::RecipientPublic,
     trust: TrustRegistry,
     packet: Vec<u8>,
     policy: MailboxPolicy,
@@ -52,7 +55,7 @@ impl Fixture {
         trust.enroll(CUSTODIAN, 1, custodian.verifying_key()).unwrap();
         trust.enroll(RECIPIENT, 1, recipient_signer.verifying_key()).unwrap();
         trust.enroll([7; 16], 1, sender.verifying_key()).unwrap();
-        let (_, recipient_public) = crypto_w3::new_recipient();
+        let (recipient_secret, recipient_public) = crypto_w3::new_recipient();
         let packet = private_route_w3::seal_private(
             &sender,
             &recipient_public,
@@ -92,7 +95,7 @@ impl Fixture {
             packet_len: packet.len() as u32,
             digest: *blake3::hash(&packet).as_bytes(),
         };
-        Self { owner, custodian, sender_signer: sender, recipient_signer, trust, packet, policy, claims }
+        Self { owner, custodian, sender_signer: sender, recipient_signer, recipient_secret, recipient_public, trust, packet, policy, claims }
     }
 
     fn provision(&self, path: &Path) {
@@ -285,7 +288,7 @@ fn oversized_frames_are_rejected_before_read_allocation_or_storage() {
     f.provision(&path);
     let (addr, worker) = serve(&f, &path);
     let mut client = TcpStream::connect(addr).unwrap();
-    client.write_all(&((MAX_MESSAGE_BYTES + 513) as u32).to_be_bytes()).unwrap();
+    client.write_all(&((MAX_MESSAGE_BYTES + 545) as u32).to_be_bytes()).unwrap();
     drop(client);
     assert!(matches!(worker.join().unwrap(), Err(WireError::Invalid)));
     assert_eq!(count(&path, "custodian_mailbox_offer"), 0);
@@ -314,7 +317,7 @@ fn forged_reply(reply: Vec<u8>) -> (std::net::SocketAddr, thread::JoinHandle<()>
         let mut header = [0u8; 4];
         peer.read_exact(&mut header).unwrap();
         let len = u32::from_be_bytes(header) as usize;
-        assert!(len <= MAX_MESSAGE_BYTES + 512);
+        assert!(len <= MAX_MESSAGE_BYTES + 544);
         let mut request = vec![0u8; len];
         peer.read_exact(&mut request).unwrap();
         peer.write_all(&(reply.len() as u32).to_be_bytes()).unwrap();
@@ -494,6 +497,12 @@ fn delegated_exchange(
     response
 }
 
+fn invitation_hpke(f: &Fixture) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&f.recipient_public.to_bytes());
+    bytes
+}
+
 fn invitation(f: &Fixture, max_packet_bytes: u32) -> Vec<u8> {
     sign_invitation_for_lab(&f.owner, MailboxInvitation {
         issuer: ISSUER,
@@ -508,15 +517,20 @@ fn invitation(f: &Fixture, max_packet_bytes: u32) -> Vec<u8> {
         slot: [13; 16],
         max_packet_bytes,
         valid_until_ms: EXPIRY,
+        recipient_hpke_public: invitation_hpke(f),
+        route_token: [9; 16],
     })
 }
 
-fn future_message(f: &Fixture) -> (Vec<u8>, StoreClaims) {
-    let (_, recipient_public) = crypto_w3::new_recipient();
+fn future_message(f: &Fixture, signed_invitation: &[u8]) -> (Vec<u8>, StoreClaims) {
+    let invite = verify_invitation_for_sender(
+        signed_invitation, ISSUER, CUSTODIAN, [7; 16], &f.trust, 2,
+    ).unwrap();
+    let recipient_public = invite.recipient_public().unwrap();
     let packet = private_route_w3::seal_private(
         &f.sender_signer,
         &recipient_public,
-        [9; 16],
+        invite.route_token,
         SignedHeader {
             sender_id: [7; 16],
             recipient_id: RECIPIENT,
@@ -541,7 +555,7 @@ fn signed_invitation_precedes_future_message_and_recipient_discovers_it_offline(
     f.provision(&path);
     // B issues this BEFORE A chooses a message ID or creates the ciphertext.
     let invite = invitation(&f, 1024);
-    let (packet, claims) = future_message(&f);
+    let (packet, claims) = future_message(&f, &invitation(&f, 1024));
     let proof = sign_store_for_lab(&f.sender_signer, claims);
     let first = delegated_exchange(&f, &path, &invite, &proof, &packet).unwrap();
     let replay = delegated_exchange(&f, &path, &invite, &proof, &packet).unwrap();
@@ -558,10 +572,21 @@ fn signed_invitation_precedes_future_message_and_recipient_discovers_it_offline(
     assert_eq!(entries[0].seq, first.causal.seq);
     assert_eq!(entries[0].message, claims.message);
     assert_eq!(entries[0].digest, claims.digest);
-    assert_eq!(
-        fetch_listed_exchange(&f, &path, &proof, entries[0]).unwrap(),
-        Some(packet)
-    );
+    let fetched = fetch_listed_exchange(&f, &path, &proof, entries[0])
+        .unwrap().expect("recipient must fetch the unchanged W3");
+    assert_eq!(fetched, packet);
+    let verified = private_route_w3::open_authenticated(
+        &fetched,
+        akula_wire_lab::crypto_identity_w3::TrustedRecipient {
+            secret: &f.recipient_secret,
+            recipient_id: RECIPIENT,
+            now: 2,
+            registry: &f.trust,
+        },
+        [9; 16],
+    ).expect("recipient must decrypt the exact message from signed invitation");
+    assert_eq!(verified.header().message_id, claims.message);
+    assert_eq!(verified.payload(), b"offline recipient can find this without prior message digest");
 }
 
 #[test]
@@ -571,7 +596,7 @@ fn delegated_offer_rejects_unauthorized_sender_tampering_and_second_message() {
     let f = Fixture::new();
     f.provision(&path);
     let invite = invitation(&f, 1024);
-    let (packet, claims) = future_message(&f);
+    let (packet, claims) = future_message(&f, &invitation(&f, 1024));
     let proof = sign_store_for_lab(&f.sender_signer, claims);
 
     let mut bad_invite = invite.clone();
@@ -622,7 +647,7 @@ fn delegated_store_is_fenced_by_invitation_limits_and_current_revocation() {
     let path = tmp.path().join("delegated_limits.sqlite");
     let f = Fixture::new();
     f.provision(&path);
-    let (packet, claims) = future_message(&f);
+    let (packet, claims) = future_message(&f, &invitation(&f, 1024));
     let proof = sign_store_for_lab(&f.sender_signer, claims);
 
     assert!(matches!(
@@ -635,6 +660,8 @@ fn delegated_store_is_fenced_by_invitation_limits_and_current_revocation() {
         mailbox: MAILBOX, scope: SCOPE, recipient: RECIPIENT,
         sender: [7; 16], sender_epoch: 1, offer: [12;16], slot: [13;16],
         max_packet_bytes: 1024, valid_until_ms: 1,
+        recipient_hpke_public: invitation_hpke(&f),
+        route_token: [9; 16],
     });
     assert!(matches!(
         delegated_exchange(&f, &path, &expired, &proof, &packet),
