@@ -5,3 +5,5 @@
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub mod crypto_w3;
 pub mod trust_w3;
+
+pub mod file_receipt_w4;
