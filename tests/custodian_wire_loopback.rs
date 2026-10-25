@@ -4,12 +4,13 @@ use akula_wire_lab::{
     crypto_identity_w3::SignedHeader,
     crypto_w3,
     custodian_discovery::{sign_list_for_lab, ListClaims, ListedEntry},
+    custodian_invitation::{sign_invitation_for_lab, MailboxInvitation},
     custodian_mailbox::{
         sign_fetch_for_lab, sign_store_for_lab, CustodianStoredClaim, FetchClaims, MailboxPolicy,
         StoreClaims,
     },
     custodian_wire::{bind_test_loopback, client_fetch, client_fetch_listed,
-        client_list, client_store, serve_one_loopback, WireError},
+        client_list, client_store, client_store_delegated, serve_one_loopback, WireError},
     journal_w4::Journal,
     private_route_w3,
     trust_w3::TrustRegistry,
@@ -33,6 +34,7 @@ const EXPIRY: i64 = 10_000_000;
 struct Fixture {
     owner: SigningKey,
     custodian: SigningKey,
+    sender_signer: SigningKey,
     recipient_signer: SigningKey,
     trust: TrustRegistry,
     packet: Vec<u8>,
@@ -49,6 +51,7 @@ impl Fixture {
         trust.enroll(ISSUER, 1, owner.verifying_key()).unwrap();
         trust.enroll(CUSTODIAN, 1, custodian.verifying_key()).unwrap();
         trust.enroll(RECIPIENT, 1, recipient_signer.verifying_key()).unwrap();
+        trust.enroll([7; 16], 1, sender.verifying_key()).unwrap();
         let (_, recipient_public) = crypto_w3::new_recipient();
         let packet = private_route_w3::seal_private(
             &sender,
@@ -89,7 +92,7 @@ impl Fixture {
             packet_len: packet.len() as u32,
             digest: *blake3::hash(&packet).as_bytes(),
         };
-        Self { owner, custodian, recipient_signer, trust, packet, policy, claims }
+        Self { owner, custodian, sender_signer: sender, recipient_signer, trust, packet, policy, claims }
     }
 
     fn provision(&self, path: &Path) {
@@ -152,6 +155,7 @@ fn serve(f: &Fixture, path: &Path) -> (std::net::SocketAddr, thread::JoinHandle<
     trust.enroll(ISSUER, 1, f.owner.verifying_key()).unwrap();
     trust.enroll(CUSTODIAN, 1, f.custodian.verifying_key()).unwrap();
     trust.enroll(RECIPIENT, 1, f.recipient_signer.verifying_key()).unwrap();
+    trust.enroll([7; 16], 1, f.sender_signer.verifying_key()).unwrap();
     let handle = thread::spawn(move || {
         let mut journal = Journal::open(&path).unwrap();
         serve_one_loopback(&listener, &mut journal, &signer, 1, &trust, 2)
@@ -473,4 +477,177 @@ fn listed_fetch_is_confined_to_exact_message_seq_and_digest() {
         Err(WireError::Denied)
     ));
     assert_eq!(count(&path, "receipt_outbox"), 0);
+}
+
+
+fn delegated_exchange(
+    f: &Fixture,
+    path: &Path,
+    invitation: &[u8],
+    sender_proof: &[u8],
+    packet: &[u8],
+) -> Result<CustodianStoredClaim, WireError> {
+    let (addr, worker) = serve(f, path);
+    let mut client = TcpStream::connect(addr).unwrap();
+    let response = client_store_delegated(&mut client, invitation, sender_proof, packet, &f.trust);
+    assert!(worker.join().unwrap().is_ok());
+    response
+}
+
+fn invitation(f: &Fixture, max_packet_bytes: u32) -> Vec<u8> {
+    sign_invitation_for_lab(&f.owner, MailboxInvitation {
+        issuer: ISSUER,
+        issuer_epoch: 1,
+        custodian: CUSTODIAN,
+        mailbox: MAILBOX,
+        scope: SCOPE,
+        recipient: RECIPIENT,
+        sender: [7; 16],
+        sender_epoch: 1,
+        offer: [12; 16],
+        slot: [13; 16],
+        max_packet_bytes,
+        valid_until_ms: EXPIRY,
+    })
+}
+
+fn future_message(f: &Fixture) -> (Vec<u8>, StoreClaims) {
+    let (_, recipient_public) = crypto_w3::new_recipient();
+    let packet = private_route_w3::seal_private(
+        &f.sender_signer,
+        &recipient_public,
+        [9; 16],
+        SignedHeader {
+            sender_id: [7; 16],
+            recipient_id: RECIPIENT,
+            message_id: [16; 16],
+            expiry: EXPIRY as u64,
+            epoch: 1,
+        },
+        b"offline recipient can find this without prior message digest",
+    ).unwrap();
+    let mut claims = f.claims;
+    claims.message = [16; 16];
+    claims.packet_len = packet.len() as u32;
+    claims.digest = *blake3::hash(&packet).as_bytes();
+    (packet, claims)
+}
+
+#[test]
+fn signed_invitation_precedes_future_message_and_recipient_discovers_it_offline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("delegated.sqlite");
+    let f = Fixture::new();
+    f.provision(&path);
+    // B issues this BEFORE A chooses a message ID or creates the ciphertext.
+    let invite = invitation(&f, 1024);
+    let (packet, claims) = future_message(&f);
+    let proof = sign_store_for_lab(&f.sender_signer, claims);
+    let first = delegated_exchange(&f, &path, &invite, &proof, &packet).unwrap();
+    let replay = delegated_exchange(&f, &path, &invite, &proof, &packet).unwrap();
+    assert_eq!(first, replay, "lost ACK cannot consume a second slot");
+    assert_eq!(count(&path, "custodian_mailbox_offer"), 1);
+    assert_eq!(count(&path, "custodian_mailbox_delegated_offer"), 1);
+    assert_eq!(count(&path, "causal_w12_event"), 1);
+    assert_eq!(count(&path, "receipt_outbox"), 0, "C cannot impersonate B");
+
+    // B was offline during STORE and knows only its own mailbox invitation.
+    let proof = f.list(0, 2);
+    let entries = list_exchange(&f, &path, &proof).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].seq, first.causal.seq);
+    assert_eq!(entries[0].message, claims.message);
+    assert_eq!(entries[0].digest, claims.digest);
+    assert_eq!(
+        fetch_listed_exchange(&f, &path, &proof, entries[0]).unwrap(),
+        Some(packet)
+    );
+}
+
+#[test]
+fn delegated_offer_rejects_unauthorized_sender_tampering_and_second_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("delegated_denied.sqlite");
+    let f = Fixture::new();
+    f.provision(&path);
+    let invite = invitation(&f, 1024);
+    let (packet, claims) = future_message(&f);
+    let proof = sign_store_for_lab(&f.sender_signer, claims);
+
+    let mut bad_invite = invite.clone();
+    *bad_invite.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        delegated_exchange(&f, &path, &bad_invite, &proof, &packet),
+        Err(WireError::Denied)
+    ));
+    let bad_sender = SigningKey::from_bytes(&[44; 32]);
+    assert!(matches!(
+        delegated_exchange(&f, &path, &invite, &sign_store_for_lab(&bad_sender, claims), &packet),
+        Err(WireError::Denied)
+    ));
+    let mut changed = packet.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        delegated_exchange(&f, &path, &invite, &proof, &changed),
+        Err(WireError::Denied)
+    ));
+    assert_eq!(count(&path, "custodian_mailbox_offer"), 0);
+    assert_eq!(count(&path, "outbox"), 0);
+
+    delegated_exchange(&f, &path, &invite, &proof, &packet).unwrap();
+    let (_, other_public) = crypto_w3::new_recipient();
+    let other_packet = private_route_w3::seal_private(
+        &f.sender_signer, &other_public, [9;16],
+        SignedHeader {
+            sender_id: [7;16], recipient_id: RECIPIENT,
+            message_id: [18;16], expiry: EXPIRY as u64, epoch: 1,
+        }, b"second ciphertext must not reuse one-off slot",
+    ).unwrap();
+    let mut other_claims = claims;
+    other_claims.message = [18;16];
+    other_claims.packet_len = other_packet.len() as u32;
+    other_claims.digest = *blake3::hash(&other_packet).as_bytes();
+    assert!(matches!(
+        delegated_exchange(&f, &path, &invite,
+            &sign_store_for_lab(&f.sender_signer, other_claims), &other_packet),
+        Err(WireError::Denied)
+    ));
+    assert_eq!(count(&path, "outbox"), 1);
+    assert_eq!(count(&path, "custodian_mailbox_offer"), 1);
+}
+
+#[test]
+fn delegated_store_is_fenced_by_invitation_limits_and_current_revocation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("delegated_limits.sqlite");
+    let f = Fixture::new();
+    f.provision(&path);
+    let (packet, claims) = future_message(&f);
+    let proof = sign_store_for_lab(&f.sender_signer, claims);
+
+    assert!(matches!(
+        delegated_exchange(&f, &path, &invitation(&f, packet.len() as u32 - 1),
+            &proof, &packet),
+        Err(WireError::Denied)
+    ));
+    let expired = sign_invitation_for_lab(&f.owner, MailboxInvitation {
+        issuer: ISSUER, issuer_epoch: 1, custodian: CUSTODIAN,
+        mailbox: MAILBOX, scope: SCOPE, recipient: RECIPIENT,
+        sender: [7; 16], sender_epoch: 1, offer: [12;16], slot: [13;16],
+        max_packet_bytes: 1024, valid_until_ms: 1,
+    });
+    assert!(matches!(
+        delegated_exchange(&f, &path, &expired, &proof, &packet),
+        Err(WireError::Denied)
+    ));
+    assert_eq!(count(&path, "custodian_mailbox_offer"), 0);
+
+    let mut journal = Journal::open(&path).unwrap();
+    journal.operator_revoke_store(MAILBOX).unwrap();
+    drop(journal);
+    assert!(matches!(
+        delegated_exchange(&f, &path, &invitation(&f, 1024), &proof, &packet),
+        Err(WireError::Denied)
+    ));
+    assert_eq!(count(&path, "outbox"), 0);
 }
