@@ -8,6 +8,7 @@ use crate::custodian_mailbox::{
     FETCH_GRANT_BYTES, STORE_GRANT_BYTES,
 };
 use crate::custodian_discovery::{ListedEntry, LIST_GRANT_BYTES, MAX_LIST_ITEMS};
+use crate::custodian_invitation::{verify_delegated_stored_claim, INVITATION_BYTES};
 use crate::journal_w4::Journal;
 use crate::trust_w3::TrustRegistry;
 use crate::MAX_MESSAGE_BYTES;
@@ -19,6 +20,7 @@ use std::time::Duration;
 const VERSION: u8 = 1;
 const STORE: u8 = 1;
 const FETCH: u8 = 2;
+const DELEGATED_STORE: u8 = 3;
 const LIST: u8 = 4;
 const FETCH_LISTED: u8 = 5;
 const STORED: u8 = 17;
@@ -109,6 +111,33 @@ fn handle_request(
                 signer_epoch,
                 trust,
                 now_ms,
+            )?;
+            let mut reply = Vec::with_capacity(114);
+            reply.extend_from_slice(&[VERSION, STORED]);
+            reply.extend_from_slice(&claim.custodian_epoch.to_be_bytes());
+            reply.extend_from_slice(&claim.causal.seq.to_be_bytes());
+            reply.extend_from_slice(&claim.causal.digest);
+            reply.extend_from_slice(&claim.signature);
+            Ok(reply)
+        }
+        DELEGATED_STORE => {
+            let invite_start = 2;
+            let invite_end = invite_start + INVITATION_BYTES;
+            let grant_end = invite_end + STORE_GRANT_BYTES;
+            if request.len() < grant_end + 3 {
+                return Err(AuthError::Invalid);
+            }
+            let len = u16::from_be_bytes(
+                request[grant_end..grant_end + 2].try_into().map_err(|_| AuthError::Invalid)?,
+            ) as usize;
+            let packet = &request[grant_end + 2..];
+            if len == 0 || len > MAX_MESSAGE_BYTES || len != packet.len() {
+                return Err(AuthError::Invalid);
+            }
+            let claim = journal.accept_delegated_custodian_store_and_claim(
+                &request[invite_start..invite_end],
+                &request[invite_end..grant_end],
+                packet, signer, signer_epoch, trust, now_ms,
             )?;
             let mut reply = Vec::with_capacity(114);
             reply.extend_from_slice(&[VERSION, STORED]);
@@ -369,4 +398,62 @@ pub fn client_fetch_listed(
         return Err(WireError::Invalid);
     }
     Ok(Some(packet.to_vec()))
+}
+
+
+/// One-shot lab delegated STORE. The recipient signed a one-slot invitation
+/// before this W3 was created; the enrolled sender signs the exact W3 hash.
+/// The server must prove its own signature over the W12 causal commitment.
+pub fn client_store_delegated(
+    stream: &mut TcpStream,
+    signed_invitation: &[u8],
+    sender_signed_store: &[u8],
+    w3: &[u8],
+    trust: &TrustRegistry,
+) -> Result<CustodianStoredClaim, WireError> {
+    if signed_invitation.len() != INVITATION_BYTES
+        || sender_signed_store.len() != STORE_GRANT_BYTES
+        || w3.is_empty() || w3.len() > MAX_MESSAGE_BYTES
+    {
+        return Err(WireError::Invalid);
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::with_capacity(
+        2 + INVITATION_BYTES + STORE_GRANT_BYTES + 2 + w3.len(),
+    );
+    request.extend_from_slice(&[VERSION, DELEGATED_STORE]);
+    request.extend_from_slice(signed_invitation);
+    request.extend_from_slice(sender_signed_store);
+    request.extend_from_slice(&(w3.len() as u16).to_be_bytes());
+    request.extend_from_slice(w3);
+    write_frame(stream, &request)?;
+    let reply = read_frame(stream)?;
+    let response = parse_reply(&reply, STORED)?;
+    if response.len() != 8 + 8 + 32 + 64 {
+        return Err(WireError::Invalid);
+    }
+    let (claims, _) = decode_store(sender_signed_store).map_err(|_| WireError::Invalid)?;
+    let mut pos = 0usize;
+    let epoch = u64::from_be_bytes(
+        response[pos..pos + 8].try_into().map_err(|_| WireError::Invalid)?,
+    );
+    pos += 8;
+    let seq = u64::from_be_bytes(
+        response[pos..pos + 8].try_into().map_err(|_| WireError::Invalid)?,
+    );
+    pos += 8;
+    let digest = response[pos..pos + 32].try_into().map_err(|_| WireError::Invalid)?;
+    pos += 32;
+    let signature = response[pos..pos + 64].try_into().map_err(|_| WireError::Invalid)?;
+    let claim = CustodianStoredClaim {
+        store: claims,
+        custodian_epoch: epoch,
+        causal: crate::causal_w12::CausalCommitment { seq, digest },
+        signature,
+    };
+    verify_delegated_stored_claim(
+        &claim, sender_signed_store, signed_invitation, w3, trust,
+    ).map_err(|_| WireError::Denied)?;
+    Ok(claim)
 }
