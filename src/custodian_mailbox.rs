@@ -358,6 +358,11 @@ impl Journal {
                state INTEGER NOT NULL CHECK(state IN (0,1)),
                UNIQUE(mailbox,recipient,message),
                FOREIGN KEY(mailbox) REFERENCES custodian_mailbox_policy(mailbox)
+             );
+             CREATE TABLE IF NOT EXISTS custodian_mailbox_delegated_offer(
+               offer BLOB PRIMARY KEY CHECK(length(offer)=16),
+               signed_invitation BLOB NOT NULL CHECK(length(signed_invitation)=221),
+               FOREIGN KEY(offer) REFERENCES custodian_mailbox_offer(offer)
              );",
         )?;
         Ok(())
@@ -499,7 +504,18 @@ impl Journal {
         ).optional()?;
         let (signed_store,state) = row.ok_or(AuthError::Unauthorized)?;
         if state != 0 && state != 1 { return Err(AuthError::Corrupt); }
-        let claims = verify_store(&signed_store, policy, trust, now)?;
+        let delegated_invitation: Option<Vec<u8>> = tx.query_row(
+            "SELECT signed_invitation FROM custodian_mailbox_delegated_offer WHERE offer=?1",
+            params![offer.as_slice()],
+            |r| r.get(0),
+        ).optional()?;
+        let claims = if let Some(invitation) = delegated_invitation {
+            crate::custodian_invitation::verify_delegated_store(
+                &signed_store, &invitation, policy, trust, now,
+            )?
+        } else {
+            verify_store(&signed_store, policy, trust, now)?
+        };
         if claims.offer != offer || claims.mailbox != mailbox
             || claims.packet_len as usize != w3.len()
             || blake3::hash(w3).as_bytes() != &claims.digest
