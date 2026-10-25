@@ -148,7 +148,7 @@ fn encode_store(c: StoreClaims) -> Vec<u8> {
     debug_assert_eq!(b.len(), STORE_BODY);
     b
 }
-fn decode_store(raw: &[u8]) -> Result<(StoreClaims, Signature), AuthError> {
+pub(crate) fn decode_store(raw: &[u8]) -> Result<(StoreClaims, Signature), AuthError> {
     if raw.len() != STORE_BODY + SIG_BYTES || raw[0] != VERSION { return Err(AuthError::Invalid); }
     let mut offset = 1;
     let c = StoreClaims {
@@ -521,6 +521,45 @@ impl Journal {
         )?;
         tx.commit()?;
         Ok((result, claims))
+    }
+
+    /// Safe ordering for a one-message network adapter: reject wrong or
+    /// malformed ciphertext BEFORE reserving a one-use custody slot.
+    /// The independently signed STORE grant and policy are still verified
+    /// under SQLite IMMEDIATE at RequestStore and again at CommitStore.
+    pub fn accept_custodian_store_and_claim(
+        &mut self,
+        signed_store: &[u8],
+        w3: &[u8],
+        custodian_signer: &SigningKey,
+        custodian_epoch: u64,
+        trust: &TrustRegistry,
+        now: i64,
+    ) -> Result<CustodianStoredClaim, AuthError> {
+        let (claims, _) = decode_store(signed_store)?;
+        if w3.is_empty()
+            || w3.len() > MAX_MESSAGE_BYTES
+            || claims.packet_len as usize != w3.len()
+            || blake3::hash(w3).as_bytes() != &claims.digest
+        {
+            return Err(AuthError::Invalid);
+        }
+        let route = private_route_w3::inspect_route(w3).map_err(|_| AuthError::Invalid)?;
+        if route.message_id != claims.message || route.expires_at_ms != claims.expires_at as u64 {
+            return Err(AuthError::Invalid);
+        }
+        self.request_custodian_store(signed_store, trust, now)?;
+        self.commit_custodian_store_with_claim(
+            StoreLocator {
+                mailbox: claims.mailbox,
+                offer: claims.offer,
+            },
+            w3,
+            custodian_signer,
+            custodian_epoch,
+            trust,
+            now,
+        )
     }
 
     /// Existing low-level lab entrypoint remains compatible with its original
