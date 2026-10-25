@@ -65,10 +65,10 @@ pub struct MailboxPolicy {
     pub max_offers: u32,
 }
 #[derive(Clone, Copy)]
-struct SavedPolicy {
-    policy: MailboxPolicy,
-    store_revoked: bool,
-    fetch_revoked: bool,
+pub(crate) struct SavedPolicy {
+    pub(crate) policy: MailboxPolicy,
+    pub(crate) store_revoked: bool,
+    pub(crate) fetch_revoked: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,7 +151,7 @@ fn encode_store(c: StoreClaims) -> Vec<u8> {
     debug_assert_eq!(b.len(), STORE_BODY);
     b
 }
-pub(crate) fn decode_store(raw: &[u8]) -> Result<(StoreClaims, Signature), AuthError> {
+pub(crate) pub(crate) fn decode_store(raw: &[u8]) -> Result<(StoreClaims, Signature), AuthError> {
     if raw.len() != STORE_BODY + SIG_BYTES || raw[0] != VERSION { return Err(AuthError::Invalid); }
     let mut offset = 1;
     let c = StoreClaims {
@@ -305,7 +305,7 @@ pub fn verify_custodian_stored_claim(
 fn id16(v: Vec<u8>) -> Result<[u8; 16], AuthError> {
     v.try_into().map_err(|_|AuthError::Corrupt)
 }
-fn load_policy(tx: &Transaction<'_>, mailbox: [u8; 16]) -> Result<Option<SavedPolicy>, AuthError> {
+pub(crate) fn load_policy(tx: &Transaction<'_>, mailbox: [u8; 16]) -> Result<Option<SavedPolicy>, AuthError> {
     type Row = (Vec<u8>, i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64, i64);
     let row: Option<Row> = tx.query_row(
         "SELECT issuer,issuer_epoch,custodian,scope,recipient,max_bytes,max_offers,store_revoked,fetch_revoked
@@ -334,7 +334,7 @@ fn load_policy(tx: &Transaction<'_>, mailbox: [u8; 16]) -> Result<Option<SavedPo
 }
 
 impl Journal {
-    fn ensure_custodian_mailbox_schema(&self) -> Result<(), AuthError> {
+    pub(crate) fn ensure_custodian_mailbox_schema(&self) -> Result<(), AuthError> {
         self.db.execute_batch(
             "CREATE TABLE IF NOT EXISTS custodian_mailbox_policy(
                mailbox BLOB PRIMARY KEY CHECK(length(mailbox)=16),
