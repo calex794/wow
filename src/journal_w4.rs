@@ -19,7 +19,12 @@ impl Delivery {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Insert { New, Duplicate }
-pub struct Journal { pub(crate) db: Connection }
+pub struct Journal {
+    pub(crate) db: Connection,
+    /// Optional separately anchored mail authority; always required by the
+    /// Akula Node mail bridge, absent in stand-alone historical WOW labs.
+    pub(crate) mail_role_gate: Option<crate::custodian_mailbox::MailRoleGate>,
+}
 impl Journal {
     pub fn open(path:&Path)->Result<Self,JournalError>{
         let db=Connection::open(path)?;
@@ -78,7 +83,7 @@ impl Journal {
               PRIMARY KEY(recipient,message,slot_alias),
               FOREIGN KEY(recipient,message) REFERENCES multipath_plan(recipient,message));
             PRAGMA foreign_keys=ON;")?;
-        Ok(Self{db})
+        Ok(Self { db, mail_role_gate: None })
     }
     pub fn enqueue(&mut self,recipient:[u8;16],message:[u8;16],expiry:i64,packet:&[u8])
         ->Result<Insert,JournalError>{
