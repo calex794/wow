@@ -4,8 +4,8 @@ use akula_wire_lab::{
     crypto_identity_w3::SignedHeader,
     crypto_w3,
     custodian_mailbox::{
-        sign_fetch_for_lab, sign_store_for_lab, AuthError, FetchClaims,
-        MailboxPolicy, Reservation, StoreClaims, StoreLocator,
+        sign_fetch_for_lab, sign_store_for_lab, verify_custodian_stored_claim, AuthError, FetchClaims,
+        CustodianStoredClaim, MailboxPolicy, Reservation, StoreClaims, StoreLocator,
     },
     journal_w4::Journal,
     private_route_w3,
@@ -233,4 +233,65 @@ fn quota_offer_slots_stay_reserved_after_lost_ack_and_restart() {
     assert_eq!(count(&path,"custodian_mailbox_offer"),1);
     let sig=f.store();
     assert!(matches!(j.request_custodian_store(&sig,&f.trust,EXPIRY),Err(AuthError::Expired)));
+}
+
+#[test]
+fn stored_claim_is_exact_signed_and_distinct_from_recipient_w4() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("claim.sqlite");
+    let f = Fixture::new(2);
+    let mut j = f.provision(&path);
+    let signed = f.store();
+    j.request_custodian_store(&signed, &f.trust, 1).unwrap();
+    let locator = StoreLocator { mailbox: MAILBOX, offer: f.claims.offer };
+    let claim = j.commit_custodian_store_with_claim(
+        locator, &f.packet, &f.custodian, 1, &f.trust, 2,
+    ).unwrap();
+    verify_custodian_stored_claim(&claim, &signed, &f.packet, &f.trust).unwrap();
+    assert_eq!(count(&path, "receipt_outbox"), 0, "a C claim is not W4");
+    let replay = j.commit_custodian_store_with_claim(
+        locator, &f.packet, &f.custodian, 1, &f.trust, 2,
+    ).unwrap();
+    assert_eq!(claim, replay, "lost ACK must reproduce the exact signed claim");
+    assert_eq!(count(&path, "outbox"), 1);
+    drop(j);
+    let mut reopened = Journal::open(&path).unwrap();
+    let cold = reopened.commit_custodian_store_with_claim(
+        locator, &f.packet, &f.custodian, 1, &f.trust, 2,
+    ).unwrap();
+    assert_eq!(cold, claim);
+    assert_eq!(reopened.audit_w12(SCOPE, CUSTODIAN, &f.trust).unwrap(), Some(claim.causal));
+
+    let mut changed: CustodianStoredClaim = claim;
+    changed.causal.seq += 1;
+    assert!(verify_custodian_stored_claim(&changed, &signed, &f.packet, &f.trust).is_err());
+    changed = claim;
+    changed.signature[0] ^= 1;
+    assert!(verify_custodian_stored_claim(&changed, &signed, &f.packet, &f.trust).is_err());
+    changed = claim;
+    changed.custodian_epoch += 1;
+    assert!(verify_custodian_stored_claim(&changed, &signed, &f.packet, &f.trust).is_err());
+    let mut changed_bytes = f.packet.clone();
+    *changed_bytes.last_mut().unwrap() ^= 1;
+    assert!(verify_custodian_stored_claim(&claim, &signed, &changed_bytes, &f.trust).is_err());
+    let mut wrong_grant = signed.clone();
+    *wrong_grant.last_mut().unwrap() ^= 1;
+    assert!(verify_custodian_stored_claim(&claim, &wrong_grant, &f.packet, &f.trust).is_err());
+}
+
+#[test]
+fn revoked_store_cannot_generate_a_fresh_stored_claim() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("claim_revoked.sqlite");
+    let f = Fixture::new(2);
+    let mut j = f.provision(&path);
+    j.request_custodian_store(&f.store(), &f.trust, 1).unwrap();
+    j.operator_revoke_store(MAILBOX).unwrap();
+    let result = j.commit_custodian_store_with_claim(
+        StoreLocator { mailbox: MAILBOX, offer: f.claims.offer },
+        &f.packet, &f.custodian, 1, &f.trust, 2,
+    );
+    assert!(matches!(result, Err(AuthError::Unauthorized)));
+    assert_eq!(count(&path, "outbox"), 0);
+    assert_eq!(count(&path, "causal_w12_event"), 0);
 }
