@@ -138,7 +138,7 @@ fn handle_request(
             let claim = journal.accept_delegated_custodian_store_and_claim(
                 &request[invite_start..invite_end],
                 &request[invite_end..grant_end],
-                packet, signer, signer_epoch, trust, now_ms,
+                packet, (signer, signer_epoch), trust, now_ms,
             )?;
             let mut reply = Vec::with_capacity(114);
             reply.extend_from_slice(&[VERSION, STORED]);
@@ -348,7 +348,7 @@ pub fn client_list(
     }
     let mut entries = Vec::with_capacity(usize::from(body[0]));
     let mut prev_seq = 0u64;
-    for chunk in body[1..].chunks_exact(64) {
+    for chunk in body[1..].as_chunks::<64>().0 {
         let seq = u64::from_be_bytes(chunk[..8].try_into().map_err(|_| WireError::Invalid)?);
         let message = chunk[8..24].try_into().map_err(|_| WireError::Invalid)?;
         let digest = chunk[24..56].try_into().map_err(|_| WireError::Invalid)?;
