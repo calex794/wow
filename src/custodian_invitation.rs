@@ -10,16 +10,18 @@ use crate::{
         STORE_DOMAIN,
     },
     journal_w4::Journal,
+    crypto_w3::RecipientPublic,
     private_route_w3,
     trust_w3::TrustRegistry,
     MAX_MESSAGE_BYTES,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+use hpke::Deserializable;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 const DOMAIN: &[u8] = b"Akula/WOW/Custodian/ONE-SLOT-INVITE/lab-v0\0";
 const VERSION: u8 = 1;
-const BODY_LEN: usize = 1 + 8 * 16 + 8 * 3 + 4;
+const BODY_LEN: usize = 1 + 8 * 16 + 8 * 3 + 4 + 32 + 16;
 pub const INVITATION_BYTES: usize = BODY_LEN + 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +38,9 @@ pub struct MailboxInvitation {
     pub slot: [u8; 16],
     pub max_packet_bytes: u32,
     pub valid_until_ms: i64,
+    /// Owner-authenticated W3 encryption public key and private-route token.
+    pub recipient_hpke_public: [u8; 32],
+    pub route_token: [u8; 16],
 }
 
 fn encode(c: MailboxInvitation) -> Vec<u8> {
@@ -51,6 +56,8 @@ fn encode(c: MailboxInvitation) -> Vec<u8> {
     out.extend_from_slice(&c.slot);
     out.extend_from_slice(&c.max_packet_bytes.to_be_bytes());
     out.extend_from_slice(&c.valid_until_ms.to_be_bytes());
+    out.extend_from_slice(&c.recipient_hpke_public);
+    out.extend_from_slice(&c.route_token);
     debug_assert_eq!(out.len(), BODY_LEN);
     out
 }
@@ -80,6 +87,8 @@ fn decode(raw: &[u8]) -> Result<(MailboxInvitation, Signature), AuthError> {
         slot: take(raw, &mut pos),
         max_packet_bytes: u32::from_be_bytes(take(raw, &mut pos)),
         valid_until_ms: i64::from_be_bytes(take(raw, &mut pos)),
+        recipient_hpke_public: take(raw, &mut pos),
+        route_token: take(raw, &mut pos),
     };
     debug_assert_eq!(pos, BODY_LEN);
     let signature = Signature::from_slice(&raw[BODY_LEN..]).map_err(|_| AuthError::Invalid)?;
@@ -120,10 +129,14 @@ fn verify_invitation(
         || invite.max_packet_bytes == 0
         || invite.max_packet_bytes > p.max_message_bytes
         || invite.valid_until_ms <= 0
+        || invite.route_token == [0; 16]
+        || invite.recipient_hpke_public == [0; 32]
         || now_ms < 0 || now_ms >= invite.valid_until_ms
     {
         return Err(AuthError::Invalid);
     }
+    RecipientPublic::from_bytes(&invite.recipient_hpke_public)
+        .map_err(|_| AuthError::Invalid)?;
     let owner = trust.key_for(p.issuer, p.issuer_epoch)
         .map_err(|_| AuthError::Unauthorized)?;
     let mut signed = Vec::with_capacity(DOMAIN.len() + BODY_LEN);
@@ -135,6 +148,57 @@ fn verify_invitation(
     trust.key_for(invite.sender, invite.sender_epoch)
         .map_err(|_| AuthError::Unauthorized)?;
     Ok(invite)
+}
+
+/// Sender-side verification of the original invitation before generating W3.
+/// The caller pins the expected owner/custodian IDs and authenticates the owner
+/// enrollment independently; no public network key is automatically trusted.
+pub fn verify_invitation_for_sender(
+    signed_invitation: &[u8],
+    expected_owner: [u8; 16],
+    expected_custodian: [u8; 16],
+    expected_sender: [u8; 16],
+    trust: &TrustRegistry,
+    now_ms: i64,
+) -> Result<MailboxInvitation, AuthError> {
+    let (invite, sig) = decode(signed_invitation)?;
+    if invite.issuer != expected_owner
+        || invite.custodian != expected_custodian
+        || invite.sender != expected_sender
+        || invite.mailbox == [0; 16]
+        || invite.scope == [0; 16]
+        || invite.recipient == [0; 16]
+        || invite.issuer_epoch == 0
+        || invite.sender_epoch == 0
+        || invite.offer == [0; 16]
+        || invite.slot == [0; 16]
+        || invite.max_packet_bytes == 0
+        || invite.max_packet_bytes as usize > MAX_MESSAGE_BYTES
+        || invite.route_token == [0; 16]
+        || invite.recipient_hpke_public == [0; 32]
+        || now_ms < 0
+        || now_ms >= invite.valid_until_ms
+    {
+        return Err(AuthError::Invalid);
+    }
+    RecipientPublic::from_bytes(&invite.recipient_hpke_public)
+        .map_err(|_| AuthError::Invalid)?;
+    let owner = trust.key_for(invite.issuer, invite.issuer_epoch)
+        .map_err(|_| AuthError::Unauthorized)?;
+    let mut signed = Vec::with_capacity(DOMAIN.len() + BODY_LEN);
+    signed.extend_from_slice(DOMAIN);
+    signed.extend_from_slice(&signed_invitation[..BODY_LEN]);
+    owner.verify(&signed, &sig).map_err(|_| AuthError::Unauthorized)?;
+    trust.key_for(invite.sender, invite.sender_epoch)
+        .map_err(|_| AuthError::Unauthorized)?;
+    Ok(invite)
+}
+
+impl MailboxInvitation {
+    /// Only use after verifying the signed invitation with a pinned owner.
+    pub fn recipient_public(&self) -> Result<RecipientPublic, AuthError> {
+        RecipientPublic::from_bytes(&self.recipient_hpke_public).map_err(|_| AuthError::Invalid)
+    }
 }
 
 /// Current policy, owner invitation, sender proof and exact W3 object fields
@@ -316,7 +380,11 @@ impl Journal {
             return Err(AuthError::Invalid);
         }
         let route = private_route_w3::inspect_route(w3).map_err(|_| AuthError::Invalid)?;
-        if route.message_id != claims.message || route.expires_at_ms != claims.expires_at as u64 {
+        let (invite, _) = decode(signed_invitation)?;
+        if route.token != invite.route_token
+            || route.message_id != claims.message
+            || route.expires_at_ms != claims.expires_at as u64
+        {
             return Err(AuthError::Invalid);
         }
         self.request_delegated_custodian_store(
