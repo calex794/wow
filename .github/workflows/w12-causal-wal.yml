@@ -6,6 +6,7 @@ on:
       - 'src/custodian_mailbox.rs'
       - 'src/custodian_wire.rs'
       - 'src/custodian_discovery.rs'
+      - 'src/custodian_invitation.rs'
       - 'src/bin/w12_causal_crash_worker.rs'
       - 'src/lib.rs'
       - 'Cargo.toml'
