@@ -28,7 +28,6 @@ const OFFER: [u8; 16] = [12; 16];
 const EXPIRY: i64 = 10_000_000;
 
 struct Fixture {
-    owner: SigningKey,
     custodian: SigningKey,
     recipient: SigningKey,
     trust: TrustRegistry,
@@ -84,7 +83,7 @@ impl Fixture {
             packet_len: packet.len() as u32,
             digest: *blake3::hash(&packet).as_bytes(),
         });
-        Self {owner,custodian,recipient,trust,packet,policy,store}
+        Self {custodian,recipient,trust,packet,policy,store}
     }
     fn gate(&self, epoch: u64) -> MailRoleGate {
         MailRoleGate {
