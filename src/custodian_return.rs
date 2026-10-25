@@ -302,9 +302,9 @@ impl Journal {
             || hint.token!=invite.route_token
             || store.message!=route.message || store.digest!=route.digest
             || store.expires_at!=route.expires_at_ms
-            || digest.as_slice()!=route.digest
+            || digest.as_slice()!=route.digest.as_slice()
             || blake3::hash(&packet).as_bytes()!=&route.digest
-            || expiry!=route.expires_at_ms || message.as_slice()!=route.message {
+            || expiry!=route.expires_at_ms || message.as_slice()!=route.message.as_slice() {
             return Err(AuthError::Unauthorized);
         }
         let existing:Option<Vec<u8>>=tx.query_row(
