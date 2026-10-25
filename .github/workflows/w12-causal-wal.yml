@@ -7,6 +7,7 @@ on:
       - 'src/custodian_wire.rs'
       - 'src/custodian_discovery.rs'
       - 'src/custodian_invitation.rs'
+      - 'src/custodian_return.rs'
       - 'src/bin/w12_causal_crash_worker.rs'
       - 'src/lib.rs'
       - 'Cargo.toml'
@@ -14,6 +15,7 @@ on:
       - 'tests/causal_w12_expiry.rs'
       - 'tests/custodian_mailbox_auth.rs'
       - 'tests/custodian_wire_loopback.rs'
+      - 'tests/custodian_return_loopback.rs'
       - '.github/workflows/w12-causal-wal.yml'
   workflow_dispatch:
 permissions:
@@ -32,5 +34,7 @@ jobs:
         run: cargo test --test custodian_mailbox_auth
       - name: Check local-only authenticated custodian socket adapter
         run: cargo test --test custodian_wire_loopback
+      - name: Verify encrypted W4 return across three SQLite participants
+        run: cargo test --test custodian_return_loopback
       - name: Build W12 child process
         run: cargo build --bin w12_causal_crash_worker --features causal-lab-fault
