@@ -3,11 +3,21 @@ on:
   pull_request:
     paths:
       - 'src/causal_w12.rs'
+      - 'src/custodian_mailbox.rs'
+      - 'src/journal_w4.rs'
+      - 'src/custodian_wire.rs'
+      - 'src/custodian_discovery.rs'
+      - 'src/custodian_invitation.rs'
+      - 'src/custodian_return.rs'
       - 'src/bin/w12_causal_crash_worker.rs'
       - 'src/lib.rs'
       - 'Cargo.toml'
       - 'tests/causal_w12_crash.rs'
       - 'tests/causal_w12_expiry.rs'
+      - 'tests/custodian_mailbox_auth.rs'
+      - 'tests/custodian_mail_role_gate.rs'
+      - 'tests/custodian_wire_loopback.rs'
+      - 'tests/custodian_return_loopback.rs'
       - '.github/workflows/w12-causal-wal.yml'
   workflow_dispatch:
 permissions:
@@ -22,5 +32,13 @@ jobs:
         run: cargo test --test causal_w12_crash --features causal-lab-fault
       - name: Check W12 expiry integrity and compatibility
         run: cargo test --test causal_w12_expiry
+      - name: Check distinct custodian STORE/FETCH authorization
+        run: cargo test --test custodian_mailbox_auth
+      - name: Check transaction-bound root-pinned mail role gate
+        run: cargo test --test custodian_mail_role_gate
+      - name: Check local-only authenticated custodian socket adapter
+        run: cargo test --test custodian_wire_loopback
+      - name: Verify encrypted W4 return across three SQLite participants
+        run: cargo test --test custodian_return_loopback
       - name: Build W12 child process
         run: cargo build --bin w12_causal_crash_worker --features causal-lab-fault
