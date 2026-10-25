@@ -1,0 +1,16 @@
+[package]
+name = "akula-wow-w3-crypto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Isolated WOW W3 COSE/HPKE crypto without SQLite or transport"
+
+[lib]
+name = "akula_wow_w3_crypto"
+path = "src/lib.rs"
+
+[dependencies]
+coset = "0.4.2"
+ed25519-dalek = "2.2"
+hpke = "0.14.1"
