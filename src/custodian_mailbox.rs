@@ -361,7 +361,7 @@ impl Journal {
              );
              CREATE TABLE IF NOT EXISTS custodian_mailbox_delegated_offer(
                offer BLOB PRIMARY KEY CHECK(length(offer)=16),
-               signed_invitation BLOB NOT NULL CHECK(length(signed_invitation)=221),
+               signed_invitation BLOB NOT NULL CHECK(length(signed_invitation)=269),
                FOREIGN KEY(offer) REFERENCES custodian_mailbox_offer(offer)
              );",
         )?;
@@ -510,9 +510,11 @@ impl Journal {
             |r| r.get(0),
         ).optional()?;
         let claims = if let Some(invitation) = delegated_invitation {
-            crate::custodian_invitation::verify_delegated_store(
+            let verified = crate::custodian_invitation::verify_delegated_store(
                 &signed_store, &invitation, policy, trust, now,
-            )?
+            )?;
+            crate::custodian_invitation::verify_invited_route(&invitation, w3)?;
+            verified
         } else {
             verify_store(&signed_store, policy, trust, now)?
         };
