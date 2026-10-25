@@ -186,7 +186,7 @@ impl Journal {
         self.ensure_custodian_mailbox_schema()?;
         self.ensure_w12_schema()?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy = load_policy(&tx, untrusted.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy = load_policy(&tx, untrusted.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let claims = authorize(signed_list, policy, trust, now_ms)?;
         let mut results = Vec::with_capacity(usize::from(claims.max_items));
         {
@@ -229,7 +229,7 @@ impl Journal {
         self.ensure_custodian_mailbox_schema()?;
         self.ensure_w12_schema()?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy = load_policy(&tx, untrusted.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy = load_policy(&tx, untrusted.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let claims = authorize(signed_list, policy, trust, now_ms)?;
         if wanted.seq <= claims.since_seq || wanted.seq > i64::MAX as u64
             || wanted.message == [0; 16]
