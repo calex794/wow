@@ -420,6 +420,104 @@ impl Journal {
         Ok(())
     }
 
+    /// Local operator provisioning only: caller MUST have verified exact
+    /// owner-signed mail policy against a root-pinned operator key. Do not
+    /// expose this method as a network command or production enrollment.
+    pub fn operator_provision_mail_role_gate(
+        &mut self, gate: MailRoleGate,
+    ) -> Result<(), AuthError> {
+        if !valid_mail_role_gate(&gate) { return Err(AuthError::Invalid); }
+        self.ensure_custodian_mailbox_schema()?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let policy = load_policy(&tx, gate.mailbox_policy.mailbox, None)?
+            .ok_or(AuthError::Unauthorized)?;
+        if policy.policy != gate.mailbox_policy { return Err(AuthError::Unauthorized); }
+        let previous: Option<(i64, Vec<u8>, i64)> = tx.query_row(
+            "SELECT policy_epoch,signed_digest,revoked FROM custodian_mail_role_guard
+             WHERE mailbox=?1",
+            params![gate.mailbox_policy.mailbox.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?;
+        match previous {
+            None => {
+                tx.execute(
+                    "INSERT INTO custodian_mail_role_guard(mailbox,policy_epoch,signed_digest)
+                     VALUES(?1,?2,?3)",
+                    params![gate.mailbox_policy.mailbox.as_slice(),
+                        gate.policy_epoch as i64, gate.signed_policy_digest.as_slice()],
+                )?;
+            }
+            Some((epoch, digest, revoked)) => {
+                if epoch == gate.policy_epoch as i64
+                    && digest.as_slice() == gate.signed_policy_digest.as_slice()
+                    && revoked == 0
+                {
+                    tx.commit()?;
+                    return Ok(());
+                }
+                // Never revive a revoked role or downgrade its epoch without
+                // a strictly newer independently owner-signed policy.
+                if gate.policy_epoch <= epoch as u64 {
+                    return Err(AuthError::Conflict);
+                }
+                tx.execute(
+                    "UPDATE custodian_mail_role_guard
+                     SET policy_epoch=?2,signed_digest=?3,revoked=0 WHERE mailbox=?1",
+                    params![gate.mailbox_policy.mailbox.as_slice(),
+                        gate.policy_epoch as i64, gate.signed_policy_digest.as_slice()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bind this EXACT independently verified owner role to the journal.
+    /// A mismatch with SQLite requires HOLD, never automatic provisioning.
+    pub fn bind_mail_role_gate(&mut self, gate: MailRoleGate) -> Result<(), AuthError> {
+        if !valid_mail_role_gate(&gate) || self.mail_role_gate.is_some() {
+            return Err(AuthError::Unauthorized);
+        }
+        self.ensure_custodian_mailbox_schema()?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let policy = load_policy(&tx, gate.mailbox_policy.mailbox, Some(gate))?
+            .ok_or(AuthError::Unauthorized)?;
+        if policy.store_revoked || policy.fetch_revoked {
+            return Err(AuthError::Unauthorized);
+        }
+        tx.commit()?;
+        self.mail_role_gate = Some(gate);
+        Ok(())
+    }
+
+    /// Explicitly re-check the exact active row in a SQLite transaction.
+    /// Once bound, STORE/LIST/FETCH/RETURN also check at their own tx boundary.
+    pub fn require_mail_role_gate_current(&mut self) -> Result<(), AuthError> {
+        let gate = self.mail_role_gate.ok_or(AuthError::Unauthorized)?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_policy(&tx, gate.mailbox_policy.mailbox, Some(gate))?
+            .ok_or(AuthError::Unauthorized)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Local revocation must serialize with every admitted SQLite IMMEDIATE
+    /// mailbox transaction. No stale preflight can override the revoked row.
+    pub fn operator_revoke_mail_role_gate(
+        &mut self, mailbox: [u8; 16],
+    ) -> Result<(), AuthError> {
+        self.ensure_custodian_mailbox_schema()?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx.execute(
+            "UPDATE custodian_mail_role_guard SET revoked=1 WHERE mailbox=?1",
+            params![mailbox.as_slice()],
+        )? != 1 {
+            return Err(AuthError::Unauthorized);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Trusted local operator only; never wire this directly to network input.
     /// New epoch is required for any policy change, including unrevocation.
     pub fn operator_provision_mailbox(
