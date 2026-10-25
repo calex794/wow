@@ -44,7 +44,6 @@ struct Context {
     custodian:SigningKey,
     trust:TrustRegistry,
     bob_hpke_secret:crypto_w3::RecipientSecret,
-    bob_hpke_public:crypto_w3::RecipientPublic,
     alice_hpke_secret:crypto_w3::RecipientSecret,
     alice_hpke_public:crypto_w3::RecipientPublic,
     invite:Vec<u8>,
@@ -92,7 +91,7 @@ impl Context {
             offer:OFFER,slot:SLOT,expires_at:EXPIRY,grant_until:EXPIRY-1,
             packet_len:w3.len() as u32,digest,
         });
-        Self {owner,alice,bob,custodian,trust,bob_hpke_secret,bob_hpke_public,
+        Self {owner,alice,bob,custodian,trust,bob_hpke_secret,
               alice_hpke_secret,alice_hpke_public,invite,signed_store,w3,digest}
     }
     fn provision(&self,path:&Path){
