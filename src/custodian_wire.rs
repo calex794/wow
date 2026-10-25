@@ -29,7 +29,8 @@ const MISSING: u8 = 19;
 const LISTED: u8 = 20;
 const FAILED: u8 = 254;
 const DENIED: u8 = 255;
-const FRAME_LIMIT: usize = MAX_MESSAGE_BYTES + 512;
+// Extra space for an owner invitation + sender STORE proof + W3 payload.
+const FRAME_LIMIT: usize = MAX_MESSAGE_BYTES + 544;
 
 #[derive(Debug)]
 pub enum WireError {
