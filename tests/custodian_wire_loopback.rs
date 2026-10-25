@@ -125,7 +125,11 @@ fn serve(f: &Fixture, path: &Path) -> (std::net::SocketAddr, thread::JoinHandle<
     let addr = listener.local_addr().unwrap();
     let path: PathBuf = path.to_path_buf();
     let signer = f.custodian.clone();
-    let trust = f.trust.clone();
+    // Two independently provisioned registries: do not share the client's
+    // in-memory trust object with the custodian process.
+    let mut trust = TrustRegistry::new();
+    trust.enroll(ISSUER, 1, f.owner.verifying_key()).unwrap();
+    trust.enroll(CUSTODIAN, 1, f.custodian.verifying_key()).unwrap();
     let handle = thread::spawn(move || {
         let mut journal = Journal::open(&path).unwrap();
         serve_one_loopback(&listener, &mut journal, &signer, 1, &trust, 2)
