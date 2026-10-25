@@ -17,6 +17,7 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 const STORE_DOMAIN: &[u8] = b"Akula/WOW/Custodian/STORE/lab-v0\0";
 const FETCH_DOMAIN: &[u8] = b"Akula/WOW/Custodian/FETCH/lab-v0\0";
+const STORED_DOMAIN: &[u8] = b"Akula/WOW/Custodian/STORED-CLAIM/lab-v0\0";
 const VERSION: u8 = 1;
 const STORE_BODY: usize = 1 + 16 * 8 + 8 * 3 + 4 + 32;
 const FETCH_BODY: usize = 1 + 16 * 6 + 8 * 2 + 32;
@@ -95,6 +96,16 @@ pub struct FetchClaims {
     pub grant_until: i64,
     pub digest: [u8; 32],
 }
+/// A signer assertion bound to the exact owner STORE grant and W12 head.
+/// This does NOT prove continuous physical storage or recipient delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustodianStoredClaim {
+    pub store: StoreClaims,
+    pub custodian_epoch: u64,
+    pub causal: CausalCommitment,
+    pub signature: [u8; 64],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reservation { Reserved, AlreadyReserved, AlreadyCommitted }
 
@@ -242,6 +253,52 @@ fn verify_fetch(
         .map_err(|_|AuthError::Unauthorized)?;
     Ok(c)
 }
+fn stored_claim_body(claim: &CustodianStoredClaim) -> Vec<u8> {
+    let mut body = signed(STORED_DOMAIN, &encode_store(claim.store));
+    body.extend_from_slice(&claim.custodian_epoch.to_be_bytes());
+    body.extend_from_slice(&claim.causal.seq.to_be_bytes());
+    body.extend_from_slice(&claim.causal.digest);
+    body
+}
+
+/// Verify a custodian's signed assertion against the *original* owner-signed
+/// grant, exact ciphertext and currently enrolled keys. The W12 journal itself
+/// requires a separate audit. This is neither recipient W4 nor a remote storage proof.
+pub fn verify_custodian_stored_claim(
+    claim: &CustodianStoredClaim,
+    signed_store: &[u8],
+    w3: &[u8],
+    trust: &TrustRegistry,
+) -> Result<(), AuthError> {
+    let (expected, owner_signature) = decode_store(signed_store)?;
+    if claim.store != expected
+        || claim.custodian_epoch == 0
+        || claim.custodian_epoch > i64::MAX as u64
+        || claim.causal.seq == 0
+        || claim.causal.digest == [0; 32]
+        || expected.packet_len as usize != w3.len()
+        || blake3::hash(w3).as_bytes() != &expected.digest
+        || expected.expires_at <= 0
+    {
+        return Err(AuthError::Invalid);
+    }
+    let route = private_route_w3::inspect_route(w3).map_err(|_| AuthError::Invalid)?;
+    if route.message_id != expected.message || route.expires_at_ms != expected.expires_at as u64 {
+        return Err(AuthError::Invalid);
+    }
+    let owner = trust.key_for(expected.issuer, expected.issuer_epoch)
+        .map_err(|_| AuthError::Unauthorized)?;
+    owner.verify(&signed(STORE_DOMAIN, &signed_store[..STORE_BODY]), &owner_signature)
+        .map_err(|_| AuthError::Unauthorized)?;
+    let custodian = trust.key_for(expected.custodian, claim.custodian_epoch)
+        .map_err(|_| AuthError::Unauthorized)?;
+    custodian.verify(
+        &stored_claim_body(claim),
+        &Signature::from_bytes(&claim.signature),
+    ).map_err(|_| AuthError::Unauthorized)?;
+    Ok(())
+}
+
 fn id16(v: Vec<u8>) -> Result<[u8; 16], AuthError> {
     v.try_into().map_err(|_|AuthError::Corrupt)
 }
@@ -420,11 +477,11 @@ impl Journal {
     /// CommitStore: check current local policy and signed STORE grant under
     /// the SAME SQLite IMMEDIATE transaction as W12/W3 and reservation state.
     /// The signer is the separately enrolled custodian, never the mailbox owner.
-    pub fn commit_custodian_store(
+    fn commit_custodian_store_verified(
         &mut self, locator: StoreLocator, w3: &[u8],
         custodian_signer: &SigningKey, custodian_epoch: u64,
         trust: &TrustRegistry, now: i64,
-    ) -> Result<CausalCommitment, AuthError> {
+    ) -> Result<(CausalCommitment, StoreClaims), AuthError> {
         let StoreLocator { mailbox, offer } = locator;
         if w3.is_empty() || w3.len() > MAX_MESSAGE_BYTES { return Err(AuthError::Invalid); }
         self.ensure_custodian_mailbox_schema()?;
@@ -463,7 +520,41 @@ impl Journal {
             params![mailbox.as_slice(),offer.as_slice()],
         )?;
         tx.commit()?;
-        Ok(result)
+        Ok((result, claims))
+    }
+
+    /// Existing low-level lab entrypoint remains compatible with its original
+    /// causal return value. It does NOT return a signed custodian receipt.
+    pub fn commit_custodian_store(
+        &mut self, locator: StoreLocator, w3: &[u8],
+        custodian_signer: &SigningKey, custodian_epoch: u64,
+        trust: &TrustRegistry, now: i64,
+    ) -> Result<CausalCommitment, AuthError> {
+        self.commit_custodian_store_verified(
+            locator, w3, custodian_signer, custodian_epoch, trust, now,
+        ).map(|(causal, _)| causal)
+    }
+
+    /// Sign only AFTER the same-DB STORE reservation, exact W3, and W12
+    /// have committed. After lost ACK, replay signs the same immutable claim.
+    /// A CustodianStoredClaim is a bounded custodian assertion, not recipient W4
+    /// and not proof that a malicious server retained the bytes.
+    pub fn commit_custodian_store_with_claim(
+        &mut self, locator: StoreLocator, w3: &[u8],
+        custodian_signer: &SigningKey, custodian_epoch: u64,
+        trust: &TrustRegistry, now: i64,
+    ) -> Result<CustodianStoredClaim, AuthError> {
+        let (causal, store) = self.commit_custodian_store_verified(
+            locator, w3, custodian_signer, custodian_epoch, trust, now,
+        )?;
+        let mut claim = CustodianStoredClaim {
+            store,
+            custodian_epoch,
+            causal,
+            signature: [0; 64],
+        };
+        claim.signature = custodian_signer.sign(&stored_claim_body(&claim)).to_bytes();
+        Ok(claim)
     }
 
     /// FETCH is a separate signed capability. A public W3 route tag,
