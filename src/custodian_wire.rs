@@ -9,6 +9,8 @@ use crate::custodian_mailbox::{
 };
 use crate::custodian_discovery::{ListedEntry, LIST_GRANT_BYTES, MAX_LIST_ITEMS};
 use crate::custodian_invitation::{verify_delegated_stored_claim, INVITATION_BYTES};
+use crate::custodian_return::{ROUTE_BYTES, DEPOSIT_BYTES, READ_BYTES};
+use crate::private_return_w4::{self, ENVELOPE_LEN};
 use crate::journal_w4::Journal;
 use crate::trust_w3::TrustRegistry;
 use crate::MAX_MESSAGE_BYTES;
@@ -23,10 +25,15 @@ const FETCH: u8 = 2;
 const DELEGATED_STORE: u8 = 3;
 const LIST: u8 = 4;
 const FETCH_LISTED: u8 = 5;
+const RETURN_REGISTER: u8 = 6;
+const RETURN_DEPOSIT: u8 = 7;
+const RETURN_FETCH: u8 = 8;
 const STORED: u8 = 17;
 const FETCHED: u8 = 18;
 const MISSING: u8 = 19;
 const LISTED: u8 = 20;
+const RETURN_ACK: u8 = 21;
+const RETURN_ENVELOPE: u8 = 22;
 const FAILED: u8 = 254;
 const DENIED: u8 = 255;
 // Extra space for an owner invitation + sender STORE proof + W3 payload.
@@ -196,6 +203,29 @@ fn handle_request(
                     let mut reply = Vec::with_capacity(packet.len() + 2);
                     reply.extend_from_slice(&[VERSION, FETCHED]);
                     reply.extend_from_slice(&packet);
+                    Ok(reply)
+                }
+                None => Ok(vec![VERSION, MISSING]),
+            }
+        }
+        RETURN_REGISTER if request.len() == 2 + ROUTE_BYTES => {
+            journal.register_private_w4_return(&request[2..], trust, now_ms)?;
+            Ok(vec![VERSION, RETURN_ACK])
+        }
+        RETURN_DEPOSIT if request.len() == 2 + DEPOSIT_BYTES + ENVELOPE_LEN => {
+            let end = 2 + DEPOSIT_BYTES;
+            journal.deposit_private_w4_return(
+                &request[2..end], &request[end..], trust, now_ms,
+            )?;
+            Ok(vec![VERSION, RETURN_ACK])
+        }
+        RETURN_FETCH if request.len() == 2 + READ_BYTES => {
+            let envelope = journal.fetch_private_w4_return(&request[2..], trust, now_ms)?;
+            match envelope {
+                Some(bytes) => {
+                    let mut reply = Vec::with_capacity(2 + ENVELOPE_LEN);
+                    reply.extend_from_slice(&[VERSION, RETURN_ENVELOPE]);
+                    reply.extend_from_slice(&bytes);
                     Ok(reply)
                 }
                 None => Ok(vec![VERSION, MISSING]),
@@ -457,4 +487,75 @@ pub fn client_store_delegated(
         &claim, sender_signed_store, signed_invitation, w3, trust,
     ).map_err(|_| WireError::Denied)?;
     Ok(claim)
+}
+
+
+/// One-off sender-authenticated opaque return registration. This transport
+/// ACK is NOT a cryptographic custody proof and never implies recipient W4.
+pub fn client_register_return(
+    stream: &mut TcpStream,
+    signed_route: &[u8],
+) -> Result<(), WireError> {
+    if signed_route.len() != ROUTE_BYTES { return Err(WireError::Invalid); }
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request=Vec::with_capacity(2+ROUTE_BYTES);
+    request.extend_from_slice(&[VERSION,RETURN_REGISTER]);
+    request.extend_from_slice(signed_route);
+    write_frame(stream,&request)?;
+    let reply=read_frame(stream)?;
+    if parse_reply(&reply,RETURN_ACK)?.is_empty() {
+        Ok(())
+    } else { Err(WireError::Invalid) }
+}
+
+/// Recipient-signed opaque W4 envelope deposit. A C ACK only means that C
+/// reported storing bytes; the sender must decrypt and verify recipient W4.
+pub fn client_deposit_return(
+    stream: &mut TcpStream,
+    signed_deposit: &[u8],
+    envelope: &[u8],
+) -> Result<(), WireError> {
+    if signed_deposit.len()!=DEPOSIT_BYTES || envelope.len()!=ENVELOPE_LEN {
+        return Err(WireError::Invalid);
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request=Vec::with_capacity(2+DEPOSIT_BYTES+ENVELOPE_LEN);
+    request.extend_from_slice(&[VERSION,RETURN_DEPOSIT]);
+    request.extend_from_slice(signed_deposit);
+    request.extend_from_slice(envelope);
+    write_frame(stream,&request)?;
+    let reply=read_frame(stream)?;
+    if parse_reply(&reply,RETURN_ACK)?.is_empty() {
+        Ok(())
+    } else { Err(WireError::Invalid) }
+}
+
+/// Sender-scoped return FETCH: no plaintext W4 is exposed on the wire.
+/// Returned bytes are untrusted until sender HPKE decrypts and verifies the
+/// recipient signature AND exact local original-W3 digest.
+pub fn client_fetch_return(
+    stream: &mut TcpStream,
+    signed_read: &[u8],
+    expected_tag: [u8;16],
+) -> Result<Option<Vec<u8>>, WireError> {
+    if signed_read.len()!=READ_BYTES || expected_tag==[0;16] {
+        return Err(WireError::Invalid);
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request=Vec::with_capacity(2+READ_BYTES);
+    request.extend_from_slice(&[VERSION,RETURN_FETCH]);
+    request.extend_from_slice(signed_read);
+    write_frame(stream,&request)?;
+    let reply=read_frame(stream)?;
+    if reply.as_slice()==[VERSION,MISSING] {return Ok(None);}
+    let envelope=parse_reply(&reply,RETURN_ENVELOPE)?;
+    if envelope.len()!=ENVELOPE_LEN
+        || private_return_w4::inspect_route(envelope)
+          .map_err(|_|WireError::Invalid)? != expected_tag {
+        return Err(WireError::Invalid);
+    }
+    Ok(Some(envelope.to_vec()))
 }
