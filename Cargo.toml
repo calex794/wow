@@ -53,3 +53,7 @@ noq-udp = { git = "https://github.com/calex794/noq", rev = "2eabf9895d40c263aa33
 name = "w12_causal_crash_worker"
 path = "src/bin/w12_causal_crash_worker.rs"
 required-features = ["causal-lab-fault"]
+
+[workspace]
+members = ["w3-crypto"]
+resolver = "2"
