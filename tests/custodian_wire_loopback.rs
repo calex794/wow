@@ -3,11 +3,13 @@
 use akula_wire_lab::{
     crypto_identity_w3::SignedHeader,
     crypto_w3,
+    custodian_discovery::{sign_list_for_lab, ListClaims, ListedEntry},
     custodian_mailbox::{
         sign_fetch_for_lab, sign_store_for_lab, CustodianStoredClaim, FetchClaims, MailboxPolicy,
         StoreClaims,
     },
-    custodian_wire::{bind_test_loopback, client_fetch, client_store, serve_one_loopback, WireError},
+    custodian_wire::{bind_test_loopback, client_fetch, client_fetch_listed,
+        client_list, client_store, serve_one_loopback, WireError},
     journal_w4::Journal,
     private_route_w3,
     trust_w3::TrustRegistry,
@@ -31,6 +33,7 @@ const EXPIRY: i64 = 10_000_000;
 struct Fixture {
     owner: SigningKey,
     custodian: SigningKey,
+    recipient_signer: SigningKey,
     trust: TrustRegistry,
     packet: Vec<u8>,
     policy: MailboxPolicy,
@@ -40,10 +43,12 @@ impl Fixture {
     fn new() -> Self {
         let owner = SigningKey::from_bytes(&[1; 32]);
         let custodian = SigningKey::from_bytes(&[8; 32]);
+        let recipient_signer = SigningKey::from_bytes(&[3; 32]);
         let sender = SigningKey::from_bytes(&[7; 32]);
         let mut trust = TrustRegistry::new();
         trust.enroll(ISSUER, 1, owner.verifying_key()).unwrap();
         trust.enroll(CUSTODIAN, 1, custodian.verifying_key()).unwrap();
+        trust.enroll(RECIPIENT, 1, recipient_signer.verifying_key()).unwrap();
         let (_, recipient_public) = crypto_w3::new_recipient();
         let packet = private_route_w3::seal_private(
             &sender,
@@ -84,12 +89,28 @@ impl Fixture {
             packet_len: packet.len() as u32,
             digest: *blake3::hash(&packet).as_bytes(),
         };
-        Self { owner, custodian, trust, packet, policy, claims }
+        Self { owner, custodian, recipient_signer, trust, packet, policy, claims }
     }
 
     fn provision(&self, path: &Path) {
         let mut journal = Journal::open(path).unwrap();
         journal.operator_provision_mailbox(self.policy, &self.trust).unwrap();
+    }
+
+    fn list(&self, since_seq: u64, max_items: u8) -> Vec<u8> {
+        sign_list_for_lab(&self.recipient_signer, ListClaims {
+            issuer: ISSUER,
+            issuer_epoch: 1,
+            custodian: CUSTODIAN,
+            mailbox: MAILBOX,
+            scope: SCOPE,
+            recipient: RECIPIENT,
+            recipient_epoch: 1,
+            since_seq,
+            grant_until_ms: 60_000,
+            nonce: [17; 16],
+            max_items,
+        })
     }
 
     fn store(&self) -> Vec<u8> {
@@ -130,6 +151,7 @@ fn serve(f: &Fixture, path: &Path) -> (std::net::SocketAddr, thread::JoinHandle<
     let mut trust = TrustRegistry::new();
     trust.enroll(ISSUER, 1, f.owner.verifying_key()).unwrap();
     trust.enroll(CUSTODIAN, 1, f.custodian.verifying_key()).unwrap();
+    trust.enroll(RECIPIENT, 1, f.recipient_signer.verifying_key()).unwrap();
     let handle = thread::spawn(move || {
         let mut journal = Journal::open(&path).unwrap();
         serve_one_loopback(&listener, &mut journal, &signer, 1, &trust, 2)
@@ -321,4 +343,134 @@ fn malicious_server_cannot_replace_fetched_ciphertext() {
         Err(WireError::Invalid)
     ));
     worker.join().unwrap();
+}
+
+
+fn list_exchange(
+    f: &Fixture,
+    path: &Path,
+    proof: &[u8],
+) -> Result<Vec<ListedEntry>, WireError> {
+    let (addr, worker) = serve(f, path);
+    let mut client = TcpStream::connect(addr).unwrap();
+    let response = client_list(&mut client, proof);
+    assert!(worker.join().unwrap().is_ok());
+    response
+}
+
+fn fetch_listed_exchange(
+    f: &Fixture,
+    path: &Path,
+    proof: &[u8],
+    item: ListedEntry,
+) -> Result<Option<Vec<u8>>, WireError> {
+    let (addr, worker) = serve(f, path);
+    let mut client = TcpStream::connect(addr).unwrap();
+    let response = client_fetch_listed(&mut client, proof, item);
+    assert!(worker.join().unwrap().is_ok());
+    response
+}
+
+#[test]
+fn offline_recipient_can_discover_and_fetch_after_custodian_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recipient_list.sqlite");
+    let f = Fixture::new();
+    f.provision(&path);
+    let stored = store_exchange(&f, &path, &f.store(), &f.packet).unwrap();
+    // The sender's connection is gone. Recipient has no prior message/digest
+    // and uses only its independently signed private LIST read permission.
+    let list_proof = f.list(0, 2);
+    let entries = list_exchange(&f, &path, &list_proof).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, MESSAGE);
+    assert_eq!(entries[0].seq, stored.causal.seq);
+    assert_eq!(entries[0].digest, f.claims.digest);
+    let packet = fetch_listed_exchange(&f, &path, &list_proof, entries[0]).unwrap();
+    assert_eq!(packet, Some(f.packet.clone()));
+    assert_eq!(list_exchange(&f, &path, &f.list(entries[0].seq, 2)).unwrap().len(), 0);
+    assert_eq!(count(&path, "receipt_outbox"), 0, "C cannot issue recipient W4");
+}
+
+#[test]
+fn private_list_rejects_wrong_signer_epoch_scope_and_revocation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recipient_acl.sqlite");
+    let f = Fixture::new();
+    f.provision(&path);
+    store_exchange(&f, &path, &f.store(), &f.packet).unwrap();
+    let allowed = f.list(0, 1);
+    let mut forged = allowed.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    assert!(matches!(list_exchange(&f, &path, &forged), Err(WireError::Denied)));
+
+    let mut wrong_claims = ListClaims {
+        issuer: ISSUER, issuer_epoch: 1, custodian: CUSTODIAN,
+        mailbox: [99; 16], scope: SCOPE, recipient: RECIPIENT,
+        recipient_epoch: 1, since_seq: 0, grant_until_ms: 60_000,
+        nonce: [21; 16], max_items: 1,
+    };
+    let wrong = sign_list_for_lab(&f.recipient_signer, wrong_claims);
+    assert!(matches!(list_exchange(&f, &path, &wrong), Err(WireError::Denied)));
+
+    wrong_claims.mailbox = MAILBOX;
+    wrong_claims.issuer_epoch = 2;
+    let wrong_epoch = sign_list_for_lab(&f.recipient_signer, wrong_claims);
+    assert!(matches!(list_exchange(&f, &path, &wrong_epoch), Err(WireError::Denied)));
+
+    wrong_claims.issuer_epoch = 1;
+    wrong_claims.scope = [77; 16];
+    let wrong_scope = sign_list_for_lab(&f.recipient_signer, wrong_claims);
+    assert!(matches!(list_exchange(&f, &path, &wrong_scope), Err(WireError::Denied)));
+
+    wrong_claims.scope = SCOPE;
+    wrong_claims.nonce = [0; 16];
+    let invalid = sign_list_for_lab(&f.recipient_signer, wrong_claims);
+    assert!(matches!(list_exchange(&f, &path, &invalid), Err(WireError::Denied)));
+
+    wrong_claims.nonce = [1; 16];
+    wrong_claims.grant_until_ms = 1;
+    let expired = sign_list_for_lab(&f.recipient_signer, wrong_claims);
+    assert!(matches!(list_exchange(&f, &path, &expired), Err(WireError::Denied)));
+
+    let mut journal = Journal::open(&path).unwrap();
+    journal.operator_revoke_fetch(MAILBOX).unwrap();
+    drop(journal);
+    assert!(matches!(list_exchange(&f, &path, &allowed), Err(WireError::Denied)));
+}
+
+#[test]
+fn listed_fetch_is_confined_to_exact_message_seq_and_digest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recipient_confined.sqlite");
+    let f = Fixture::new();
+    f.provision(&path);
+    store_exchange(&f, &path, &f.store(), &f.packet).unwrap();
+    let grant = f.list(0, 1);
+    let entries = list_exchange(&f, &path, &grant).unwrap();
+    let original = entries[0];
+    let mut changed = original;
+    changed.digest[0] ^= 1;
+    assert!(matches!(
+        fetch_listed_exchange(&f, &path, &grant, changed),
+        Err(WireError::Denied)
+    ));
+    changed = original;
+    changed.seq += 1;
+    assert!(matches!(
+        fetch_listed_exchange(&f, &path, &grant, changed),
+        Ok(None)
+    ));
+    changed = original;
+    changed.message = [42; 16];
+    assert!(matches!(
+        fetch_listed_exchange(&f, &path, &grant, changed),
+        Ok(None)
+    ));
+    let after = f.list(original.seq, 1);
+    assert!(matches!(
+        fetch_listed_exchange(&f, &path, &after, original),
+        Err(WireError::Denied)
+    ));
+    assert_eq!(count(&path, "receipt_outbox"), 0);
 }
