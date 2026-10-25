@@ -4,6 +4,7 @@ on:
     paths:
       - 'src/causal_w12.rs'
       - 'src/custodian_mailbox.rs'
+      - 'src/journal_w4.rs'
       - 'src/custodian_wire.rs'
       - 'src/custodian_discovery.rs'
       - 'src/custodian_invitation.rs'
@@ -14,6 +15,7 @@ on:
       - 'tests/causal_w12_crash.rs'
       - 'tests/causal_w12_expiry.rs'
       - 'tests/custodian_mailbox_auth.rs'
+      - 'tests/custodian_mail_role_gate.rs'
       - 'tests/custodian_wire_loopback.rs'
       - 'tests/custodian_return_loopback.rs'
       - '.github/workflows/w12-causal-wal.yml'
@@ -32,6 +34,8 @@ jobs:
         run: cargo test --test causal_w12_expiry
       - name: Check distinct custodian STORE/FETCH authorization
         run: cargo test --test custodian_mailbox_auth
+      - name: Check transaction-bound root-pinned mail role gate
+        run: cargo test --test custodian_mail_role_gate
       - name: Check local-only authenticated custodian socket adapter
         run: cargo test --test custodian_wire_loopback
       - name: Verify encrypted W4 return across three SQLite participants
