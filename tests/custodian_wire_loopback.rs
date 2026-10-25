@@ -15,7 +15,7 @@ use akula_wire_lab::{
 };
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -278,4 +278,47 @@ fn public_listener_is_rejected_before_accepting_a_connection() {
         Err(WireError::Denied)
     ));
     assert_eq!(count(&path, "custodian_mailbox_offer"), 0);
+}
+
+fn forged_reply(reply: Vec<u8>) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+    let listener = bind_test_loopback().unwrap();
+    let addr = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut header = [0u8; 4];
+        peer.read_exact(&mut header).unwrap();
+        let len = u32::from_be_bytes(header) as usize;
+        assert!(len <= MAX_MESSAGE_BYTES + 512);
+        let mut request = vec![0u8; len];
+        peer.read_exact(&mut request).unwrap();
+        peer.write_all(&(reply.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(&reply).unwrap();
+    });
+    (addr, worker)
+}
+
+#[test]
+fn malicious_server_cannot_forge_custodian_stored_confirmation() {
+    let f = Fixture::new();
+    let mut forged = vec![1u8, 17u8];
+    forged.extend_from_slice(&[0u8; 112]);
+    let (addr, worker) = forged_reply(forged);
+    let mut stream = TcpStream::connect(addr).unwrap();
+    assert!(matches!(
+        client_store(&mut stream, &f.store(), &f.packet, &f.trust),
+        Err(WireError::Denied)
+    ));
+    worker.join().unwrap();
+}
+
+#[test]
+fn malicious_server_cannot_replace_fetched_ciphertext() {
+    let f = Fixture::new();
+    let (addr, worker) = forged_reply(vec![1u8, 18u8, 9u8, 8u8, 7u8]);
+    let mut stream = TcpStream::connect(addr).unwrap();
+    assert!(matches!(
+        client_fetch(&mut stream, &f.fetch(), f.claims.digest),
+        Err(WireError::Invalid)
+    ));
+    worker.join().unwrap();
 }
