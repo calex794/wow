@@ -279,7 +279,7 @@ impl Journal {
         let hint=decode_route(signed_route)?;
         self.ensure_custodian_return_schema()?;
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy=load_policy(&tx,hint.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy=load_policy(&tx, hint.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let route=authorize_route(signed_route,policy,trust,now_ms)?;
         type Entry=(Vec<u8>,Vec<u8>,Vec<u8>,Vec<u8>,i64,Vec<u8>);
         let stored:Option<Entry>=tx.query_row(
@@ -353,7 +353,7 @@ impl Journal {
         ).optional()?;
         let (signed_route,stored,stored_hash)=row.ok_or(AuthError::Unauthorized)?;
         let route_hint=decode_route(&signed_route)?;
-        let policy=load_policy(&tx,route_hint.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy=load_policy(&tx, route_hint.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         let route=authorize_route(&signed_route,policy,trust,now_ms)?;
         authorize_deposit(signed_deposit,policy,route,envelope,trust,now_ms)?;
         if let Some(old)=stored {
@@ -390,7 +390,7 @@ impl Journal {
         ).optional()?;
         let (signed_route,stored,stored_hash)=row.ok_or(AuthError::Unauthorized)?;
         let route_hint=decode_route(&signed_route)?;
-        let policy=load_policy(&tx,route_hint.mailbox)?.ok_or(AuthError::Unauthorized)?;
+        let policy=load_policy(&tx, route_hint.mailbox, self.mail_role_gate)?.ok_or(AuthError::Unauthorized)?;
         // A revoked STORE grant does not erase already deposited returns, so
         // use explicit sender read proof and current FETCH revocation here.
         let route=decode_route(&signed_route)?;
